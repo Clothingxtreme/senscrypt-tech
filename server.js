@@ -1842,7 +1842,40 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
       })
     } catch (error) {
       const message = getAxiosErrorMessage(error, "Failed to initiate payout with Monnify.")
-      return res.status(502).json({ error: message })
+      const failedPayout = await Payout.create({
+        creatorId: req.user._id,
+        amount: payoutAmount,
+        bankName,
+        bankCode,
+        accountNumber,
+        accountName,
+        status: "failed",
+        transferReference,
+        providerReference: transferReference,
+        providerMessage: message,
+        createdAt: new Date(),
+        completedAt: new Date(),
+      })
+
+      io.to(getCreatorRoom(req.user._id)).emit("newPayout", failedPayout)
+
+      await createAuditLog({
+        actorType: "system",
+        eventType: "payout.failed",
+        message: `Payout failed for ${bankName}.`,
+        metadata: {
+          amount: payoutAmount,
+          bankName,
+          bankCode,
+          accountNumber: String(accountNumber).slice(-4),
+          accountName,
+          creatorId: req.user._id.toString(),
+          transferReference,
+          error: message,
+        },
+      })
+
+      return res.status(502).json({ error: message, payout: failedPayout })
     }
 
     const providerStatus =
