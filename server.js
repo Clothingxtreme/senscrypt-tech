@@ -1,28 +1,34 @@
-require("dotenv").config()
-
 const express = require("express")
 const http = require("http")
 const mongoose = require("mongoose")
 const cors = require("cors")
 const axios = require("axios")
 const crypto = require("crypto")
+const path = require("path")
 const { Server } = require("socket.io")
 const { AxiosError } = require("axios")
 
-const {
-  MONGODB_URI = "mongodb://127.0.0.1:27017/streamtip",
-  MONNIFY_API_KEY = "",
-  MONNIFY_SECRET_KEY = "",
-  MONNIFY_CONTRACT_CODE = "",
-  MONNIFY_BASE_URL = "https://sandbox.monnify.com",
-  FRONTEND_ORIGIN = "*",
-  MONNIFY_WEBHOOK_IP_ALLOWLIST = "",
-  GOOGLE_CLIENT_ID = "",
-  APPLE_CLIENT_ID = "",
-  ADMIN_EMAIL = "admin@streamtip.local",
-  ADMIN_PASSWORD = "ChangeMeAdmin123!",
-  MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER = "",
-} = process.env
+require("dotenv").config({ path: path.join(__dirname, ".env") })
+
+const MONGODB_URI = String(process.env.MONGODB_URI || "").trim()
+const MONNIFY_API_KEY = String(process.env.MONNIFY_API_KEY || "").trim()
+const MONNIFY_SECRET_KEY = String(process.env.MONNIFY_SECRET_KEY || "").trim()
+const MONNIFY_CONTRACT_CODE = String(process.env.MONNIFY_CONTRACT_CODE || "").trim()
+const MONNIFY_BASE_URL = String(process.env.MONNIFY_BASE_URL || "").trim()
+const FRONTEND_ORIGIN = String(process.env.FRONTEND_ORIGIN || "").trim()
+const MONNIFY_WEBHOOK_IP_ALLOWLIST = String(process.env.MONNIFY_WEBHOOK_IP_ALLOWLIST || "").trim()
+const GOOGLE_CLIENT_ID = String(process.env.GOOGLE_CLIENT_ID || "").trim()
+const APPLE_CLIENT_ID = String(process.env.APPLE_CLIENT_ID || "").trim()
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || "").trim()
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || "").trim()
+const MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER = String(
+  process.env.MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER || "",
+).trim()
+
+const missingRequiredEnv = ["MONGODB_URI"].filter((key) => !process.env[key])
+if (missingRequiredEnv.length > 0) {
+  console.error(`Missing required environment variables: ${missingRequiredEnv.join(", ")}`)
+}
 
 function parseAllowedOrigins(value) {
   const origins = String(value || "")
@@ -127,10 +133,26 @@ const io = new Server(server, {
 const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
 
-mongoose
-  .connect(MONGODB_URI)
-  .then(() => console.log("MongoDB Connected"))
-  .catch((error) => console.log(error))
+if (MONGODB_URI) {
+  mongoose
+    .connect(MONGODB_URI)
+    .then(() => console.log("MongoDB Connected"))
+    .catch((error) => console.error("MongoDB connection failed", error))
+}
+
+function isDatabaseConnected() {
+  return mongoose.connection.readyState === 1
+}
+
+function requireDatabaseReady(_req, res, next) {
+  if (isDatabaseConnected()) {
+    return next()
+  }
+
+  return res.status(503).json({
+    error: "Database is not connected. Check MONGODB_URI in the backend environment variables.",
+  })
+}
 
 const donationSchema = new mongoose.Schema({
   creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
@@ -270,7 +292,7 @@ const fallbackBanks = [
 ]
 
 function isMonnifyConfigured() {
-  return Boolean(MONNIFY_API_KEY && MONNIFY_SECRET_KEY && MONNIFY_CONTRACT_CODE)
+  return Boolean(MONNIFY_API_KEY && MONNIFY_SECRET_KEY && MONNIFY_CONTRACT_CODE && MONNIFY_BASE_URL)
 }
 
 function isMonnifySandbox() {
@@ -278,6 +300,10 @@ function isMonnifySandbox() {
 }
 
 function getMonnifyEnvironment() {
+  if (!MONNIFY_BASE_URL) {
+    return "unconfigured"
+  }
+
   return isMonnifySandbox() ? "sandbox" : "live"
 }
 
@@ -728,7 +754,7 @@ async function resolveBankAccountName({ bankCode, accountNumber }) {
 async function createReservedAccountForUser(user) {
   if (!isMonnifyConfigured()) {
     throw new Error(
-      "Monnify is not configured yet. Add MONNIFY_API_KEY, MONNIFY_SECRET_KEY, and MONNIFY_CONTRACT_CODE to Backend/.env.",
+      "Monnify is not configured yet. Add MONNIFY_API_KEY, MONNIFY_SECRET_KEY, MONNIFY_CONTRACT_CODE, and MONNIFY_BASE_URL to Backend/.env.",
     )
   }
 
@@ -1128,10 +1154,13 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "streamtip-api",
+    database: isDatabaseConnected() ? "connected" : "disconnected",
     environment: getMonnifyEnvironment(),
     uptime: Math.round(process.uptime()),
   })
 })
+
+app.use(requireDatabaseReady)
 
 app.post("/auth/register", async (req, res) => {
   try {
@@ -1368,6 +1397,12 @@ app.post("/admin/auth/login", async (req, res) => {
     }
 
     const normalizedEmail = String(email).toLowerCase().trim()
+
+    if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+      return res.status(503).json({
+        error: "Admin login is not configured. Set ADMIN_EMAIL and ADMIN_PASSWORD on the backend.",
+      })
+    }
 
     if (
       normalizedEmail !== String(ADMIN_EMAIL).toLowerCase().trim() ||
