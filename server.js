@@ -10,20 +10,37 @@ const { AxiosError } = require("axios")
 
 require("dotenv").config({ path: path.join(__dirname, ".env") })
 
-const MONGODB_URI = String(process.env.MONGODB_URI || "").trim()
-const MONNIFY_API_KEY = String(process.env.MONNIFY_API_KEY || "").trim()
-const MONNIFY_SECRET_KEY = String(process.env.MONNIFY_SECRET_KEY || "").trim()
-const MONNIFY_CONTRACT_CODE = String(process.env.MONNIFY_CONTRACT_CODE || "").trim()
-const MONNIFY_BASE_URL = String(process.env.MONNIFY_BASE_URL || "").trim()
-const FRONTEND_ORIGIN = String(process.env.FRONTEND_ORIGIN || "").trim()
-const MONNIFY_WEBHOOK_IP_ALLOWLIST = String(process.env.MONNIFY_WEBHOOK_IP_ALLOWLIST || "").trim()
-const GOOGLE_CLIENT_ID = String(process.env.GOOGLE_CLIENT_ID || "").trim()
-const APPLE_CLIENT_ID = String(process.env.APPLE_CLIENT_ID || "").trim()
-const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || "").trim()
-const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || "").trim()
-const MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER = String(
-  process.env.MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER || "",
-).trim()
+function readEnv(key) {
+  let value = String(process.env[key] || "").trim()
+
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1).trim()
+  }
+
+  if (value.startsWith(`${key}=`)) {
+    value = value.slice(key.length + 1).trim()
+  }
+
+  return value
+}
+
+const MONGODB_URI = readEnv("MONGODB_URI")
+const MONNIFY_API_KEY = readEnv("MONNIFY_API_KEY")
+const MONNIFY_SECRET_KEY = readEnv("MONNIFY_SECRET_KEY")
+const MONNIFY_CONTRACT_CODE = readEnv("MONNIFY_CONTRACT_CODE")
+const MONNIFY_BASE_URL = readEnv("MONNIFY_BASE_URL")
+const FRONTEND_ORIGIN = readEnv("FRONTEND_ORIGIN")
+const MONNIFY_WEBHOOK_IP_ALLOWLIST = readEnv("MONNIFY_WEBHOOK_IP_ALLOWLIST")
+const GOOGLE_CLIENT_ID = readEnv("GOOGLE_CLIENT_ID")
+const APPLE_CLIENT_ID = readEnv("APPLE_CLIENT_ID")
+const ADMIN_EMAIL = readEnv("ADMIN_EMAIL")
+const ADMIN_PASSWORD = readEnv("ADMIN_PASSWORD")
+const MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER = readEnv(
+  "MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER",
+)
 
 const missingRequiredEnv = ["MONGODB_URI"].filter((key) => !process.env[key])
 if (missingRequiredEnv.length > 0) {
@@ -132,12 +149,30 @@ const io = new Server(server, {
 
 const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
+let lastDatabaseError = ""
+
+function getMongoUriHost() {
+  if (!MONGODB_URI) {
+    return ""
+  }
+
+  try {
+    return new URL(MONGODB_URI).host
+  } catch (_error) {
+    return "invalid-uri"
+  }
+}
 
 if (MONGODB_URI) {
   mongoose
-    .connect(MONGODB_URI)
+    .connect(MONGODB_URI, { serverSelectionTimeoutMS: 15000 })
     .then(() => console.log("MongoDB Connected"))
-    .catch((error) => console.error("MongoDB connection failed", error))
+    .catch((error) => {
+      lastDatabaseError = error instanceof Error ? error.message : String(error)
+      console.error("MongoDB connection failed", lastDatabaseError)
+    })
+} else {
+  lastDatabaseError = "MONGODB_URI is missing."
 }
 
 function isDatabaseConnected() {
@@ -1155,6 +1190,10 @@ app.get("/health", (_req, res) => {
     ok: true,
     service: "streamtip-api",
     database: isDatabaseConnected() ? "connected" : "disconnected",
+    databaseReadyState: mongoose.connection.readyState,
+    mongodbUriConfigured: Boolean(MONGODB_URI),
+    mongodbHost: getMongoUriHost(),
+    lastDatabaseError,
     environment: getMonnifyEnvironment(),
     uptime: Math.round(process.uptime()),
   })
