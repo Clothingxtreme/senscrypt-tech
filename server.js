@@ -2343,7 +2343,7 @@ app.post("/admin/platform-withdrawals", requireAdminSession, async (req, res) =>
       accountNumber: String(accountNumber).trim(),
       accountName: String(accountName).trim(),
       note: String(note || "").trim(),
-      status: "completed",
+      status: "recorded",
       transferReference,
       providerReference: transferReference,
       providerMessage: "Manual platform withdrawal recorded by admin.",
@@ -2355,7 +2355,7 @@ app.post("/admin/platform-withdrawals", requireAdminSession, async (req, res) =>
       actorType: "admin",
       actorId: req.adminSession._id.toString(),
       eventType: "admin.platform_withdrawal.created",
-      message: `Admin withdrew platform revenue to ${withdrawal.bankName}.`,
+      message: `Admin recorded a manual platform withdrawal to ${withdrawal.bankName}.`,
       metadata: {
         amount: withdrawalAmount,
         bankName: withdrawal.bankName,
