@@ -2328,12 +2328,6 @@ app.post("/admin/platform-withdrawals", requireAdminSession, async (req, res) =>
       })
     }
 
-    if (!bankCode) {
-      return res.status(400).json({
-        error: "Bank code is required for live disbursement.",
-      })
-    }
-
     if (withdrawalAmount > totals.pendingPlatformRevenue) {
       return res.status(400).json({
         error: "You can only withdraw from the available platform 20% balance.",
@@ -2342,29 +2336,6 @@ app.post("/admin/platform-withdrawals", requireAdminSession, async (req, res) =>
     }
 
     const transferReference = createTransferReference("STIP-PLATFORM")
-    let transferResponse
-
-    try {
-      transferResponse = await initiateMonnifyDisbursement({
-        amount: withdrawalAmount,
-        bankCode,
-        accountNumber,
-        accountName,
-        narration: "StreamTip platform revenue withdrawal",
-        reference: transferReference,
-      })
-    } catch (error) {
-      const message = getAxiosErrorMessage(error, "Failed to initiate platform withdrawal with Monnify.")
-      return res.status(502).json({ error: message })
-    }
-
-    const providerStatus =
-      transferResponse.status ||
-      transferResponse.paymentStatus ||
-      transferResponse.transactionStatus ||
-      ""
-    const withdrawalStatus = normalizeMonnifyTransferStatus(providerStatus)
-
     const withdrawal = await PlatformWithdrawal.create({
       amount: withdrawalAmount,
       bankName: String(bankName).trim(),
@@ -2372,20 +2343,12 @@ app.post("/admin/platform-withdrawals", requireAdminSession, async (req, res) =>
       accountNumber: String(accountNumber).trim(),
       accountName: String(accountName).trim(),
       note: String(note || "").trim(),
-      status: withdrawalStatus,
+      status: "completed",
       transferReference,
-      providerReference:
-        String(
-          transferResponse.transactionReference ||
-            transferResponse.reference ||
-            transferResponse.paymentReference ||
-            transferReference,
-        ).trim() || transferReference,
-      providerMessage: String(
-        transferResponse.message || transferResponse.responseMessage || providerStatus || "",
-      ).trim(),
+      providerReference: transferReference,
+      providerMessage: "Manual platform withdrawal recorded by admin.",
       createdAt: new Date(),
-      completedAt: withdrawalStatus === "completed" ? new Date() : undefined,
+      completedAt: new Date(),
     })
 
     await createAuditLog({
@@ -2402,6 +2365,7 @@ app.post("/admin/platform-withdrawals", requireAdminSession, async (req, res) =>
         transferReference,
         providerReference: withdrawal.providerReference || "",
         providerStatus: withdrawal.status,
+        mode: "manual",
       },
     })
 
