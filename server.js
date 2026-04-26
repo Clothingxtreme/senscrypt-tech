@@ -439,6 +439,74 @@ function getOverlayStateForUser(user) {
   }
 }
 
+function normalizeName(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
+}
+
+function getNestedValue(source, path) {
+  return path.split(".").reduce((current, key) => {
+    if (Array.isArray(current)) {
+      current = current[0]
+    }
+
+    if (!current || typeof current !== "object") {
+      return undefined
+    }
+
+    return current[key]
+  }, source)
+}
+
+function getDonationSenderName(eventData, data, creator) {
+  const creatorNames = [
+    creator?.name,
+    creator?.virtualAccount?.accountName,
+    `StreamTip/${creator?.name || ""}`,
+    eventData?.customer?.name,
+    eventData?.customerName,
+  ]
+    .map(normalizeName)
+    .filter(Boolean)
+
+  const candidatePaths = [
+    "paymentSourceInformation.accountName",
+    "paymentSourceInformation.accountHolderName",
+    "paymentSourceInformation.originatorAccountName",
+    "sourceAccountInformation.accountName",
+    "sourceAccountInformation.accountHolderName",
+    "originatorAccountName",
+    "sourceAccountName",
+    "accountName",
+    "payerName",
+    "payer.accountName",
+    "payer.name",
+  ]
+
+  const candidates = [
+    ...candidatePaths.map((path) => getNestedValue(eventData, path)),
+    ...candidatePaths.map((path) => getNestedValue(data, path)),
+    data?.sender,
+    data?.payerName,
+  ]
+
+  for (const candidate of candidates) {
+    const sender = String(candidate || "").trim()
+    const normalizedSender = normalizeName(sender)
+
+    if (!sender || !normalizedSender || creatorNames.includes(normalizedSender)) {
+      continue
+    }
+
+    if (normalizedSender.startsWith("streamtip ")) {
+      continue
+    }
+
+    return sender
+  }
+
+  return "Anonymous"
+}
+
 function sanitizeUser(user) {
   if (!user) return null
 
@@ -1721,14 +1789,6 @@ app.post("/webhook/monnify", async (req, res) => {
       }
     }
 
-    const sender =
-      eventData.payerName ||
-      eventData.customer?.name ||
-      eventData.customerName ||
-      eventData.paymentSourceInformation?.accountName ||
-      data.sender ||
-      data.payerName ||
-      "Anonymous"
     const destinationAccountNumber = String(
       eventData.destinationAccountInformation?.accountNumber || "",
     ).trim()
@@ -1756,6 +1816,7 @@ app.post("/webhook/monnify", async (req, res) => {
       return res.sendStatus(200)
     }
 
+    const sender = getDonationSenderName(eventData, data, creator)
     const donation = await Donation.create({
       creatorId: creator._id,
       creatorEmail: creator.email,
