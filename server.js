@@ -338,6 +338,7 @@ const userSchema = new mongoose.Schema(
       settings: { type: mongoose.Schema.Types.Mixed, default: defaultOverlaySettings },
       customization: { type: mongoose.Schema.Types.Mixed, default: defaultOverlayCustomization },
       customGifts: { type: mongoose.Schema.Types.Mixed, default: defaultCustomGifts },
+      leaderboardResetAt: Date,
       updatedAt: Date,
     },
   },
@@ -436,6 +437,9 @@ function getOverlayStateForUser(user) {
     customGifts: Array.isArray(overlayState.customGifts) && overlayState.customGifts.length
       ? overlayState.customGifts
       : defaultCustomGifts,
+    leaderboardResetAt: overlayState.leaderboardResetAt
+      ? new Date(overlayState.leaderboardResetAt).toISOString()
+      : "",
   }
 }
 
@@ -1937,6 +1941,12 @@ app.put("/overlay-state", requireSessionUser, async (req, res) => {
       settings: req.body?.settings ? req.body.settings : currentState.settings,
       customization: req.body?.customization ? req.body.customization : currentState.customization,
       customGifts: Array.isArray(req.body?.customGifts) ? req.body.customGifts : currentState.customGifts,
+      leaderboardResetAt:
+        typeof req.body?.leaderboardResetAt === "string" && req.body.leaderboardResetAt
+          ? new Date(req.body.leaderboardResetAt)
+          : currentState.leaderboardResetAt
+            ? new Date(currentState.leaderboardResetAt)
+            : undefined,
       updatedAt: new Date(),
     }
 
@@ -1964,11 +1974,21 @@ app.get("/public/overlay/:creatorId", async (req, res) => {
       return res.status(404).json({ error: "Overlay not found." })
     }
 
-    const donations = await Donation.find({ creatorId: user._id }).sort({ date: -1 }).limit(100)
+    const overlayState = getOverlayStateForUser(user)
+    const leaderboardResetAt = overlayState.leaderboardResetAt
+      ? new Date(overlayState.leaderboardResetAt)
+      : null
+    const donationQuery = {
+      creatorId: user._id,
+      ...(leaderboardResetAt && !Number.isNaN(leaderboardResetAt.getTime())
+        ? { date: { $gte: leaderboardResetAt } }
+        : {}),
+    }
+    const donations = await Donation.find(donationQuery).sort({ date: -1 }).limit(100)
 
     res.set("Cache-Control", "no-store, max-age=0")
     return res.json({
-      ...getOverlayStateForUser(user),
+      ...overlayState,
       user: sanitizePublicOverlayUser(user),
       donations,
     })
