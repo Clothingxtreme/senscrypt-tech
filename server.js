@@ -151,6 +151,48 @@ const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
 let lastDatabaseError = ""
 
+const defaultOverlaySettings = {
+  animations: true,
+  sounds: true,
+  notifications: false,
+  preview: false,
+}
+
+const defaultOverlayCustomization = {
+  giftPack: "tiktok",
+  goalAmount: 250000,
+  goalTitle: "Tonight's Gift Goal",
+  previewPlatform: "tiktok",
+  goalOpacity: 0.92,
+  leaderboardOpacity: 0.88,
+  accountOpacity: 0.9,
+  showLeaderboard: true,
+  showGoal: true,
+  showAccountDetails: true,
+  showTopSupporter: true,
+  showAmbientScene: true,
+  alertPosition: { anchor: "center", offsetX: 0, offsetY: 12 },
+  goalPosition: { anchor: "top-center", offsetX: 0, offsetY: 0 },
+  leaderboardPosition: { anchor: "top-right", offsetX: 0, offsetY: 0 },
+  accountPosition: { anchor: "bottom-left", offsetX: 0, offsetY: 0 },
+  goalGradient: { start: "#22d3ee", middle: "#8b5cf6", end: "#ec4899" },
+  leaderboardGradient: { start: "#818cf8", middle: "#22d3ee", end: "#f472b6" },
+  accountGradient: { start: "#1d4ed8", middle: "#0f766e", end: "#22c55e" },
+  alertGradient: { start: "#f472b6", middle: "#8b5cf6", end: "#38bdf8" },
+}
+
+const defaultCustomGifts = [
+  { id: "gift-rose", name: "Rose", icon: "Rose", minAmount: 1, maxAmount: 49, animationType: "rose-bloom" },
+  { id: "gift-panda", name: "Panda", icon: "Panda", minAmount: 50, maxAmount: 299, animationType: "bubble-pop" },
+  { id: "gift-perfume", name: "Perfume", icon: "Perfume", minAmount: 300, maxAmount: 999, animationType: "petal-rain" },
+  { id: "gift-confetti", name: "Confetti", icon: "Confetti", minAmount: 1000, maxAmount: 4999, animationType: "confetti-burst" },
+  { id: "gift-money-rain", name: "Money Rain", icon: "Money Rain", minAmount: 5000, maxAmount: 14999, animationType: "money-cannon" },
+  { id: "gift-disco-ball", name: "Disco Ball", icon: "Disco Ball", minAmount: 15000, maxAmount: 44999, animationType: "disco-spin" },
+  { id: "gift-airplane", name: "Airplane", icon: "Airplane", minAmount: 45000, maxAmount: 149999, animationType: "airplane-flyover" },
+  { id: "gift-lion", name: "Lion", icon: "Lion", minAmount: 150000, maxAmount: 449999, animationType: "lion-roar" },
+  { id: "gift-universe", name: "Universe", icon: "Universe", minAmount: 450000, maxAmount: 2000000, animationType: "universe-rift" },
+]
+
 function getMongoUriHost() {
   if (!MONGODB_URI) {
     return ""
@@ -292,6 +334,12 @@ const userSchema = new mongoose.Schema(
       environment: { type: String, enum: ["sandbox", "live"], default: "sandbox" },
       createdAt: Date,
     },
+    overlayState: {
+      settings: { type: mongoose.Schema.Types.Mixed, default: defaultOverlaySettings },
+      customization: { type: mongoose.Schema.Types.Mixed, default: defaultOverlayCustomization },
+      customGifts: { type: mongoose.Schema.Types.Mixed, default: defaultCustomGifts },
+      updatedAt: Date,
+    },
   },
   {
     timestamps: true,
@@ -358,6 +406,39 @@ function sanitizeIdentity(identity) {
   }
 }
 
+function getOverlaySlug(user) {
+  const slug = String(user?.name || "creator")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+
+  return slug || "creator"
+}
+
+function sanitizePlainObject(value, fallback) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ...fallback }
+  }
+
+  return {
+    ...fallback,
+    ...value,
+  }
+}
+
+function getOverlayStateForUser(user) {
+  const overlayState = user?.overlayState || {}
+
+  return {
+    settings: sanitizePlainObject(overlayState.settings, defaultOverlaySettings),
+    customization: sanitizePlainObject(overlayState.customization, defaultOverlayCustomization),
+    customGifts: Array.isArray(overlayState.customGifts) && overlayState.customGifts.length
+      ? overlayState.customGifts
+      : defaultCustomGifts,
+  }
+}
+
 function sanitizeUser(user) {
   if (!user) return null
 
@@ -365,12 +446,27 @@ function sanitizeUser(user) {
     id: user._id,
     name: user.name,
     email: user.email,
+    overlaySlug: getOverlaySlug(user),
     role: user.role || "creator",
     status: user.status || "active",
     profileImage: user.profileImage || "",
     identity: sanitizeIdentity(user.identity),
     virtualAccount: user.virtualAccount || null,
     createdAt: user.createdAt,
+  }
+}
+
+function sanitizePublicOverlayUser(user) {
+  const sanitized = sanitizeUser(user)
+
+  if (!sanitized) {
+    return null
+  }
+
+  return {
+    ...sanitized,
+    email: "",
+    identity: undefined,
   }
 }
 
@@ -1164,6 +1260,19 @@ io.use(async (socket, next) => {
     const sessionToken = String(
       socket.handshake.auth?.sessionToken || socket.handshake.headers["x-session-token"] || "",
     ).trim()
+    const overlayCreatorId = String(socket.handshake.auth?.overlayCreatorId || "").trim()
+
+    if (overlayCreatorId && mongoose.Types.ObjectId.isValid(overlayCreatorId)) {
+      const creator = await User.findById(overlayCreatorId)
+
+      if (creator && (!creator.status || creator.status === "active")) {
+        socket.data.user = null
+        socket.data.overlayCreatorId = creator._id
+        socket.join(getCreatorRoom(creator._id))
+      }
+
+      return next()
+    }
 
     if (!sessionToken) {
       socket.data.user = null
@@ -1748,6 +1857,63 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: "Failed to create Monnify sandbox donation." })
+  }
+})
+
+app.get("/overlay-state", requireSessionUser, async (req, res) => {
+  try {
+    return res.json(getOverlayStateForUser(req.user))
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to load overlay state." })
+  }
+})
+
+app.put("/overlay-state", requireSessionUser, async (req, res) => {
+  try {
+    const currentState = getOverlayStateForUser(req.user)
+    const nextState = {
+      settings: req.body?.settings ? req.body.settings : currentState.settings,
+      customization: req.body?.customization ? req.body.customization : currentState.customization,
+      customGifts: Array.isArray(req.body?.customGifts) ? req.body.customGifts : currentState.customGifts,
+      updatedAt: new Date(),
+    }
+
+    req.user.overlayState = nextState
+    await req.user.save()
+
+    return res.json(getOverlayStateForUser(req.user))
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to save overlay state." })
+  }
+})
+
+app.get("/public/overlay/:creatorId", async (req, res) => {
+  try {
+    const creatorId = String(req.params.creatorId || "").trim()
+
+    if (!mongoose.Types.ObjectId.isValid(creatorId)) {
+      return res.status(404).json({ error: "Overlay not found." })
+    }
+
+    const user = await User.findById(creatorId)
+
+    if (!user || (user.status && user.status !== "active")) {
+      return res.status(404).json({ error: "Overlay not found." })
+    }
+
+    const donations = await Donation.find({ creatorId: user._id }).sort({ date: -1 }).limit(100)
+
+    res.set("Cache-Control", "no-store, max-age=0")
+    return res.json({
+      ...getOverlayStateForUser(user),
+      user: sanitizePublicOverlayUser(user),
+      donations,
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to load public overlay." })
   }
 })
 
