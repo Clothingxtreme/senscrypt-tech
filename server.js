@@ -596,8 +596,34 @@ function verifyMonnifySignature(req) {
   return safeTimingEqual(headerSignature, expectedSignature)
 }
 
+function parseMoneyAmount(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value
+  }
+
+  const normalized = String(value || "")
+    .replace(/,/g, "")
+    .replace(/[^\d.-]/g, "")
+    .trim()
+  const parsed = Number(normalized)
+
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function firstValidMoneyAmount(...values) {
+  for (const value of values) {
+    const amount = parseMoneyAmount(value)
+
+    if (amount > 0) {
+      return amount
+    }
+  }
+
+  return 0
+}
+
 function calculateRevenueSplit(amount) {
-  const gross = Number(amount) || 0
+  const gross = parseMoneyAmount(amount)
   const platformFee = Math.round(gross * PLATFORM_FEE_RATE)
   const creatorShare = Math.max(0, gross - platformFee)
 
@@ -1799,9 +1825,33 @@ app.post("/webhook/monnify", async (req, res) => {
     const destinationBankName = String(
       eventData.destinationAccountInformation?.bankName || "",
     ).trim()
-    const split = calculateRevenueSplit(
-      eventData.paidOn ? eventData.amountPaid : eventData.amountPaid || data.amount || data.amountPaid || 0,
+    const grossAmount = firstValidMoneyAmount(
+      eventData.amountPaid,
+      eventData.amount,
+      eventData.settlementAmount,
+      eventData.totalPayable,
+      data.amount,
+      data.amountPaid,
     )
+    const split = calculateRevenueSplit(grossAmount)
+
+    if (split.gross <= 0) {
+      await createAuditLog({
+        actorType: "system",
+        eventType: "webhook.monnify.invalid_amount",
+        message: "Monnify webhook had a paid status but no valid donation amount.",
+        metadata: {
+          eventType,
+          transactionReference,
+          paymentReference,
+          amountPaid: eventData.amountPaid,
+          amount: eventData.amount || data.amount,
+          dataAmountPaid: data.amountPaid,
+        },
+      })
+
+      return res.sendStatus(200)
+    }
 
     if (!creator) {
       await createAuditLog({
