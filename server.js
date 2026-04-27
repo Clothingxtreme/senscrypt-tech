@@ -333,6 +333,13 @@ function requireDatabaseReady(_req, res, next) {
     return next()
   }
 
+  console.error("database.not_ready", {
+    readyState: mongoose.connection.readyState,
+    host: getMongoUriHost(),
+    databaseName: mongoose.connection.name || "",
+    lastDatabaseError,
+  })
+
   return res.status(503).json({
     error: "Database is not connected. Check MONGODB_URI in the backend environment variables.",
   })
@@ -1762,6 +1769,7 @@ app.get("/health", (_req, res) => {
     service: "streamtip-api",
     database: isDatabaseConnected() ? "connected" : "disconnected",
     databaseReadyState: mongoose.connection.readyState,
+    databaseName: mongoose.connection.name || "",
     mongodbUriConfigured: Boolean(MONGODB_URI),
     mongodbHost: getMongoUriHost(),
     lastDatabaseError,
