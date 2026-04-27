@@ -681,9 +681,14 @@ function getDonationSenderName(eventData, data, creator) {
       /(narration|remark|remarks|senderremark|originatorremark|description|note|comment)$/i,
     ),
   ]
+  const checkedNarrations = []
 
   for (const candidate of narrationCandidates) {
     const nickname = sanitizeDonorDisplayName(candidate)
+
+    if (nickname) {
+      checkedNarrations.push(nickname)
+    }
 
     if (!nickname || isSystemNarration(nickname, creatorNames)) {
       continue
@@ -692,6 +697,7 @@ function getDonationSenderName(eventData, data, creator) {
     return {
       name: nickname,
       source: "narration",
+      checkedNarrations: Array.from(new Set(checkedNarrations)).slice(0, 12),
     }
   }
 
@@ -731,12 +737,14 @@ function getDonationSenderName(eventData, data, creator) {
     return {
       name: getFirstNameOnly(sender),
       source: "account_first_name",
+      checkedNarrations: Array.from(new Set(checkedNarrations)).slice(0, 12),
     }
   }
 
   return {
     name: "Anonymous",
     source: "anonymous",
+    checkedNarrations: Array.from(new Set(checkedNarrations)).slice(0, 12),
   }
 }
 
@@ -2157,6 +2165,7 @@ app.post("/webhook/monnify", async (req, res) => {
       metadata: {
         sender: senderDisplay.name,
         senderNameSource: senderDisplay.source,
+        checkedNarrations: senderDisplay.checkedNarrations || [],
         amount: split.gross,
         platformFee: split.platformFee,
         creatorShare: split.creatorShare,
