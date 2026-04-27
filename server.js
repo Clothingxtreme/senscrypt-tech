@@ -175,16 +175,48 @@ async function saveGiftSoundUpload({ req, buffer, mimeType, originalFileName }) 
     throw error
   }
 
-  const safeUserId = String(req.user._id).replace(/[^a-z0-9]/gi, "")
-  const fileName = `${safeUserId}-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${extension}`
-  const filePath = path.join(giftSoundsUploadDir, fileName)
-
-  await fs.promises.writeFile(filePath, buffer)
+  const sound = await GiftSound.create({
+    ownerId: req.user._id,
+    fileName: String(originalFileName || "Uploaded audio").slice(0, 80),
+    contentType: String(mimeType || "audio/mpeg").split(";")[0].trim(),
+    data: buffer,
+    createdAt: new Date(),
+  })
 
   return {
-    soundUrl: `${getPublicRequestBaseUrl(req)}/uploads/gift-sounds/${fileName}`,
+    soundUrl: `${getPublicRequestBaseUrl(req)}/uploads/gift-sounds/${sound._id}`,
     soundName: String(originalFileName || "Uploaded audio").slice(0, 80),
   }
+}
+
+async function normalizeCustomGiftSoundUploads(req, customGifts) {
+  if (!Array.isArray(customGifts)) {
+    return customGifts
+  }
+
+  return Promise.all(
+    customGifts.map(async (gift) => {
+      const soundUrl = String(gift?.soundUrl || "")
+      const match = soundUrl.match(/^data:([^;]+);base64,(.+)$/)
+
+      if (!match) {
+        return gift
+      }
+
+      const savedSound = await saveGiftSoundUpload({
+        req,
+        buffer: Buffer.from(match[2], "base64"),
+        mimeType: match[1],
+        originalFileName: gift.soundName || `${gift.name || "gift"} sound`,
+      })
+
+      return {
+        ...gift,
+        soundUrl: savedSound.soundUrl,
+        soundName: savedSound.soundName,
+      }
+    }),
+  )
 }
 
 const app = express()
@@ -380,8 +412,20 @@ const auditLogSchema = new mongoose.Schema(
   { timestamps: false },
 )
 
+const giftSoundSchema = new mongoose.Schema(
+  {
+    ownerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
+    fileName: { type: String, default: "Uploaded audio" },
+    contentType: { type: String, default: "audio/mpeg" },
+    data: Buffer,
+    createdAt: { type: Date, default: Date.now },
+  },
+  { timestamps: false },
+)
+
 const AdminSession = mongoose.model("AdminSession", adminSessionSchema)
 const AuditLog = mongoose.model("AuditLog", auditLogSchema)
+const GiftSound = mongoose.model("GiftSound", giftSoundSchema)
 
 const userSchema = new mongoose.Schema(
   {
@@ -625,6 +669,44 @@ function collectNestedValuesByKey(source, keyPattern, maxDepth = 5) {
   return results
 }
 
+function collectNestedEntriesByKey(source, keyPattern, maxDepth = 5) {
+  const results = []
+  const visited = new Set()
+
+  function visit(value, depth, pathParts) {
+    if (!value || typeof value !== "object" || depth > maxDepth || visited.has(value)) {
+      return
+    }
+
+    visited.add(value)
+
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, depth + 1, [...pathParts, String(index)]))
+      return
+    }
+
+    Object.entries(value).forEach(([key, nestedValue]) => {
+      const nextPathParts = [...pathParts, key]
+
+      if (keyPattern.test(key) && typeof nestedValue !== "object") {
+        const displayValue = sanitizeDonorDisplayName(nestedValue)
+
+        if (displayValue) {
+          results.push({
+            path: nextPathParts.join("."),
+            value: displayValue,
+          })
+        }
+      }
+
+      visit(nestedValue, depth + 1, nextPathParts)
+    })
+  }
+
+  visit(source, 0, [])
+  return results
+}
+
 function getDonationSenderName(eventData, data, creator) {
   const creatorNames = [
     creator?.name,
@@ -681,6 +763,16 @@ function getDonationSenderName(eventData, data, creator) {
       /(narration|remark|remarks|senderremark|originatorremark|description|note|comment)$/i,
     ),
   ]
+  const checkedNarrationFields = [
+    ...collectNestedEntriesByKey(
+      eventData,
+      /(narration|remark|remarks|senderremark|originatorremark|description|note|comment|reference)$/i,
+    ).map((entry) => ({ ...entry, root: "eventData" })),
+    ...collectNestedEntriesByKey(
+      data,
+      /(narration|remark|remarks|senderremark|originatorremark|description|note|comment|reference)$/i,
+    ).map((entry) => ({ ...entry, root: "data" })),
+  ].slice(0, 20)
   const checkedNarrations = []
 
   for (const candidate of narrationCandidates) {
@@ -698,6 +790,7 @@ function getDonationSenderName(eventData, data, creator) {
       name: nickname,
       source: "narration",
       checkedNarrations: Array.from(new Set(checkedNarrations)).slice(0, 12),
+      checkedNarrationFields,
     }
   }
 
@@ -738,6 +831,7 @@ function getDonationSenderName(eventData, data, creator) {
       name: getFirstNameOnly(sender),
       source: "account_first_name",
       checkedNarrations: Array.from(new Set(checkedNarrations)).slice(0, 12),
+      checkedNarrationFields,
     }
   }
 
@@ -745,6 +839,7 @@ function getDonationSenderName(eventData, data, creator) {
     name: "Anonymous",
     source: "anonymous",
     checkedNarrations: Array.from(new Set(checkedNarrations)).slice(0, 12),
+    checkedNarrationFields,
   }
 }
 
@@ -2140,6 +2235,20 @@ app.post("/webhook/monnify", async (req, res) => {
     }
 
     const senderDisplay = getDonationSenderName(eventData, data, creator)
+    const senderNameResolutionMetadata = {
+      sender: senderDisplay.name,
+      senderNameSource: senderDisplay.source,
+      checkedNarrations: senderDisplay.checkedNarrations || [],
+      checkedNarrationFields: (senderDisplay.checkedNarrationFields || []).map((entry) => ({
+        ...entry,
+        rejectedAsSystem: isSystemNarration(entry.value, []),
+      })),
+      creatorId: creator._id.toString(),
+      transactionReference,
+      paymentReference,
+    }
+    console.info("donation.sender_name_resolution", senderNameResolutionMetadata)
+
     const donation = await Donation.create({
       creatorId: creator._id,
       creatorEmail: creator.email,
@@ -2160,12 +2269,20 @@ app.post("/webhook/monnify", async (req, res) => {
 
     await createAuditLog({
       actorType: "system",
+      eventType: "donation.sender_name_resolution",
+      message: `Donation sender display resolved as ${senderDisplay.source}.`,
+      metadata: senderNameResolutionMetadata,
+    })
+
+    await createAuditLog({
+      actorType: "system",
       eventType: "donation.received",
       message: `Donation received from ${senderDisplay.name}.`,
       metadata: {
         sender: senderDisplay.name,
         senderNameSource: senderDisplay.source,
         checkedNarrations: senderDisplay.checkedNarrations || [],
+        checkedNarrationFields: senderDisplay.checkedNarrationFields || [],
         amount: split.gross,
         platformFee: split.platformFee,
         creatorShare: split.creatorShare,
@@ -2259,6 +2376,27 @@ app.get("/overlay-state", requireSessionUser, async (req, res) => {
   }
 })
 
+app.get("/uploads/gift-sounds/:soundId", async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.soundId)) {
+      return res.status(404).send("Sound not found.")
+    }
+
+    const sound = await GiftSound.findById(req.params.soundId)
+
+    if (!sound?.data?.length) {
+      return res.status(404).send("Sound not found.")
+    }
+
+    res.setHeader("Content-Type", sound.contentType || "audio/mpeg")
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable")
+    return res.send(sound.data)
+  } catch (error) {
+    console.error(error)
+    return res.status(500).send("Failed to load gift sound.")
+  }
+})
+
 app.post(
   "/overlay-sound-upload",
   requireSessionUser,
@@ -2312,10 +2450,13 @@ app.post("/overlay-sound-upload-json", requireSessionUser, async (req, res) => {
 app.put("/overlay-state", requireSessionUser, async (req, res) => {
   try {
     const currentState = getOverlayStateForUser(req.user)
+    const nextCustomGifts = Array.isArray(req.body?.customGifts)
+      ? await normalizeCustomGiftSoundUploads(req, req.body.customGifts)
+      : currentState.customGifts
     const nextState = {
       settings: req.body?.settings ? req.body.settings : currentState.settings,
       customization: req.body?.customization ? req.body.customization : currentState.customization,
-      customGifts: Array.isArray(req.body?.customGifts) ? req.body.customGifts : currentState.customGifts,
+      customGifts: nextCustomGifts,
       leaderboardResetAt:
         typeof req.body?.leaderboardResetAt === "string" && req.body.leaderboardResetAt
           ? new Date(req.body.leaderboardResetAt)
@@ -2731,6 +2872,7 @@ app.delete("/admin/users/:id", requireAdminSession, async (req, res) => {
     await Promise.all([
       Donation.deleteMany({ creatorId: user._id }),
       Payout.deleteMany({ creatorId: user._id }),
+      GiftSound.deleteMany({ ownerId: user._id }),
       User.deleteOne({ _id: user._id }),
     ])
 
