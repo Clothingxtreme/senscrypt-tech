@@ -4,6 +4,7 @@ const mongoose = require("mongoose")
 const cors = require("cors")
 const axios = require("axios")
 const crypto = require("crypto")
+const fs = require("fs")
 const path = require("path")
 const { Server } = require("socket.io")
 const { AxiosError } = require("axios")
@@ -120,7 +121,79 @@ function isWebhookIpAllowed(req) {
   return requestIps.some((ip) => monnifyWebhookIpAllowlist.includes(ip))
 }
 
+function getPublicRequestBaseUrl(req) {
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim()
+  const protocol = forwardedProto || req.protocol || "http"
+  const host = req.get("host")
+
+  return `${protocol}://${host}`
+}
+
+function getAudioUploadExtension(mimeType) {
+  const normalized = String(mimeType || "").toLowerCase().split(";")[0].trim()
+
+  if (normalized === "audio/mpeg" || normalized === "audio/mp3") return ".mp3"
+  if (normalized === "audio/wav" || normalized === "audio/x-wav" || normalized === "audio/wave") {
+    return ".wav"
+  }
+  if (normalized === "audio/ogg") return ".ogg"
+  if (normalized === "audio/webm") return ".webm"
+  if (normalized === "audio/aac") return ".aac"
+  if (normalized === "audio/mp4" || normalized === "audio/x-m4a") return ".m4a"
+
+  return ""
+}
+
+function getAudioUploadExtensionFromName(fileName) {
+  const extension = path.extname(String(fileName || "").toLowerCase())
+
+  if ([".mp3", ".wav", ".ogg", ".webm", ".aac", ".m4a"].includes(extension)) {
+    return extension
+  }
+
+  return ""
+}
+
+async function saveGiftSoundUpload({ req, buffer, mimeType, originalFileName }) {
+  const extension = getAudioUploadExtension(mimeType) || getAudioUploadExtensionFromName(originalFileName)
+
+  if (!extension) {
+    const error = new Error("Upload an MP3, WAV, OGG, WEBM, AAC, or M4A audio file.")
+    error.statusCode = 400
+    throw error
+  }
+
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+    const error = new Error("No audio file was uploaded.")
+    error.statusCode = 400
+    throw error
+  }
+
+  if (buffer.length > 2 * 1024 * 1024) {
+    const error = new Error("Use an audio file smaller than 2 MB.")
+    error.statusCode = 400
+    throw error
+  }
+
+  const safeUserId = String(req.user._id).replace(/[^a-z0-9]/gi, "")
+  const fileName = `${safeUserId}-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${extension}`
+  const filePath = path.join(giftSoundsUploadDir, fileName)
+
+  await fs.promises.writeFile(filePath, buffer)
+
+  return {
+    soundUrl: `${getPublicRequestBaseUrl(req)}/uploads/gift-sounds/${fileName}`,
+    soundName: String(originalFileName || "Uploaded audio").slice(0, 80),
+  }
+}
+
 const app = express()
+app.set("trust proxy", true)
+
+const uploadsRoot = path.join(__dirname, "uploads")
+const giftSoundsUploadDir = path.join(uploadsRoot, "gift-sounds")
+fs.mkdirSync(giftSoundsUploadDir, { recursive: true })
+
 app.use(
   cors({
     origin(origin, callback) {
@@ -132,8 +205,10 @@ app.use(
     },
   }),
 )
+app.use("/uploads", express.static(uploadsRoot))
 app.use(
   express.json({
+    limit: "25mb",
     verify: (req, _res, buffer) => {
       req.rawBody = buffer.toString("utf8")
     },
@@ -2108,6 +2183,56 @@ app.get("/overlay-state", requireSessionUser, async (req, res) => {
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: "Failed to load overlay state." })
+  }
+})
+
+app.post(
+  "/overlay-sound-upload",
+  requireSessionUser,
+  express.raw({ type: ["audio/*", "application/octet-stream"], limit: "3mb" }),
+  async (req, res) => {
+    try {
+      const mimeType = String(req.headers["content-type"] || "").split(";")[0].trim()
+      const originalFileName = String(req.headers["x-file-name"] || "Uploaded audio").slice(0, 80)
+      const savedSound = await saveGiftSoundUpload({
+        req,
+        buffer: req.body,
+        mimeType,
+        originalFileName,
+      })
+
+      return res.status(201).json(savedSound)
+    } catch (error) {
+      console.error(error)
+      return res.status(error.statusCode || 500).json({
+        error: error instanceof Error ? error.message : "Failed to upload gift sound.",
+      })
+    }
+  },
+)
+
+app.post("/overlay-sound-upload-json", requireSessionUser, async (req, res) => {
+  try {
+    const dataUrl = String(req.body?.dataUrl || "")
+    const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
+
+    if (!match) {
+      return res.status(400).json({ error: "Invalid audio upload payload." })
+    }
+
+    const savedSound = await saveGiftSoundUpload({
+      req,
+      buffer: Buffer.from(match[2], "base64"),
+      mimeType: String(req.body?.mimeType || match[1]),
+      originalFileName: String(req.body?.fileName || "Uploaded audio").slice(0, 80),
+    })
+
+    return res.status(201).json(savedSound)
+  } catch (error) {
+    console.error(error)
+    return res.status(error.statusCode || 500).json({
+      error: error instanceof Error ? error.message : "Failed to upload gift sound.",
+    })
   }
 })
 
