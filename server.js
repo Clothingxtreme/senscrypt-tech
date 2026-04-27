@@ -235,6 +235,7 @@ const donationSchema = new mongoose.Schema({
   creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
   creatorEmail: String,
   sender: String,
+  senderNameSource: String,
   amount: Number,
   platformFee: Number,
   creatorShare: Number,
@@ -461,6 +462,51 @@ function getNestedValue(source, path) {
   }, source)
 }
 
+function sanitizeDonorDisplayName(value) {
+  return String(value || "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[<>]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 32)
+}
+
+function getFirstNameOnly(value) {
+  const sanitized = sanitizeDonorDisplayName(value)
+    .replace(/^streamtip\s*\/\s*/i, "")
+    .replace(/^from\s+/i, "")
+    .trim()
+
+  if (!sanitized) {
+    return "Anonymous"
+  }
+
+  return sanitized.split(/\s+/)[0] || "Anonymous"
+}
+
+function isSystemNarration(value, creatorNames = []) {
+  const sanitized = sanitizeDonorDisplayName(value)
+  const normalized = normalizeName(sanitized)
+
+  if (!normalized) return true
+  if (creatorNames.includes(normalized)) return true
+  if (normalized.startsWith("streamtip ")) return true
+  if (/^(transfer|bank transfer|payment|donation|gift|monnify|moniepoint|wallet funding)$/i.test(sanitized)) {
+    return true
+  }
+  if (/^(mfy|mnfy|stp|stip|trf|txn|ref)[\s/-]*[a-z0-9-]{5,}$/i.test(sanitized)) {
+    return true
+  }
+  if (/^[a-z0-9-]{18,}$/i.test(sanitized) && /\d/.test(sanitized)) {
+    return true
+  }
+  if (/^\d{6,}$/.test(sanitized)) {
+    return true
+  }
+
+  return false
+}
+
 function getDonationSenderName(eventData, data, creator) {
   const creatorNames = [
     creator?.name,
@@ -472,7 +518,45 @@ function getDonationSenderName(eventData, data, creator) {
     .map(normalizeName)
     .filter(Boolean)
 
-  const candidatePaths = [
+  const narrationPaths = [
+    "narration",
+    "remark",
+    "remarks",
+    "reference",
+    "senderReference",
+    "customerReference",
+    "paymentDescription",
+    "paymentNarration",
+    "transactionNarration",
+    "transactionDescription",
+    "transactionRemark",
+    "description",
+    "note",
+    "meta.narration",
+    "meta.remark",
+    "metadata.narration",
+    "metadata.remark",
+  ]
+
+  const narrationCandidates = [
+    ...narrationPaths.map((path) => getNestedValue(eventData, path)),
+    ...narrationPaths.map((path) => getNestedValue(data, path)),
+  ]
+
+  for (const candidate of narrationCandidates) {
+    const nickname = sanitizeDonorDisplayName(candidate)
+
+    if (!nickname || isSystemNarration(nickname, creatorNames)) {
+      continue
+    }
+
+    return {
+      name: nickname,
+      source: "narration",
+    }
+  }
+
+  const senderNamePaths = [
     "paymentSourceInformation.accountName",
     "paymentSourceInformation.accountHolderName",
     "paymentSourceInformation.originatorAccountName",
@@ -487,8 +571,8 @@ function getDonationSenderName(eventData, data, creator) {
   ]
 
   const candidates = [
-    ...candidatePaths.map((path) => getNestedValue(eventData, path)),
-    ...candidatePaths.map((path) => getNestedValue(data, path)),
+    ...senderNamePaths.map((path) => getNestedValue(eventData, path)),
+    ...senderNamePaths.map((path) => getNestedValue(data, path)),
     data?.sender,
     data?.payerName,
   ]
@@ -505,10 +589,16 @@ function getDonationSenderName(eventData, data, creator) {
       continue
     }
 
-    return sender
+    return {
+      name: getFirstNameOnly(sender),
+      source: "account_first_name",
+    }
   }
 
-  return "Anonymous"
+  return {
+    name: "Anonymous",
+    source: "anonymous",
+  }
 }
 
 function sanitizeUser(user) {
@@ -1870,11 +1960,12 @@ app.post("/webhook/monnify", async (req, res) => {
       return res.sendStatus(200)
     }
 
-    const sender = getDonationSenderName(eventData, data, creator)
+    const senderDisplay = getDonationSenderName(eventData, data, creator)
     const donation = await Donation.create({
       creatorId: creator._id,
       creatorEmail: creator.email,
-      sender,
+      sender: senderDisplay.name,
+      senderNameSource: senderDisplay.source,
       amount: split.gross,
       platformFee: split.platformFee,
       creatorShare: split.creatorShare,
@@ -1891,9 +1982,10 @@ app.post("/webhook/monnify", async (req, res) => {
     await createAuditLog({
       actorType: "system",
       eventType: "donation.received",
-      message: `Donation received from ${sender}.`,
+      message: `Donation received from ${senderDisplay.name}.`,
       metadata: {
-        sender,
+        sender: senderDisplay.name,
+        senderNameSource: senderDisplay.source,
         amount: split.gross,
         platformFee: split.platformFee,
         creatorShare: split.creatorShare,
@@ -1926,7 +2018,9 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
     }
 
     const amount = Number(req.body?.amount) || 0
-    const sender = String(req.body?.sender || "Monnify Sandbox Tester").trim() || "Monnify Sandbox Tester"
+    const sender =
+      sanitizeDonorDisplayName(req.body?.sender || "Monnify Sandbox Tester") ||
+      "Monnify Sandbox Tester"
 
     if (!amount || amount <= 0) {
       return res.status(400).json({ error: "Enter a valid test donation amount." })
@@ -1938,6 +2032,7 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
       creatorId: req.user._id,
       creatorEmail: req.user.email,
       sender,
+      senderNameSource: "manual_test",
       amount: split.gross,
       platformFee: split.platformFee,
       creatorShare: split.creatorShare,
