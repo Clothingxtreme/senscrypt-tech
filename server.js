@@ -2699,8 +2699,13 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
 })
 
 app.get("/donations", requireSessionUser, async (req, res) => {
-  const donations = await Donation.find({ creatorId: req.user._id }).sort({ date: -1 })
-  res.json(donations)
+  try {
+    const donations = await Donation.find({ creatorId: req.user._id }).sort({ date: -1 })
+    res.json(donations)
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load donations." })
+  }
 })
 
 app.get("/user", requireSessionUser, async (req, res) => {
