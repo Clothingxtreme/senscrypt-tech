@@ -566,7 +566,11 @@ function isSystemNarration(value, creatorNames = []) {
   if (!normalized) return true
   if (creatorNames.includes(normalized)) return true
   if (normalized.startsWith("streamtip ")) return true
-  if (/^(transfer|bank transfer|payment|donation|gift|monnify|moniepoint|wallet funding)$/i.test(sanitized)) {
+  if (
+    /^(transfer|bank transfer|payment|bank transfer payment|donation|gift|monnify|moniepoint|wallet funding)$/i.test(
+      sanitized,
+    )
+  ) {
     return true
   }
   if (/^(mfy|mnfy|stp|stip|trf|txn|ref)[\s/-]*[a-z0-9-]{5,}$/i.test(sanitized)) {
@@ -580,6 +584,35 @@ function isSystemNarration(value, creatorNames = []) {
   }
 
   return false
+}
+
+function collectNestedValuesByKey(source, keyPattern, maxDepth = 5) {
+  const results = []
+  const visited = new Set()
+
+  function visit(value, depth) {
+    if (!value || typeof value !== "object" || depth > maxDepth || visited.has(value)) {
+      return
+    }
+
+    visited.add(value)
+
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item, depth + 1))
+      return
+    }
+
+    Object.entries(value).forEach(([key, nestedValue]) => {
+      if (keyPattern.test(key) && typeof nestedValue !== "object") {
+        results.push(nestedValue)
+      }
+
+      visit(nestedValue, depth + 1)
+    })
+  }
+
+  visit(source, 0)
+  return results
 }
 
 function getDonationSenderName(eventData, data, creator) {
@@ -600,11 +633,28 @@ function getDonationSenderName(eventData, data, creator) {
     "reference",
     "senderReference",
     "customerReference",
+    "paymentReference",
     "paymentDescription",
     "paymentNarration",
     "transactionNarration",
     "transactionDescription",
     "transactionRemark",
+    "paymentSourceInformation.narration",
+    "paymentSourceInformation.remark",
+    "paymentSourceInformation.remarks",
+    "paymentSourceInformation.description",
+    "paymentSourceInformation.paymentDescription",
+    "paymentSourceInformation.transactionDescription",
+    "sourceAccountInformation.narration",
+    "sourceAccountInformation.remark",
+    "sourceAccountInformation.remarks",
+    "sourceAccountInformation.description",
+    "sourceAccountInformation.paymentDescription",
+    "sourceAccountInformation.transactionDescription",
+    "originatorNarration",
+    "originatorRemark",
+    "senderNarration",
+    "senderRemark",
     "description",
     "note",
     "meta.narration",
@@ -616,6 +666,14 @@ function getDonationSenderName(eventData, data, creator) {
   const narrationCandidates = [
     ...narrationPaths.map((path) => getNestedValue(eventData, path)),
     ...narrationPaths.map((path) => getNestedValue(data, path)),
+    ...collectNestedValuesByKey(
+      eventData,
+      /(narration|remark|remarks|senderremark|originatorremark|description|note|comment|reference)$/i,
+    ),
+    ...collectNestedValuesByKey(
+      data,
+      /(narration|remark|remarks|senderremark|originatorremark|description|note|comment|reference)$/i,
+    ),
   ]
 
   for (const candidate of narrationCandidates) {
