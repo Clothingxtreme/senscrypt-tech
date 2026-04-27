@@ -562,10 +562,20 @@ function getFirstNameOnly(value) {
 function isSystemNarration(value, creatorNames = []) {
   const sanitized = sanitizeDonorDisplayName(value)
   const normalized = normalizeName(sanitized)
+  const compact = sanitized.replace(/[^a-z0-9]/gi, "").toLowerCase()
 
   if (!normalized) return true
   if (creatorNames.includes(normalized)) return true
   if (normalized.startsWith("streamtip ")) return true
+  if (/^(mfy|mnfy|monnify|stip|stp|trf|txn|ref)\d{5,}/i.test(compact)) {
+    return true
+  }
+  if (/^(mfy|mnfy|monnify|stip|stp|trf|txn|ref)(\s|\/|-)/i.test(sanitized)) {
+    return true
+  }
+  if ((sanitized.match(/\//g) || []).length >= 2 && /\d{8,}/.test(sanitized)) {
+    return true
+  }
   if (
     /^(transfer|bank transfer|payment|bank transfer payment|donation|gift|monnify|moniepoint|wallet funding)$/i.test(
       sanitized,
@@ -630,10 +640,6 @@ function getDonationSenderName(eventData, data, creator) {
     "narration",
     "remark",
     "remarks",
-    "reference",
-    "senderReference",
-    "customerReference",
-    "paymentReference",
     "paymentDescription",
     "paymentNarration",
     "transactionNarration",
@@ -668,11 +674,11 @@ function getDonationSenderName(eventData, data, creator) {
     ...narrationPaths.map((path) => getNestedValue(data, path)),
     ...collectNestedValuesByKey(
       eventData,
-      /(narration|remark|remarks|senderremark|originatorremark|description|note|comment|reference)$/i,
+      /(narration|remark|remarks|senderremark|originatorremark|description|note|comment)$/i,
     ),
     ...collectNestedValuesByKey(
       data,
-      /(narration|remark|remarks|senderremark|originatorremark|description|note|comment|reference)$/i,
+      /(narration|remark|remarks|senderremark|originatorremark|description|note|comment)$/i,
     ),
   ]
 
