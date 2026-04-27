@@ -744,16 +744,48 @@ function getAxiosErrorMessage(error, fallbackMessage) {
     return fallbackMessage
   }
 
+  const monnifyCode =
+    error.response?.data?.responseCode ||
+    error.response?.data?.responseBody?.responseCode ||
+    error.response?.data?.responseBody?.code
   const monnifyMessage =
     error.response?.data?.responseMessage ||
     error.response?.data?.responseBody?.message ||
     error.response?.data?.message
+
+  if (
+    String(monnifyCode || "").toUpperCase() === "D06" ||
+    String(monnifyMessage || "").toLowerCase().includes("unauthorized request")
+  ) {
+    return "Monnify rejected this withdrawal because the backend server IP is not authorized for live disbursement. Please contact support."
+  }
 
   if (typeof monnifyMessage === "string" && monnifyMessage.trim()) {
     return monnifyMessage.trim()
   }
 
   return error.message || fallbackMessage
+}
+
+function getAxiosErrorDetails(error) {
+  if (!(error instanceof AxiosError)) {
+    return {}
+  }
+
+  return {
+    httpStatus: error.response?.status || "",
+    responseCode:
+      error.response?.data?.responseCode ||
+      error.response?.data?.responseBody?.responseCode ||
+      error.response?.data?.responseBody?.code ||
+      "",
+    responseMessage:
+      error.response?.data?.responseMessage ||
+      error.response?.data?.responseBody?.message ||
+      error.response?.data?.message ||
+      error.message ||
+      "",
+  }
 }
 
 function buildMonnifyCustomerEmail(email, suffix) {
@@ -2256,6 +2288,7 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
         eventType: "payout.failed",
         message: `Payout failed for ${bankName}.`,
         metadata: {
+          ...getAxiosErrorDetails(error),
           amount: payoutAmount,
           bankName,
           bankCode,
