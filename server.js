@@ -441,12 +441,6 @@ const userSchema = new mongoose.Schema(
     identity: {
       bvn: { type: String, default: "" },
       nin: { type: String, default: "" },
-      dateOfBirth: { type: String, default: "" },
-      firstName: { type: String, default: "" },
-      middleName: { type: String, default: "" },
-      lastName: { type: String, default: "" },
-      policyAcceptedAt: Date,
-      signupCompletedAt: Date,
     },
     virtualAccount: {
       accountReference: String,
@@ -524,30 +518,12 @@ function requiresMonnifyCustomerVerification() {
 function sanitizeIdentity(identity) {
   const bvn = String(identity?.bvn || "").trim()
   const nin = String(identity?.nin || "").trim()
-  const dateOfBirth = String(identity?.dateOfBirth || "").trim()
-  const firstName = String(identity?.firstName || "").trim()
-  const middleName = String(identity?.middleName || "").trim()
-  const lastName = String(identity?.lastName || "").trim()
-  const policyAcceptedAt = identity?.policyAcceptedAt
-    ? new Date(identity.policyAcceptedAt).toISOString()
-    : ""
-  const signupCompletedAt = identity?.signupCompletedAt
-    ? new Date(identity.signupCompletedAt).toISOString()
-    : ""
 
   return {
     hasBvn: Boolean(bvn),
     hasNin: Boolean(nin),
     bvnLast4: bvn ? bvn.slice(-4) : "",
     ninLast4: nin ? nin.slice(-4) : "",
-    hasDateOfBirth: Boolean(dateOfBirth),
-    dateOfBirth,
-    firstName,
-    middleName,
-    lastName,
-    policyAcceptedAt,
-    signupCompletedAt,
-    isComplete: Boolean(bvn && nin && dateOfBirth && firstName && lastName && policyAcceptedAt),
   }
 }
 
@@ -1798,18 +1774,7 @@ app.use(requireDatabaseReady)
 
 app.post("/auth/register", async (req, res) => {
   try {
-    const {
-      name,
-      email,
-      password,
-      bvn = "",
-      nin = "",
-      dateOfBirth = "",
-      firstName = "",
-      middleName = "",
-      lastName = "",
-      acceptIdentityPolicy = false,
-    } = req.body
+    const { name, email, password, bvn = "", nin = "" } = req.body
 
     if (!name || !email || !password) {
       return res.status(400).json({ error: "Name, email, and password are required." })
@@ -1820,35 +1785,17 @@ app.post("/auth/register", async (req, res) => {
     const rawPassword = String(password)
     const trimmedBvn = String(bvn || "").trim()
     const trimmedNin = String(nin || "").trim()
-    const trimmedDateOfBirth = String(dateOfBirth || "").trim()
-    const trimmedFirstName = String(firstName || "").trim()
-    const trimmedMiddleName = String(middleName || "").trim()
-    const trimmedLastName = String(lastName || "").trim()
 
     if (rawPassword.length < 8) {
       return res.status(400).json({ error: "Password must be at least 8 characters long." })
     }
 
-    if (!acceptIdentityPolicy) {
-      return res.status(400).json({
-        error: "You must accept the identity policy before creating a creator account.",
-      })
-    }
-
-    if (!/^\d{11}$/.test(trimmedBvn)) {
+    if (trimmedBvn && !/^\d{11}$/.test(trimmedBvn)) {
       return res.status(400).json({ error: "BVN must be 11 digits." })
     }
 
-    if (!/^\d{11}$/.test(trimmedNin)) {
+    if (trimmedNin && !/^\d{11}$/.test(trimmedNin)) {
       return res.status(400).json({ error: "NIN must be 11 digits." })
-    }
-
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmedDateOfBirth)) {
-      return res.status(400).json({ error: "Date of birth is required in YYYY-MM-DD format." })
-    }
-
-    if (!trimmedFirstName || !trimmedLastName) {
-      return res.status(400).json({ error: "First name and last name are required." })
     }
 
     let user = await User.findOne({ email: normalizedEmail })
@@ -1867,12 +1814,6 @@ app.post("/auth/register", async (req, res) => {
       identity: {
         bvn: trimmedBvn,
         nin: trimmedNin,
-        dateOfBirth: trimmedDateOfBirth,
-        firstName: trimmedFirstName,
-        middleName: trimmedMiddleName,
-        lastName: trimmedLastName,
-        policyAcceptedAt: new Date(),
-        signupCompletedAt: new Date(),
       },
     })
 
