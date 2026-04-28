@@ -1072,6 +1072,46 @@ function isTemporaryMonnifyError(error) {
   )
 }
 
+function isReservedAccountAlreadyMissingError(error) {
+  if (!(error instanceof AxiosError)) {
+    return false
+  }
+
+  const status = Number(error.response?.status || 0)
+  const responseCode = String(
+    error.response?.data?.responseCode ||
+      error.response?.data?.responseBody?.responseCode ||
+      error.response?.data?.responseBody?.code ||
+      "",
+  )
+    .trim()
+    .toUpperCase()
+  const message = getAxiosErrorMessage(error, "").toLowerCase()
+
+  return (
+    status === 404 ||
+    message.includes("cannot find reserved account") ||
+    message.includes("reserved account not found") ||
+    (responseCode === "99" && message.includes("not found"))
+  )
+}
+
+function isReservedAccountAlreadyMissingResponse(response) {
+  const responseCode = String(response?.responseCode || response?.responseBody?.responseCode || "")
+    .trim()
+    .toUpperCase()
+  const message = String(response?.responseMessage || response?.message || response?.responseBody?.message || "")
+    .toLowerCase()
+    .trim()
+
+  return (
+    response?.requestSuccessful === false &&
+    (message.includes("cannot find reserved account") ||
+      message.includes("reserved account not found") ||
+      (responseCode === "99" && message.includes("not found")))
+  )
+}
+
 function wait(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms)
@@ -1477,6 +1517,106 @@ async function createReservedAccountForUser(user) {
   await user.save()
 
   return virtualAccount
+}
+
+async function deallocateMonnifyReservedAccount(accountReference) {
+  if (!isMonnifyConfigured()) {
+    throw new Error(
+      "Monnify is not configured yet. Add MONNIFY_API_KEY, MONNIFY_SECRET_KEY, MONNIFY_CONTRACT_CODE, and MONNIFY_BASE_URL to Backend/.env.",
+    )
+  }
+
+  const normalizedReference = String(accountReference || "").trim()
+
+  if (!normalizedReference) {
+    throw new Error("No Monnify account reference is saved for this virtual account.")
+  }
+
+  const accessToken = await getMonnifyAccessToken()
+  const response = await axios.delete(
+    `${MONNIFY_BASE_URL}/api/v1/bank-transfer/reserved-accounts/reference/${encodeURIComponent(
+      normalizedReference,
+    )}`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+    },
+  )
+
+  return response.data || {}
+}
+
+async function removeVirtualAccountForUser(user) {
+  const previousVirtualAccount = user.virtualAccount || null
+  const accountReference = String(previousVirtualAccount?.accountReference || "").trim()
+  const accountStatus = String(previousVirtualAccount?.status || "").toLowerCase()
+  const remoteDeallocation = {
+    attempted: false,
+    succeeded: false,
+    alreadyMissing: false,
+    responseMessage: "",
+  }
+
+  if (!previousVirtualAccount?.accountNumber) {
+    return {
+      user,
+      previousVirtualAccount: null,
+      remoteDeallocation,
+    }
+  }
+
+  if (accountReference && accountStatus !== "pending" && !accountReference.startsWith("PENDING-")) {
+    remoteDeallocation.attempted = true
+
+    try {
+      const monnifyResponse = await deallocateMonnifyReservedAccount(accountReference)
+      remoteDeallocation.responseMessage = String(
+        monnifyResponse.responseMessage || monnifyResponse.message || "Reserved account deallocated.",
+      ).trim()
+
+      if (isReservedAccountAlreadyMissingResponse(monnifyResponse)) {
+        remoteDeallocation.alreadyMissing = true
+      } else if (monnifyResponse.requestSuccessful === false) {
+        throw new Error(
+          remoteDeallocation.responseMessage || "Could not deallocate the Monnify reserved account.",
+        )
+      } else {
+        remoteDeallocation.succeeded = true
+      }
+    } catch (error) {
+      if (!isReservedAccountAlreadyMissingError(error)) {
+        const message =
+          error instanceof AxiosError
+            ? getAxiosErrorMessage(error, "Could not deallocate the Monnify reserved account.")
+            : error instanceof Error
+              ? error.message
+              : "Could not deallocate the Monnify reserved account."
+
+        throw new Error(message)
+      }
+
+      remoteDeallocation.alreadyMissing = true
+      remoteDeallocation.responseMessage = getAxiosErrorMessage(
+        error,
+        "Reserved account was already missing in Monnify.",
+      )
+    }
+  }
+
+  const updatedUser = await User.findByIdAndUpdate(
+    user._id,
+    { $unset: { virtualAccount: "" } },
+    { new: true },
+  )
+
+  return {
+    user: updatedUser || user,
+    previousVirtualAccount,
+    remoteDeallocation,
+  }
 }
 
 function createTransferReference(prefix = "STIP-PAYOUT") {
@@ -3063,6 +3203,52 @@ app.post("/admin/users/:id/virtual-account", requireAdminSession, async (req, re
         error instanceof Error
           ? error.message
           : "Could not provision a Monnify reserved account.",
+    })
+  }
+})
+
+app.delete("/admin/users/:id/virtual-account", requireAdminSession, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id)
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found." })
+    }
+
+    if (!user.virtualAccount?.accountNumber) {
+      return res.status(404).json({ error: "This user does not have a saved virtual account." })
+    }
+
+    const { user: updatedUser, previousVirtualAccount, remoteDeallocation } =
+      await removeVirtualAccountForUser(user)
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "admin.user.virtual_account.deleted",
+      message: `Admin deleted the saved virtual account for ${user.email}.`,
+      metadata: {
+        userId: user._id.toString(),
+        email: user.email,
+        accountReference: previousVirtualAccount?.accountReference || "",
+        accountNumberLast4: String(previousVirtualAccount?.accountNumber || "").slice(-4),
+        bankName: previousVirtualAccount?.bankName || "",
+        remoteDeallocation,
+      },
+    })
+
+    res.json({
+      user: sanitizeUser(updatedUser),
+      virtualAccount: null,
+      remoteDeallocation,
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(502).json({
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not delete the virtual account.",
     })
   }
 })
