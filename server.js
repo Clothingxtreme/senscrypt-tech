@@ -29,6 +29,7 @@ function readEnv(key) {
 }
 
 const MONGODB_URI = readEnv("MONGODB_URI")
+const MONGODB_DATABASE = readEnv("MONGODB_DATABASE") || "streamtip"
 const MONNIFY_API_KEY = readEnv("MONNIFY_API_KEY")
 const MONNIFY_SECRET_KEY = readEnv("MONNIFY_SECRET_KEY")
 const MONNIFY_CONTRACT_CODE = readEnv("MONNIFY_CONTRACT_CODE")
@@ -312,9 +313,32 @@ function getMongoUriHost() {
   }
 }
 
+function getMongoUriDatabaseName() {
+  if (!MONGODB_URI) {
+    return ""
+  }
+
+  try {
+    const pathname = new URL(MONGODB_URI).pathname.replace(/^\/+/, "").trim()
+    return pathname ? decodeURIComponent(pathname.split("/")[0]) : ""
+  } catch (_error) {
+    return ""
+  }
+}
+
+function getMongoConnectionOptions() {
+  const options = { serverSelectionTimeoutMS: 15000 }
+
+  if (!getMongoUriDatabaseName() && MONGODB_DATABASE) {
+    options.dbName = MONGODB_DATABASE
+  }
+
+  return options
+}
+
 if (MONGODB_URI) {
   mongoose
-    .connect(MONGODB_URI, { serverSelectionTimeoutMS: 15000 })
+    .connect(MONGODB_URI, getMongoConnectionOptions())
     .then(() => console.log("MongoDB Connected"))
     .catch((error) => {
       lastDatabaseError = error instanceof Error ? error.message : String(error)
