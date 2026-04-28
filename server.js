@@ -257,6 +257,7 @@ const io = new Server(server, {
 
 const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
+const MIN_CREATOR_WITHDRAWAL = 5000
 let lastDatabaseError = ""
 
 const defaultOverlaySettings = {
@@ -2740,6 +2741,13 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
 
     if (!payoutAmount || payoutAmount <= 0) {
       return res.status(400).json({ error: "Enter a valid payout amount." })
+    }
+
+    if (payoutAmount < MIN_CREATOR_WITHDRAWAL) {
+      return res.status(400).json({
+        error: `Minimum withdrawal is NGN ${MIN_CREATOR_WITHDRAWAL.toLocaleString()}.`,
+        minimumWithdrawal: MIN_CREATOR_WITHDRAWAL,
+      })
     }
 
     if (payoutAmount > availableCreatorBalance) {
