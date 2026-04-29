@@ -2044,8 +2044,11 @@ async function reconcilePendingPayouts() {
   }
 
   const pendingPayouts = await Payout.find({
-    status: "pending",
     transferReference: { $exists: true, $ne: "" },
+    $or: [
+      { status: "pending" },
+      { status: "failed", reviewStatus: "approved" },
+    ],
   })
     .sort({ createdAt: 1 })
     .limit(50)
@@ -2117,34 +2120,24 @@ async function initiateMonnifyDisbursement({
   )
 
   const disbursement = response.data?.responseBody || {}
+  const responseMessage = String(response.data?.responseMessage || disbursement.message || "").trim()
+  const responseCode = String(response.data?.responseCode || disbursement.responseCode || "").trim()
+
+  if (response.data?.requestSuccessful === false) {
+    throw new Error(responseMessage || "Monnify rejected the disbursement request.")
+  }
+
   const disbursementReference = String(disbursement.reference || reference || "").trim()
 
   if (!disbursementReference) {
     throw new Error("Monnify did not return a disbursement reference.")
   }
 
-  const validateResponse = await axios.post(
-    `${MONNIFY_BASE_URL}/api/v2/disbursements/single/validate`,
-    { reference: disbursementReference },
-    {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-    },
-  )
-
-  const validation = validateResponse.data?.responseBody || {}
-
   return {
     ...disbursement,
-    ...validation,
-    reference: validation.reference || disbursementReference,
-    validationMessage:
-      validation.message ||
-      validation.responseMessage ||
-      validateResponse.data?.responseMessage ||
-      "",
+    reference: disbursementReference,
+    responseMessage,
+    responseCode,
   }
 }
 
