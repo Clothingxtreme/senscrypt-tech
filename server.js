@@ -50,16 +50,24 @@ if (missingRequiredEnv.length > 0) {
 }
 
 function parseAllowedOrigins(value) {
-  const origins = String(value || "")
+  const localOrigins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+    "http://localhost:5001",
+    "http://127.0.0.1:5001",
+  ]
+  const configuredOrigins = String(value || "")
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean)
 
-  if (origins.length === 0 || origins.includes("*")) {
+  if (configuredOrigins.includes("*")) {
     return "*"
   }
 
-  return origins
+  return Array.from(new Set([...configuredOrigins, ...localOrigins]))
 }
 
 function parseCsvList(value) {
@@ -393,6 +401,11 @@ const payoutSchema = new mongoose.Schema({
   creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
   amount: Number,
   status: String,
+  reviewStatus: { type: String, default: "not_required", index: true },
+  reviewReason: String,
+  reviewedBy: String,
+  reviewedAt: Date,
+  rejectionReason: String,
   bankName: String,
   bankCode: String,
   accountNumber: String,
@@ -405,6 +418,28 @@ const payoutSchema = new mongoose.Schema({
 })
 
 const Payout = mongoose.model("Payout", payoutSchema)
+
+const payoutProfileChangeRequestSchema = new mongoose.Schema(
+  {
+    creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
+    currentProfile: { type: Object, default: {} },
+    requestedProfile: { type: Object, default: {} },
+    supportNote: String,
+    proofSummary: String,
+    status: { type: String, default: "awaiting_review", index: true },
+    reviewedBy: String,
+    reviewedAt: Date,
+    rejectionReason: String,
+    cooldownUntil: Date,
+    createdAt: { type: Date, default: Date.now },
+  },
+  { timestamps: false },
+)
+
+const PayoutProfileChangeRequest = mongoose.model(
+  "PayoutProfileChangeRequest",
+  payoutProfileChangeRequestSchema,
+)
 
 const platformWithdrawalSchema = new mongoose.Schema({
   amount: Number,
@@ -462,6 +497,9 @@ const GiftSound = mongoose.model("GiftSound", giftSoundSchema)
 const userSchema = new mongoose.Schema(
   {
     name: { type: String, required: true },
+    firstName: { type: String, default: "" },
+    middleName: { type: String, default: "" },
+    lastName: { type: String, default: "" },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     passwordHash: { type: String, required: true },
     sessionToken: { type: String, default: null },
@@ -473,6 +511,27 @@ const userSchema = new mongoose.Schema(
     identity: {
       bvn: { type: String, default: "" },
       nin: { type: String, default: "" },
+      dateOfBirth: { type: String, default: "" },
+      firstName: { type: String, default: "" },
+      middleName: { type: String, default: "" },
+      lastName: { type: String, default: "" },
+      policyAcceptedAt: Date,
+      signupCompletedAt: Date,
+    },
+    payoutProfile: {
+      bankName: String,
+      bankCode: String,
+      accountNumber: String,
+      accountName: String,
+      firstName: String,
+      middleName: String,
+      lastName: String,
+      status: { type: String, default: "missing" },
+      locked: { type: Boolean, default: false },
+      verifiedAt: Date,
+      lockedAt: Date,
+      changeRequiresSupport: { type: Boolean, default: true },
+      verificationProvider: { type: String, default: "monnify" },
     },
     virtualAccount: {
       accountReference: String,
@@ -500,6 +559,83 @@ const userSchema = new mongoose.Schema(
 )
 
 const User = mongoose.model("User", userSchema)
+
+function splitNamePartsFromFullName(name) {
+  const parts = String(name || "").trim().split(/\s+/).filter(Boolean)
+
+  return {
+    firstName: parts[0] || "",
+    middleName: parts.length > 2 ? parts.slice(1, -1).join(" ") : "",
+    lastName: parts.length > 1 ? parts[parts.length - 1] : "",
+  }
+}
+
+function buildFullNameFromParts({ firstName, middleName, lastName }, fallback = "") {
+  return [firstName, middleName, lastName]
+    .map((part) => String(part || "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .trim() || String(fallback || "Creator").trim()
+}
+
+function getUserNameParts(user) {
+  const fallbackParts = splitNamePartsFromFullName(user?.name)
+  const identity = user?.identity || {}
+
+  return {
+    firstName: String(user?.firstName || identity.firstName || fallbackParts.firstName || "").trim(),
+    middleName: String(user?.middleName || identity.middleName || fallbackParts.middleName || "").trim(),
+    lastName: String(user?.lastName || identity.lastName || fallbackParts.lastName || "").trim(),
+  }
+}
+
+function applyUserNameParts(user, parts) {
+  const nextParts = {
+    firstName: String(parts?.firstName || "").trim(),
+    middleName: String(parts?.middleName || "").trim(),
+    lastName: String(parts?.lastName || "").trim(),
+  }
+
+  user.firstName = nextParts.firstName
+  user.middleName = nextParts.middleName
+  user.lastName = nextParts.lastName
+  user.name = buildFullNameFromParts(nextParts, user.name || user.email || "Creator")
+  user.identity = user.identity || {}
+  user.identity.firstName = nextParts.firstName
+  user.identity.middleName = nextParts.middleName
+  user.identity.lastName = nextParts.lastName
+
+  return nextParts
+}
+
+async function backfillUserNameParts() {
+  if (!isDatabaseConnected()) return
+
+  const users = await User.find({
+    $or: [
+      { firstName: { $in: [null, ""] } },
+      { lastName: { $in: [null, ""] } },
+      { "identity.firstName": { $in: [null, ""] } },
+      { "identity.lastName": { $in: [null, ""] } },
+    ],
+  }).limit(500)
+
+  for (const user of users) {
+    const parts = getUserNameParts(user)
+    if (!parts.firstName && !parts.lastName) continue
+
+    applyUserNameParts(user, parts)
+    await user.save()
+  }
+}
+
+if (mongoose.connection.readyState === 1) {
+  void backfillUserNameParts().catch((error) => console.error("user.name_parts_backfill_failed", error))
+} else {
+  mongoose.connection.once("open", () => {
+    void backfillUserNameParts().catch((error) => console.error("user.name_parts_backfill_failed", error))
+  })
+}
 
 function getCreatorRoom(userId) {
   return `creator:${String(userId)}`
@@ -547,16 +683,129 @@ function requiresMonnifyCustomerVerification() {
   return getMonnifyEnvironment() === "live"
 }
 
-function sanitizeIdentity(identity) {
+function sanitizeIdentity(identity, fallbackParts = {}) {
   const bvn = String(identity?.bvn || "").trim()
   const nin = String(identity?.nin || "").trim()
+  const firstName = String(identity?.firstName || fallbackParts.firstName || "").trim()
+  const middleName = String(identity?.middleName || fallbackParts.middleName || "").trim()
+  const lastName = String(identity?.lastName || fallbackParts.lastName || "").trim()
 
   return {
     hasBvn: Boolean(bvn),
     hasNin: Boolean(nin),
     bvnLast4: bvn ? bvn.slice(-4) : "",
     ninLast4: nin ? nin.slice(-4) : "",
+    hasDateOfBirth: Boolean(String(identity?.dateOfBirth || "").trim()),
+    dateOfBirth: identity?.dateOfBirth || "",
+    firstName,
+    middleName,
+    lastName,
+    policyAcceptedAt: identity?.policyAcceptedAt || "",
+    signupCompletedAt: identity?.signupCompletedAt || "",
+    isComplete: Boolean(
+      bvn &&
+        nin &&
+        String(identity?.dateOfBirth || "").trim() &&
+        firstName &&
+        lastName,
+    ),
   }
+}
+
+function sanitizePayoutProfile(profile) {
+  if (!profile?.accountNumber) {
+    return {
+      status: "missing",
+      locked: false,
+      changeRequiresSupport: true,
+    }
+  }
+
+  return {
+    bankName: profile.bankName || "",
+    bankCode: profile.bankCode || "",
+    accountNumber: profile.accountNumber || "",
+    accountName: profile.accountName || "",
+    firstName: profile.firstName || "",
+    middleName: profile.middleName || "",
+    lastName: profile.lastName || "",
+    status: profile.status || "missing",
+    locked: Boolean(profile.locked),
+    verifiedAt: profile.verifiedAt || "",
+    lockedAt: profile.lockedAt || "",
+    changeRequiresSupport: profile.changeRequiresSupport !== false,
+    verificationProvider: profile.verificationProvider || "monnify",
+  }
+}
+
+function sanitizePayoutProfileChangeRequest(request) {
+  if (!request) return null
+
+  return {
+    id: request._id,
+    creatorId: request.creatorId?._id || request.creatorId || "",
+    creator: request.creatorId?._id ? sanitizeUser(request.creatorId) : undefined,
+    currentProfile: sanitizePayoutProfile(request.currentProfile),
+    requestedProfile: sanitizePayoutProfile(request.requestedProfile),
+    supportNote: request.supportNote || "",
+    proofSummary: request.proofSummary || "",
+    status: request.status || "awaiting_review",
+    reviewedBy: request.reviewedBy || "",
+    reviewedAt: request.reviewedAt || "",
+    rejectionReason: request.rejectionReason || "",
+    cooldownUntil: request.cooldownUntil || "",
+    createdAt: request.createdAt || "",
+  }
+}
+
+function normalizeNameToken(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z]/g, "")
+    .trim()
+}
+
+function tokenizeName(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+}
+
+function validateLegalNameParts({ firstName, middleName, lastName }) {
+  const first = String(firstName || "").trim()
+  const middle = String(middleName || "").trim()
+  const last = String(lastName || "").trim()
+
+  if (!first || !last) {
+    throw new Error("First name and last name are required.")
+  }
+
+  return { first, middle, last }
+}
+
+function validatePayoutAccountNameMatch({ firstName, middleName, lastName, accountName }) {
+  const legal = validateLegalNameParts({ firstName, middleName, lastName })
+  const accountTokens = tokenizeName(accountName)
+  const missing = [legal.first, legal.middle, legal.last]
+    .map((part) => ({ original: part, normalized: normalizeNameToken(part) }))
+    .filter((part) => part.normalized && !accountTokens.includes(part.normalized))
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Bank account name must match your first and last name${legal.middle ? ", plus your middle name" : ""}. Missing match: ${missing
+        .map((part) => part.original)
+        .join(", ")}. If this is a special case, contact support for manual verification.`,
+    )
+  }
+
+  return legal
 }
 
 function getOverlaySlug(user) {
@@ -878,15 +1127,22 @@ function getDonationSenderName(eventData, data, creator) {
 function sanitizeUser(user) {
   if (!user) return null
 
+  const nameParts = getUserNameParts(user)
+  const displayName = buildFullNameFromParts(nameParts, user.name || user.email || "Creator")
+
   return {
     id: user._id,
-    name: user.name,
+    name: displayName,
+    firstName: nameParts.firstName,
+    middleName: nameParts.middleName,
+    lastName: nameParts.lastName,
     email: user.email,
     overlaySlug: getOverlaySlug(user),
     role: user.role || "creator",
     status: user.status || "active",
     profileImage: user.profileImage || "",
-    identity: sanitizeIdentity(user.identity),
+    identity: sanitizeIdentity(user.identity, nameParts),
+    payoutProfile: sanitizePayoutProfile(user.payoutProfile),
     virtualAccount: user.virtualAccount || null,
     createdAt: user.createdAt,
   }
@@ -1651,15 +1907,157 @@ function createTransferReference(prefix = "STIP-PAYOUT") {
 function normalizeMonnifyTransferStatus(status) {
   const normalized = String(status || "").toUpperCase()
 
-  if (["SUCCESS", "SUCCESSFUL", "COMPLETED"].includes(normalized)) {
+  if (["SUCCESS", "SUCCESSFUL", "COMPLETED", "SUCCESSFUL_DISBURSEMENT"].includes(normalized)) {
     return "completed"
   }
 
-  if (["FAILED", "REJECTED", "CANCELLED", "EXPIRED"].includes(normalized)) {
+  if (["CANCELLED", "CANCELED", "EXPIRED"].includes(normalized)) {
+    return "cancelled"
+  }
+
+  if (
+    [
+      "FAILED",
+      "FAILED_DISBURSEMENT",
+      "REJECTED",
+      "REVERSED",
+      "REVERSED_DISBURSEMENT",
+    ].includes(normalized)
+  ) {
     return "failed"
   }
 
   return "pending"
+}
+
+function extractMonnifyDisbursementReference(eventData = {}, data = {}) {
+  return String(
+    eventData.reference ||
+      eventData.transferReference ||
+      eventData.transactionReference ||
+      eventData.transactionRef ||
+      eventData.paymentReference ||
+      data.reference ||
+      data.transferReference ||
+      data.transactionReference ||
+      data.paymentReference ||
+      "",
+  ).trim()
+}
+
+function extractMonnifyDisbursementStatus(eventData = {}, data = {}) {
+  return String(
+    eventData.status ||
+      eventData.paymentStatus ||
+      eventData.transactionStatus ||
+      eventData.transferStatus ||
+      data.status ||
+      data.paymentStatus ||
+      data.transactionStatus ||
+      data.eventType ||
+      "",
+  ).trim()
+}
+
+async function getMonnifyDisbursementSummary(reference) {
+  if (!isMonnifyConfigured()) {
+    throw new Error("Monnify disbursement is not configured yet.")
+  }
+
+  const accessToken = await getMonnifyAccessToken()
+  const response = await axios.get(`${MONNIFY_BASE_URL}/api/v2/disbursements/single/summary`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+    },
+    params: { reference },
+  })
+
+  return response.data?.responseBody || {}
+}
+
+async function updatePayoutFromProviderStatus(payout, providerPayload = {}, actorType = "system") {
+  const providerStatus = extractMonnifyDisbursementStatus(providerPayload, providerPayload)
+  const normalizedStatus = normalizeMonnifyTransferStatus(providerStatus)
+
+  payout.status = normalizedStatus
+  payout.providerReference =
+    String(
+      providerPayload.transactionReference ||
+        providerPayload.paymentReference ||
+        providerPayload.reference ||
+        payout.providerReference ||
+        payout.transferReference,
+    ).trim() || payout.transferReference
+  payout.providerMessage = String(
+    providerPayload.message ||
+      providerPayload.responseMessage ||
+      providerPayload.narration ||
+      providerStatus ||
+      payout.providerMessage ||
+      "",
+  ).trim()
+
+  if (["completed", "failed", "cancelled"].includes(normalizedStatus)) {
+    payout.completedAt = payout.completedAt || new Date()
+  }
+
+  await payout.save()
+
+  io.to(getCreatorRoom(payout.creatorId)).emit("newPayout", payout)
+
+  await createAuditLog({
+    actorType,
+    eventType: "payout.status_synced",
+    message: `Payout ${payout.transferReference} synced as ${normalizedStatus}.`,
+    metadata: {
+      payoutId: payout._id.toString(),
+      transferReference: payout.transferReference,
+      providerStatus,
+      providerReference: payout.providerReference || "",
+    },
+  })
+
+  return payout
+}
+
+async function reconcilePendingPayouts() {
+  if (!isDatabaseConnected() || !isMonnifyConfigured()) {
+    return { checked: 0, updated: 0 }
+  }
+
+  const pendingPayouts = await Payout.find({
+    status: "pending",
+    transferReference: { $exists: true, $ne: "" },
+  })
+    .sort({ createdAt: 1 })
+    .limit(50)
+
+  let updated = 0
+
+  for (const payout of pendingPayouts) {
+    try {
+      const summary = await getMonnifyDisbursementSummary(payout.transferReference)
+      const beforeStatus = payout.status
+      await updatePayoutFromProviderStatus(payout, summary, "system")
+      if (payout.status !== beforeStatus) {
+        updated += 1
+      }
+    } catch (error) {
+      await createAuditLog({
+        actorType: "system",
+        eventType: "payout.reconciliation.failed",
+        message: `Could not reconcile payout ${payout.transferReference}.`,
+        metadata: {
+          payoutId: payout._id.toString(),
+          transferReference: payout.transferReference,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      })
+    }
+  }
+
+  return { checked: pendingPayouts.length, updated }
 }
 
 async function initiateMonnifyDisbursement({
@@ -1701,7 +2099,36 @@ async function initiateMonnifyDisbursement({
     },
   )
 
-  return response.data?.responseBody || {}
+  const disbursement = response.data?.responseBody || {}
+  const disbursementReference = String(disbursement.reference || reference || "").trim()
+
+  if (!disbursementReference) {
+    throw new Error("Monnify did not return a disbursement reference.")
+  }
+
+  const validateResponse = await axios.post(
+    `${MONNIFY_BASE_URL}/api/v2/disbursements/single/validate`,
+    { reference: disbursementReference },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    },
+  )
+
+  const validation = validateResponse.data?.responseBody || {}
+
+  return {
+    ...disbursement,
+    ...validation,
+    reference: validation.reference || disbursementReference,
+    validationMessage:
+      validation.message ||
+      validation.responseMessage ||
+      validateResponse.data?.responseMessage ||
+      "",
+  }
 }
 
 async function getCurrentUser() {
@@ -1711,7 +2138,7 @@ async function getCurrentUser() {
 async function getRevenueTotals({ creatorId } = {}) {
   const donationQuery = creatorId ? { creatorId } : {}
   const payoutQuery = {
-    status: { $ne: "failed" },
+    status: { $nin: ["failed", "rejected", "cancelled"] },
     ...(creatorId ? { creatorId } : {}),
   }
   const platformWithdrawalQuery = creatorId ? { _id: null } : { status: { $ne: "failed" } }
@@ -1752,6 +2179,160 @@ async function getRevenueTotals({ creatorId } = {}) {
     creatorAvailableBalance: Math.max(0, creatorRevenue - totalPaidOut),
     pendingPlatformRevenue: Math.max(0, platformRevenue - totalPlatformWithdrawn),
   }
+}
+
+async function hasSuccessfulWithdrawal(creatorId) {
+  const completedPayout = await Payout.findOne({
+    creatorId,
+    status: "completed",
+  }).sort({ createdAt: 1 })
+
+  return Boolean(completedPayout)
+}
+
+function getLockedPayoutProfile(user) {
+  const profile = user?.payoutProfile || {}
+
+  if (
+    !profile.locked ||
+    profile.status !== "verified" ||
+    !profile.bankCode ||
+    !profile.accountNumber ||
+    !profile.accountName
+  ) {
+    throw new Error("Add and verify your locked payout bank account before requesting withdrawals.")
+  }
+
+  return profile
+}
+
+async function buildVerifiedPayoutProfile({
+  user,
+  bankCode,
+  bankName,
+  accountNumber,
+  firstName,
+  middleName,
+  lastName,
+}) {
+  const cleanBankCode = String(bankCode || "").trim()
+  const cleanBankName = String(bankName || "").trim()
+  const cleanAccountNumber = String(accountNumber || "").replace(/\D/g, "").slice(0, 10)
+  const fallbackParts = getUserNameParts(user)
+  const legal = validateLegalNameParts({
+    firstName: typeof firstName === "string" ? firstName : fallbackParts.firstName,
+    middleName: typeof middleName === "string" ? middleName : fallbackParts.middleName,
+    lastName: typeof lastName === "string" ? lastName : fallbackParts.lastName,
+  })
+
+  if (!cleanBankCode || cleanAccountNumber.length !== 10) {
+    throw new Error("Bank and 10-digit account number are required.")
+  }
+
+  const resolvedAccount = await resolveBankAccountName({
+    bankCode: cleanBankCode,
+    accountNumber: cleanAccountNumber,
+  })
+
+  validatePayoutAccountNameMatch({
+    ...legal,
+    accountName: resolvedAccount.accountName,
+  })
+
+  return {
+    bankName: cleanBankName || resolvedAccount.bankName || "",
+    bankCode: resolvedAccount.bankCode || cleanBankCode,
+    accountNumber: resolvedAccount.accountNumber || cleanAccountNumber,
+    accountName: resolvedAccount.accountName,
+    firstName: legal.first,
+    middleName: legal.middle,
+    lastName: legal.last,
+    status: "verified",
+    locked: true,
+    verifiedAt: new Date(),
+    lockedAt: new Date(),
+    changeRequiresSupport: true,
+    verificationProvider: "monnify",
+  }
+}
+
+async function sendPayoutToMonnify(payout, creator, actorType = "system", actorId = "") {
+  let transferResponse
+
+  try {
+    transferResponse = await initiateMonnifyDisbursement({
+      amount: Number(payout.amount) || 0,
+      bankCode: payout.bankCode,
+      accountNumber: payout.accountNumber,
+      accountName: payout.accountName,
+      narration: `StreamTip creator payout for ${creator.name}`,
+      reference: payout.transferReference || createTransferReference(),
+    })
+  } catch (error) {
+    const message = getAxiosErrorMessage(error, "Failed to initiate payout with Monnify.")
+    payout.status = "failed"
+    payout.providerMessage = message
+    payout.completedAt = new Date()
+    await payout.save()
+
+    await createAuditLog({
+      actorType,
+      actorId,
+      eventType: "payout.failed",
+      message: `Payout failed for ${payout.bankName}.`,
+      metadata: {
+        ...getAxiosErrorDetails(error),
+        payoutId: payout._id.toString(),
+        amount: payout.amount,
+        creatorId: creator._id.toString(),
+        transferReference: payout.transferReference,
+        error: message,
+      },
+    })
+
+    io.to(getCreatorRoom(creator._id)).emit("newPayout", payout)
+    throw new Error(message)
+  }
+
+  const providerStatus =
+    transferResponse.status ||
+    transferResponse.paymentStatus ||
+    transferResponse.transactionStatus ||
+    ""
+  const payoutStatus = normalizeMonnifyTransferStatus(providerStatus)
+
+  payout.status = payoutStatus
+  payout.providerReference =
+    String(
+      transferResponse.transactionReference ||
+        transferResponse.reference ||
+        transferResponse.paymentReference ||
+        payout.transferReference,
+    ).trim() || payout.transferReference
+  payout.providerMessage = String(
+    transferResponse.message || transferResponse.responseMessage || providerStatus || "",
+  ).trim()
+  payout.completedAt = payoutStatus === "completed" ? new Date() : undefined
+  await payout.save()
+
+  io.to(getCreatorRoom(creator._id)).emit("newPayout", payout)
+
+  await createAuditLog({
+    actorType,
+    actorId,
+    eventType: "payout.sent_to_monnify",
+    message: `Payout sent to Monnify for ${payout.bankName}.`,
+    metadata: {
+      payoutId: payout._id.toString(),
+      amount: payout.amount,
+      creatorId: creator._id.toString(),
+      transferReference: payout.transferReference,
+      providerReference: payout.providerReference || "",
+      providerStatus: payout.status,
+    },
+  })
+
+  return payout
 }
 
 function groupTransactionsByPeriod(withdrawals) {
@@ -1947,28 +2528,55 @@ app.use(requireDatabaseReady)
 
 app.post("/auth/register", async (req, res) => {
   try {
-    const { name, email, password, bvn = "", nin = "" } = req.body
+    const {
+      email,
+      password,
+      bvn = "",
+      nin = "",
+      dateOfBirth = "",
+      firstName = "",
+      middleName = "",
+      lastName = "",
+      acceptIdentityPolicy = false,
+      bankName = "",
+      bankCode = "",
+      accountNumber = "",
+    } = req.body
 
-    if (!name || !email || !password) {
-      return res.status(400).json({ error: "Name, email, and password are required." })
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password are required." })
     }
 
     const normalizedEmail = String(email).toLowerCase().trim()
-    const trimmedName = String(name).trim()
     const rawPassword = String(password)
     const trimmedBvn = String(bvn || "").trim()
     const trimmedNin = String(nin || "").trim()
+    const trimmedDateOfBirth = String(dateOfBirth || "").trim()
+    const legal = validateLegalNameParts({ firstName, middleName, lastName })
+    const trimmedName = buildFullNameFromParts({
+      firstName: legal.first,
+      middleName: legal.middle,
+      lastName: legal.last,
+    })
 
     if (rawPassword.length < 8) {
       return res.status(400).json({ error: "Password must be at least 8 characters long." })
     }
 
-    if (trimmedBvn && !/^\d{11}$/.test(trimmedBvn)) {
+    if (!acceptIdentityPolicy) {
+      return res.status(400).json({ error: "Accept the identity policy before creating an account." })
+    }
+
+    if (!/^\d{11}$/.test(trimmedBvn)) {
       return res.status(400).json({ error: "BVN must be 11 digits." })
     }
 
-    if (trimmedNin && !/^\d{11}$/.test(trimmedNin)) {
+    if (!/^\d{11}$/.test(trimmedNin)) {
       return res.status(400).json({ error: "NIN must be 11 digits." })
+    }
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmedDateOfBirth)) {
+      return res.status(400).json({ error: "Date of birth is required." })
     }
 
     let user = await User.findOne({ email: normalizedEmail })
@@ -1977,8 +2585,24 @@ app.post("/auth/register", async (req, res) => {
       return res.status(409).json({ error: "An account with that email already exists." })
     }
 
+    const payoutProfile = await buildVerifiedPayoutProfile({
+      user: {
+        identity: {
+          firstName: legal.first,
+          middleName: legal.middle,
+          lastName: legal.last,
+        },
+      },
+      bankCode,
+      bankName,
+      accountNumber,
+    })
+
     user = await User.create({
       name: trimmedName,
+      firstName: legal.first,
+      middleName: legal.middle,
+      lastName: legal.last,
       email: normalizedEmail,
       passwordHash: hashPassword(rawPassword),
       sessionToken: generateSessionToken(),
@@ -1987,7 +2611,14 @@ app.post("/auth/register", async (req, res) => {
       identity: {
         bvn: trimmedBvn,
         nin: trimmedNin,
+        dateOfBirth: trimmedDateOfBirth,
+        firstName: legal.first,
+        middleName: legal.middle,
+        lastName: legal.last,
+        policyAcceptedAt: new Date(),
+        signupCompletedAt: new Date(),
       },
+      payoutProfile,
     })
 
     await createAuditLog({
@@ -2305,11 +2936,39 @@ app.post("/webhook/monnify", async (req, res) => {
     }
 
     const data = req.body || {}
-    const eventData =
-      (data.eventData && typeof data.eventData === "object" ? data.eventData : data.responseBody) ||
-      data
-    const creator = await findCreatorForMonnifyEvent(eventData)
+  const eventData =
+    (data.eventData && typeof data.eventData === "object" ? data.eventData : data.responseBody) ||
+    data
     const eventType = String(data.eventType || eventData.eventType || "monnify.webhook")
+    const disbursementReference = extractMonnifyDisbursementReference(eventData, data)
+
+    if (/disbursement|transfer/i.test(eventType) && disbursementReference) {
+      const payout = await Payout.findOne({
+        $or: [
+          { transferReference: disbursementReference },
+          { providerReference: disbursementReference },
+        ],
+      })
+
+      if (!payout) {
+        await createAuditLog({
+          actorType: "system",
+          eventType: "webhook.monnify.unmatched_payout",
+          message: "Monnify disbursement webhook could not be matched to a payout.",
+          metadata: {
+            eventType,
+            disbursementReference,
+          },
+        })
+
+        return res.sendStatus(200)
+      }
+
+      await updatePayoutFromProviderStatus(payout, { ...eventData, eventType }, "system")
+      return res.sendStatus(200)
+    }
+
+    const creator = await findCreatorForMonnifyEvent(eventData)
     const paymentStatus = String(
       eventData.paymentStatus || eventData.status || data.paymentStatus || "PENDING",
     ).toUpperCase()
@@ -2697,6 +3356,40 @@ app.get("/payouts", requireSessionUser, async (req, res) => {
   }
 })
 
+app.get("/public/banks", async (_req, res) => {
+  try {
+    const banks = await getSupportedBanks()
+    res.json({ banks })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load supported banks." })
+  }
+})
+
+app.post("/public/bank-account-name-enquiry", async (req, res) => {
+  try {
+    const accountNumber = String(req.body?.accountNumber || "").trim()
+    const bankCode = String(req.body?.bankCode || "").trim()
+
+    if (!bankCode || !accountNumber) {
+      return res.status(400).json({ error: "Bank code and account number are required." })
+    }
+
+    if (accountNumber.length !== 10) {
+      return res.status(400).json({ error: "Account number must be 10 digits." })
+    }
+
+    const result = await resolveBankAccountName({ bankCode, accountNumber })
+    res.json(result)
+  } catch (error) {
+    console.error(error)
+    res.status(400).json({
+      error:
+        error instanceof Error ? error.message : "Could not resolve the account name for that bank account.",
+    })
+  }
+})
+
 app.get("/banks", requireSessionUser, async (_req, res) => {
   try {
     const banks = await getSupportedBanks()
@@ -2733,11 +3426,13 @@ app.post("/bank-account-name-enquiry", requireSessionUser, async (req, res) => {
 
 app.post("/payouts", requireSessionUser, async (req, res) => {
   try {
-    const { amount, bankName, bankCode = "", accountNumber, accountName = "" } = req.body
+    const { amount } = req.body
     const payoutAmount = Number(amount) || 0
+    const payoutProfile = getLockedPayoutProfile(req.user)
 
     const creatorTotals = await getRevenueTotals({ creatorId: req.user._id })
     const availableCreatorBalance = creatorTotals.creatorAvailableBalance
+    const hasCompletedWithdrawal = await hasSuccessfulWithdrawal(req.user._id)
 
     if (!payoutAmount || payoutAmount <= 0) {
       return res.status(400).json({ error: "Enter a valid payout amount." })
@@ -2759,122 +3454,69 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
       })
     }
 
-    if (!bankName || !accountNumber || !accountName) {
-      return res.status(400).json({
-        error: "Bank name, account number, and account name are required.",
-      })
-    }
-
-    if (!bankCode) {
-      return res.status(400).json({
-        error: "Bank code is required for live disbursement.",
-      })
-    }
-
     const transferReference = createTransferReference()
-    let transferResponse
+    const requiresReviewReasons = []
 
-    try {
-      transferResponse = await initiateMonnifyDisbursement({
-        amount: payoutAmount,
-        bankCode,
-        accountNumber,
-        accountName,
-        narration: `StreamTip creator payout for ${req.user.name}`,
-        reference: transferReference,
-      })
-    } catch (error) {
-      const message = getAxiosErrorMessage(error, "Failed to initiate payout with Monnify.")
-      const failedPayout = await Payout.create({
-        creatorId: req.user._id,
-        amount: payoutAmount,
-        bankName,
-        bankCode,
-        accountNumber,
-        accountName,
-        status: "failed",
-        transferReference,
-        providerReference: transferReference,
-        providerMessage: message,
-        createdAt: new Date(),
-        completedAt: new Date(),
-      })
-
-      io.to(getCreatorRoom(req.user._id)).emit("newPayout", failedPayout)
-
-      await createAuditLog({
-        actorType: "system",
-        eventType: "payout.failed",
-        message: `Payout failed for ${bankName}.`,
-        metadata: {
-          ...getAxiosErrorDetails(error),
-          amount: payoutAmount,
-          bankName,
-          bankCode,
-          accountNumber: String(accountNumber).slice(-4),
-          accountName,
-          creatorId: req.user._id.toString(),
-          transferReference,
-          error: message,
-        },
-      })
-
-      return res.status(502).json({ error: message, payout: failedPayout })
+    if (!hasCompletedWithdrawal) {
+      requiresReviewReasons.push("first_withdrawal")
     }
-
-    const providerStatus =
-      transferResponse.status ||
-      transferResponse.paymentStatus ||
-      transferResponse.transactionStatus ||
-      ""
-    const payoutStatus = normalizeMonnifyTransferStatus(providerStatus)
 
     const payout = await Payout.create({
       creatorId: req.user._id,
       amount: payoutAmount,
-      bankName,
-      bankCode,
-      accountNumber,
-      accountName,
-      status: payoutStatus,
+      bankName: payoutProfile.bankName,
+      bankCode: payoutProfile.bankCode,
+      accountNumber: payoutProfile.accountNumber,
+      accountName: payoutProfile.accountName,
+      status: requiresReviewReasons.length ? "awaiting_review" : "pending",
+      reviewStatus: requiresReviewReasons.length ? "awaiting_review" : "not_required",
+      reviewReason: requiresReviewReasons.join(","),
       transferReference,
-      providerReference:
-        String(
-          transferResponse.transactionReference ||
-            transferResponse.reference ||
-            transferResponse.paymentReference ||
-            transferReference,
-        ).trim() || transferReference,
-      providerMessage: String(
-        transferResponse.message || transferResponse.responseMessage || providerStatus || "",
-      ).trim(),
+      providerReference: transferReference,
+      providerMessage: requiresReviewReasons.length
+        ? "Awaiting StreamTip settlement review before Monnify transfer."
+        : "Queued for Monnify transfer.",
       createdAt: new Date(),
-      completedAt: payoutStatus === "completed" ? new Date() : undefined,
     })
 
     io.to(getCreatorRoom(req.user._id)).emit("newPayout", payout)
 
     await createAuditLog({
       actorType: "system",
-      eventType: "payout.created",
-      message: `Payout created for ${bankName}.`,
+      eventType: requiresReviewReasons.length ? "payout.awaiting_review" : "payout.auto_queued",
+      message: requiresReviewReasons.length
+        ? `Payout is awaiting review for ${payoutProfile.bankName}.`
+        : `Payout auto-queued for ${payoutProfile.bankName}.`,
       metadata: {
         amount: payoutAmount,
-        bankName,
-        bankCode,
-        accountNumber: String(accountNumber).slice(-4),
-        accountName,
+        bankName: payoutProfile.bankName,
+        bankCode: payoutProfile.bankCode,
+        accountNumber: String(payoutProfile.accountNumber).slice(-4),
+        accountName: payoutProfile.accountName,
         creatorId: req.user._id.toString(),
         transferReference,
-        providerReference: payout.providerReference || "",
-        providerStatus: payout.status,
+        reviewReason: payout.reviewReason || "",
       },
     })
+
+    if (!requiresReviewReasons.length) {
+      try {
+        await sendPayoutToMonnify(payout, req.user)
+      } catch (error) {
+        return res.status(502).json({
+          error:
+            error instanceof Error ? error.message : "Failed to initiate payout with Monnify.",
+          payout,
+        })
+      }
+    }
 
     res.json(payout)
   } catch (error) {
     console.error(error)
-    res.status(500).json({ error: "Failed payout" })
+    res.status(400).json({
+      error: error instanceof Error ? error.message : "Failed payout",
+    })
   }
 })
 
@@ -2901,16 +3543,24 @@ app.put("/user", requireSessionUser, async (req, res) => {
   try {
     const user = req.user
 
-    const nextName = String(req.body?.name || "").trim()
     const nextEmail = String(req.body?.email || "").toLowerCase().trim()
     const nextProfileImage = String(req.body?.profileImage || "").trim()
     const currentPassword = String(req.body?.currentPassword || "")
     const newPassword = String(req.body?.newPassword || "")
     const nextBvn = typeof req.body?.bvn === "string" ? req.body.bvn.trim() : undefined
     const nextNin = typeof req.body?.nin === "string" ? req.body.nin.trim() : undefined
+    const currentNameParts = getUserNameParts(user)
+    const nextNameParts = validateLegalNameParts({
+      firstName:
+        typeof req.body?.firstName === "string" ? req.body.firstName : currentNameParts.firstName,
+      middleName:
+        typeof req.body?.middleName === "string" ? req.body.middleName : currentNameParts.middleName,
+      lastName:
+        typeof req.body?.lastName === "string" ? req.body.lastName : currentNameParts.lastName,
+    })
 
-    if (!nextName || !nextEmail) {
-      return res.status(400).json({ error: "Name and email are required." })
+    if (!nextEmail) {
+      return res.status(400).json({ error: "Email is required." })
     }
 
     const existingUser = await User.findOne({
@@ -2922,7 +3572,11 @@ app.put("/user", requireSessionUser, async (req, res) => {
       return res.status(409).json({ error: "That email is already in use." })
     }
 
-    user.name = nextName
+    applyUserNameParts(user, {
+      firstName: nextNameParts.first,
+      middleName: nextNameParts.middle,
+      lastName: nextNameParts.last,
+    })
     user.email = nextEmail
     user.profileImage = nextProfileImage
     user.identity = user.identity || { bvn: "", nin: "" }
@@ -2944,7 +3598,7 @@ app.put("/user", requireSessionUser, async (req, res) => {
     }
 
     if (user.virtualAccount) {
-      user.virtualAccount.accountName = user.virtualAccount.accountName || `StreamTip/${nextName}`
+      user.virtualAccount.accountName = user.virtualAccount.accountName || `StreamTip/${user.name}`
     }
 
     if (newPassword) {
@@ -3036,6 +3690,396 @@ app.get("/admin/logs", requireAdminSession, async (req, res) => {
   }
 })
 
+app.get("/portal/settlements", requireAdminSession, async (_req, res) => {
+  try {
+    const payouts = await Payout.find({
+      status: "awaiting_review",
+      reviewStatus: "awaiting_review",
+    })
+      .populate("creatorId")
+      .sort({ createdAt: 1 })
+
+    res.json({
+      payouts: payouts.map((payout) => ({
+        id: payout._id,
+        amount: payout.amount,
+        status: payout.status,
+        reviewStatus: payout.reviewStatus,
+        reviewReason: payout.reviewReason || "",
+        bankName: payout.bankName,
+        bankCode: payout.bankCode,
+        accountName: payout.accountName,
+        accountNumber: payout.accountNumber,
+        transferReference: payout.transferReference,
+        providerMessage: payout.providerMessage || "",
+        createdAt: payout.createdAt,
+        creator: sanitizeUser(payout.creatorId),
+      })),
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load settlement queue." })
+  }
+})
+
+app.post("/portal/settlements/:id/approve", requireAdminSession, async (req, res) => {
+  try {
+    const payout = await Payout.findById(req.params.id)
+
+    if (!payout) {
+      return res.status(404).json({ error: "Payout not found." })
+    }
+
+    if (payout.status !== "awaiting_review" || payout.reviewStatus !== "awaiting_review") {
+      return res.status(409).json({ error: "This payout is not awaiting review." })
+    }
+
+    const creator = await User.findById(payout.creatorId)
+
+    if (!creator) {
+      return res.status(404).json({ error: "Creator not found." })
+    }
+
+    payout.reviewStatus = "approved"
+    payout.reviewedBy = req.adminSession._id.toString()
+    payout.reviewedAt = new Date()
+    payout.providerMessage = "Approved in StreamTip portal. Sending to Monnify."
+    await payout.save()
+
+    const sentPayout = await sendPayoutToMonnify(
+      payout,
+      creator,
+      "admin",
+      req.adminSession._id.toString(),
+    )
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.settlement.approved",
+      message: `Admin approved payout ${payout.transferReference}.`,
+      metadata: {
+        payoutId: payout._id.toString(),
+        creatorId: creator._id.toString(),
+        amount: payout.amount,
+      },
+    })
+
+    res.json({ payout: sentPayout, creator: sanitizeUser(creator) })
+  } catch (error) {
+    console.error(error)
+    res.status(502).json({
+      error: error instanceof Error ? error.message : "Could not approve and send payout.",
+    })
+  }
+})
+
+app.post("/portal/settlements/:id/reject", requireAdminSession, async (req, res) => {
+  try {
+    const payout = await Payout.findById(req.params.id)
+
+    if (!payout) {
+      return res.status(404).json({ error: "Payout not found." })
+    }
+
+    if (payout.status !== "awaiting_review" || payout.reviewStatus !== "awaiting_review") {
+      return res.status(409).json({ error: "This payout is not awaiting review." })
+    }
+
+    const reason = String(req.body?.reason || "").trim()
+
+    payout.status = "rejected"
+    payout.reviewStatus = "rejected"
+    payout.reviewedBy = req.adminSession._id.toString()
+    payout.reviewedAt = new Date()
+    payout.rejectionReason = reason || "Rejected by settlement reviewer."
+    payout.providerMessage = payout.rejectionReason
+    payout.completedAt = new Date()
+    await payout.save()
+
+    io.to(getCreatorRoom(payout.creatorId)).emit("newPayout", payout)
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.settlement.rejected",
+      message: `Admin rejected payout ${payout.transferReference}.`,
+      metadata: {
+        payoutId: payout._id.toString(),
+        creatorId: payout.creatorId.toString(),
+        amount: payout.amount,
+        reason: payout.rejectionReason,
+      },
+    })
+
+    res.json({ payout })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Could not reject payout." })
+  }
+})
+
+app.get("/portal/users", requireAdminSession, async (_req, res) => {
+  try {
+    const users = await User.find().sort({ createdAt: -1 })
+    res.json({ users: users.map(sanitizeUser) })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load portal users." })
+  }
+})
+
+app.patch("/portal/users/:id", requireAdminSession, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id)
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found." })
+    }
+
+    const reason = String(req.body?.reason || "").trim()
+
+    if (!reason) {
+      return res.status(400).json({ error: "A super admin edit reason is required." })
+    }
+
+    if (typeof req.body?.email === "string" && req.body.email.trim()) {
+      user.email = req.body.email.toLowerCase().trim()
+    }
+
+    if (["active", "suspended", "banned"].includes(String(req.body?.status))) {
+      user.status = String(req.body.status)
+    }
+
+    const currentNameParts = getUserNameParts(user)
+    const identityBody = req.body?.identity && typeof req.body.identity === "object" ? req.body.identity : {}
+    const legal = validateLegalNameParts({
+      firstName:
+        typeof req.body?.firstName === "string"
+          ? req.body.firstName
+          : typeof identityBody.firstName === "string"
+            ? identityBody.firstName
+            : currentNameParts.firstName,
+      middleName:
+        typeof req.body?.middleName === "string"
+          ? req.body.middleName
+          : typeof identityBody.middleName === "string"
+            ? identityBody.middleName
+            : currentNameParts.middleName,
+      lastName:
+        typeof req.body?.lastName === "string"
+          ? req.body.lastName
+          : typeof identityBody.lastName === "string"
+            ? identityBody.lastName
+            : currentNameParts.lastName,
+    })
+    applyUserNameParts(user, {
+      firstName: legal.first,
+      middleName: legal.middle,
+      lastName: legal.last,
+    })
+
+    if (typeof identityBody.dateOfBirth === "string") {
+      user.identity = user.identity || {}
+      user.identity.dateOfBirth = identityBody.dateOfBirth.trim()
+    }
+
+    await user.save()
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.user.super_admin_updated",
+      message: `Super admin updated ${user.email}.`,
+      metadata: {
+        userId: user._id.toString(),
+        reason,
+        changedFields: Object.keys(req.body || {}).filter((key) => key !== "reason"),
+      },
+    })
+
+    res.json({ user: sanitizeUser(user) })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to update portal user." })
+  }
+})
+
+app.get("/portal/payout-profile-change-requests", requireAdminSession, async (_req, res) => {
+  try {
+    const requests = await PayoutProfileChangeRequest.find()
+      .populate("creatorId")
+      .sort({ createdAt: -1 })
+      .limit(100)
+
+    res.json({ requests: requests.map(sanitizePayoutProfileChangeRequest) })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load payout profile change requests." })
+  }
+})
+
+app.post("/portal/payout-profile-change-requests/:id/approve", requireAdminSession, async (req, res) => {
+  try {
+    const request = await PayoutProfileChangeRequest.findById(req.params.id)
+
+    if (!request) {
+      return res.status(404).json({ error: "Change request not found." })
+    }
+
+    if (request.status !== "awaiting_review") {
+      return res.status(409).json({ error: "This request has already been reviewed." })
+    }
+
+    const user = await User.findById(request.creatorId)
+
+    if (!user) {
+      return res.status(404).json({ error: "Creator not found." })
+    }
+
+    const cooldownHours = Math.max(24, Math.min(72, Number(req.body?.cooldownHours) || 48))
+    const cooldownUntil = new Date(Date.now() + cooldownHours * 3_600_000)
+
+    user.payoutProfile = {
+      ...request.requestedProfile,
+      locked: true,
+      status: "verified",
+      verifiedAt: new Date(),
+      lockedAt: new Date(),
+      changeRequiresSupport: true,
+    }
+    await user.save()
+
+    request.status = "approved"
+    request.reviewedBy = req.adminSession._id.toString()
+    request.reviewedAt = new Date()
+    request.cooldownUntil = cooldownUntil
+    await request.save()
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.payout_profile_change.approved",
+      message: `Admin approved payout profile change for ${user.email}.`,
+      metadata: {
+        requestId: request._id.toString(),
+        userId: user._id.toString(),
+        cooldownUntil,
+      },
+    })
+
+    res.json({ request: sanitizePayoutProfileChangeRequest(request), user: sanitizeUser(user) })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to approve payout profile change." })
+  }
+})
+
+app.post("/portal/payout-profile-change-requests/:id/reject", requireAdminSession, async (req, res) => {
+  try {
+    const request = await PayoutProfileChangeRequest.findById(req.params.id)
+
+    if (!request) {
+      return res.status(404).json({ error: "Change request not found." })
+    }
+
+    if (request.status !== "awaiting_review") {
+      return res.status(409).json({ error: "This request has already been reviewed." })
+    }
+
+    const reason = String(req.body?.reason || "").trim()
+
+    if (!reason) {
+      return res.status(400).json({ error: "A rejection reason is required." })
+    }
+
+    request.status = "rejected"
+    request.reviewedBy = req.adminSession._id.toString()
+    request.reviewedAt = new Date()
+    request.rejectionReason = reason
+    await request.save()
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.payout_profile_change.rejected",
+      message: "Admin rejected a payout profile change request.",
+      metadata: {
+        requestId: request._id.toString(),
+        creatorId: request.creatorId.toString(),
+        reason,
+      },
+    })
+
+    res.json({ request: sanitizePayoutProfileChangeRequest(request) })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to reject payout profile change." })
+  }
+})
+
+app.post("/portal/payouts/reconcile", requireAdminSession, async (req, res) => {
+  try {
+    const result = await reconcilePendingPayouts()
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.payouts.reconciled",
+      message: "Admin triggered payout reconciliation.",
+      metadata: result,
+    })
+    res.json(result)
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to reconcile payouts." })
+  }
+})
+
+app.post("/portal/payouts/:id/cancel", requireAdminSession, async (req, res) => {
+  try {
+    const payout = await Payout.findById(req.params.id)
+
+    if (!payout) {
+      return res.status(404).json({ error: "Payout not found." })
+    }
+
+    if (!["pending", "awaiting_review", "failed"].includes(payout.status)) {
+      return res.status(409).json({ error: "Only pending, review, or failed payouts can be cancelled." })
+    }
+
+    const reason = String(req.body?.reason || "").trim()
+
+    payout.status = "cancelled"
+    payout.reviewStatus = payout.reviewStatus === "awaiting_review" ? "rejected" : payout.reviewStatus
+    payout.reviewedBy = req.adminSession._id.toString()
+    payout.reviewedAt = new Date()
+    payout.rejectionReason = reason || "Cancelled after provider expiry."
+    payout.providerMessage = payout.rejectionReason
+    payout.completedAt = new Date()
+    await payout.save()
+
+    io.to(getCreatorRoom(payout.creatorId)).emit("newPayout", payout)
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.payout.cancelled",
+      message: `Admin cancelled payout ${payout.transferReference}.`,
+      metadata: {
+        payoutId: payout._id.toString(),
+        creatorId: payout.creatorId.toString(),
+        amount: payout.amount,
+        reason: payout.rejectionReason,
+      },
+    })
+
+    res.json({ payout })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to cancel payout." })
+  }
+})
+
 app.get("/admin/users", requireAdminSession, async (req, res) => {
   try {
     const users = await User.find().sort({ createdAt: -1 })
@@ -3083,6 +4127,9 @@ app.post("/admin/users", requireAdminSession, async (req, res) => {
   try {
     const {
       name,
+      firstName = "",
+      middleName = "",
+      lastName = "",
       email,
       password,
       role = "creator",
@@ -3091,7 +4138,17 @@ app.post("/admin/users", requireAdminSession, async (req, res) => {
     } = req.body || {}
 
     const normalizedEmail = String(email || "").toLowerCase().trim()
-    const trimmedName = String(name || "").trim()
+    const fallbackParts = splitNamePartsFromFullName(name)
+    const legal = validateLegalNameParts({
+      firstName: firstName || fallbackParts.firstName,
+      middleName: middleName || fallbackParts.middleName,
+      lastName: lastName || fallbackParts.lastName,
+    })
+    const trimmedName = buildFullNameFromParts({
+      firstName: legal.first,
+      middleName: legal.middle,
+      lastName: legal.last,
+    })
     const rawPassword = String(password || "")
     const nextRole = role === "admin" ? "admin" : "creator"
     const nextStatus = ["active", "suspended", "banned"].includes(String(status))
@@ -3111,11 +4168,19 @@ app.post("/admin/users", requireAdminSession, async (req, res) => {
 
     const user = await User.create({
       name: trimmedName,
+      firstName: legal.first,
+      middleName: legal.middle,
+      lastName: legal.last,
       email: normalizedEmail,
       passwordHash: hashPassword(rawPassword),
       sessionToken: null,
       role: nextRole,
       status: nextStatus,
+      identity: {
+        firstName: legal.first,
+        middleName: legal.middle,
+        lastName: legal.last,
+      },
     })
 
     if (provisionVirtualAccount && isMonnifyConfigured()) {
@@ -3154,7 +4219,23 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
       return res.status(404).json({ error: "User not found." })
     }
 
-    const nextName = typeof req.body?.name === "string" ? req.body.name.trim() : user.name
+    const fallbackParts =
+      typeof req.body?.name === "string" ? splitNamePartsFromFullName(req.body.name) : {}
+    const currentNameParts = getUserNameParts(user)
+    const legal = validateLegalNameParts({
+      firstName:
+        typeof req.body?.firstName === "string"
+          ? req.body.firstName
+          : fallbackParts.firstName || currentNameParts.firstName,
+      middleName:
+        typeof req.body?.middleName === "string"
+          ? req.body.middleName
+          : fallbackParts.middleName || currentNameParts.middleName,
+      lastName:
+        typeof req.body?.lastName === "string"
+          ? req.body.lastName
+          : fallbackParts.lastName || currentNameParts.lastName,
+    })
     const nextEmail =
       typeof req.body?.email === "string" ? req.body.email.toLowerCase().trim() : user.email
     const nextRole = req.body?.role === "admin" ? "admin" : req.body?.role === "creator" ? "creator" : user.role
@@ -3162,8 +4243,8 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
       ? String(req.body.status)
       : user.status
 
-    if (!nextName || !nextEmail) {
-      return res.status(400).json({ error: "Name and email are required." })
+    if (!nextEmail) {
+      return res.status(400).json({ error: "Email is required." })
     }
 
     const existingUser = await User.findOne({
@@ -3175,7 +4256,11 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
       return res.status(409).json({ error: "Another user already uses that email." })
     }
 
-    user.name = nextName
+    applyUserNameParts(user, {
+      firstName: legal.first,
+      middleName: legal.middle,
+      lastName: legal.last,
+    })
     user.email = nextEmail
     user.role = nextRole
     user.status = nextStatus
@@ -3235,6 +4320,126 @@ app.post("/admin/users/:id/virtual-account", requireAdminSession, async (req, re
         error instanceof Error
           ? error.message
           : "Could not provision a Monnify reserved account.",
+    })
+  }
+})
+
+app.post("/payout-profile", requireSessionUser, async (req, res) => {
+  try {
+    if (req.user.payoutProfile?.locked) {
+      return res.status(409).json({
+        error:
+          "Your payout account is locked. Contact support with government ID and NIN proof to request a change.",
+      })
+    }
+
+    const payoutProfile = await buildVerifiedPayoutProfile({
+      user: req.user,
+      bankCode: req.body?.bankCode,
+      bankName: req.body?.bankName,
+      accountNumber: req.body?.accountNumber,
+      firstName: req.body?.firstName,
+      middleName: req.body?.middleName,
+      lastName: req.body?.lastName,
+    })
+
+    applyUserNameParts(req.user, {
+      firstName: payoutProfile.firstName,
+      middleName: payoutProfile.middleName,
+      lastName: payoutProfile.lastName,
+    })
+    req.user.payoutProfile = payoutProfile
+    await req.user.save()
+
+    await createAuditLog({
+      actorType: "user",
+      actorId: req.user._id.toString(),
+      eventType: "payout_profile.locked",
+      message: `${req.user.email} locked a verified payout bank account.`,
+      metadata: {
+        bankName: payoutProfile.bankName,
+        bankCode: payoutProfile.bankCode,
+        accountNumberLast4: payoutProfile.accountNumber.slice(-4),
+        accountName: payoutProfile.accountName,
+      },
+    })
+
+    res.json({ user: sanitizeUser(req.user), payoutProfile: sanitizePayoutProfile(req.user.payoutProfile) })
+  } catch (error) {
+    console.error(error)
+    res.status(400).json({
+      error:
+        error instanceof Error ? error.message : "Could not verify and lock this payout account.",
+    })
+  }
+})
+
+app.post("/payout-profile/change-request", requireSessionUser, async (req, res) => {
+  try {
+    if (!req.user.payoutProfile?.locked) {
+      return res.status(400).json({
+        error: "Add and lock your first payout profile before requesting a support change.",
+      })
+    }
+
+    const existing = await PayoutProfileChangeRequest.findOne({
+      creatorId: req.user._id,
+      status: "awaiting_review",
+    })
+
+    if (existing) {
+      return res.status(409).json({
+        error: "You already have a payout account change request awaiting review.",
+      })
+    }
+
+    const requestedProfile = await buildVerifiedPayoutProfile({
+      user: req.user,
+      bankCode: req.body?.bankCode,
+      bankName: req.body?.bankName,
+      accountNumber: req.body?.accountNumber,
+      firstName: req.body?.firstName,
+      middleName: req.body?.middleName,
+      lastName: req.body?.lastName,
+    })
+    const supportNote = String(req.body?.supportNote || "").trim()
+    const proofSummary = String(req.body?.proofSummary || "").trim()
+
+    if (!supportNote || !proofSummary) {
+      return res.status(400).json({
+        error:
+          "Explain why the account must change and list the government ID/NIN proof you will provide to support.",
+      })
+    }
+
+    const request = await PayoutProfileChangeRequest.create({
+      creatorId: req.user._id,
+      currentProfile: sanitizePayoutProfile(req.user.payoutProfile),
+      requestedProfile,
+      supportNote,
+      proofSummary,
+      status: "awaiting_review",
+      createdAt: new Date(),
+    })
+
+    await createAuditLog({
+      actorType: "user",
+      actorId: req.user._id.toString(),
+      eventType: "payout_profile.change_requested",
+      message: `${req.user.email} requested a payout account change.`,
+      metadata: {
+        requestId: request._id.toString(),
+        requestedBankName: requestedProfile.bankName,
+        requestedAccountLast4: requestedProfile.accountNumber.slice(-4),
+      },
+    })
+
+    res.status(201).json({ request: sanitizePayoutProfileChangeRequest(request) })
+  } catch (error) {
+    console.error(error)
+    res.status(400).json({
+      error:
+        error instanceof Error ? error.message : "Could not submit payout profile change request.",
     })
   }
 })
@@ -3419,3 +4624,9 @@ const PORT = Number(process.env.PORT || 5000)
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on http://0.0.0.0:${PORT}`)
 })
+
+setInterval(() => {
+  void reconcilePendingPayouts().catch((error) => {
+    console.error("payout.reconciliation.interval_failed", error)
+  })
+}, 5 * 60 * 1000)
