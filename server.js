@@ -795,8 +795,20 @@ function resolvePayoutNamePart(value, fallback = "") {
   return trimmed || String(fallback || "").trim()
 }
 
-function validatePayoutAccountNameMatch({ firstName, middleName, lastName, accountName }) {
-  const legal = validateLegalNameParts({ firstName, middleName, lastName })
+function validatePayoutAccountNameMatch({
+  firstName,
+  middleName,
+  lastName,
+  first,
+  middle,
+  last,
+  accountName,
+}) {
+  const legal = validateLegalNameParts({
+    firstName: resolvePayoutNamePart(firstName, first),
+    middleName: resolvePayoutNamePart(middleName, middle),
+    lastName: resolvePayoutNamePart(lastName, last),
+  })
   const accountTokens = tokenizeName(accountName)
   const missing = [legal.first, legal.middle, legal.last]
     .map((part) => ({ original: part, normalized: normalizeNameToken(part) }))
