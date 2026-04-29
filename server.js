@@ -790,6 +790,11 @@ function validateLegalNameParts({ firstName, middleName, lastName }) {
   return { first, middle, last }
 }
 
+function resolvePayoutNamePart(value, fallback = "") {
+  const trimmed = typeof value === "string" ? value.trim() : ""
+  return trimmed || String(fallback || "").trim()
+}
+
 function validatePayoutAccountNameMatch({ firstName, middleName, lastName, accountName }) {
   const legal = validateLegalNameParts({ firstName, middleName, lastName })
   const accountTokens = tokenizeName(accountName)
@@ -2220,9 +2225,9 @@ async function buildVerifiedPayoutProfile({
   const cleanAccountNumber = String(accountNumber || "").replace(/\D/g, "").slice(0, 10)
   const fallbackParts = getUserNameParts(user)
   const legal = validateLegalNameParts({
-    firstName: typeof firstName === "string" ? firstName : fallbackParts.firstName,
-    middleName: typeof middleName === "string" ? middleName : fallbackParts.middleName,
-    lastName: typeof lastName === "string" ? lastName : fallbackParts.lastName,
+    firstName: resolvePayoutNamePart(firstName, fallbackParts.firstName),
+    middleName: resolvePayoutNamePart(middleName, fallbackParts.middleName),
+    lastName: resolvePayoutNamePart(lastName, fallbackParts.lastName),
   })
 
   if (!cleanBankCode || cleanAccountNumber.length !== 10) {
