@@ -2141,6 +2141,85 @@ async function initiateMonnifyDisbursement({
   }
 }
 
+async function authorizeMonnifySingleDisbursement({ reference, authorizationCode }) {
+  if (!isMonnifyConfigured()) {
+    throw new Error("Monnify disbursement is not configured yet.")
+  }
+
+  const cleanReference = String(reference || "").trim()
+  const cleanAuthorizationCode = String(authorizationCode || "").trim()
+
+  if (!cleanReference || !cleanAuthorizationCode) {
+    throw new Error("Transfer reference and Monnify OTP are required.")
+  }
+
+  const accessToken = await getMonnifyAccessToken()
+  const response = await axios.post(
+    `${MONNIFY_BASE_URL}/api/v2/disbursements/single/validate-otp`,
+    {
+      reference: cleanReference,
+      authorizationCode: cleanAuthorizationCode,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    },
+  )
+  const authorization = response.data?.responseBody || {}
+  const responseMessage = String(response.data?.responseMessage || authorization.message || "").trim()
+  const responseCode = String(response.data?.responseCode || authorization.responseCode || "").trim()
+
+  if (response.data?.requestSuccessful === false) {
+    throw new Error(responseMessage || "Monnify rejected the authorization code.")
+  }
+
+  return {
+    ...authorization,
+    reference: authorization.reference || cleanReference,
+    responseMessage,
+    responseCode,
+  }
+}
+
+async function resendMonnifySingleDisbursementOtp(reference) {
+  if (!isMonnifyConfigured()) {
+    throw new Error("Monnify disbursement is not configured yet.")
+  }
+
+  const cleanReference = String(reference || "").trim()
+
+  if (!cleanReference) {
+    throw new Error("Transfer reference is required.")
+  }
+
+  const accessToken = await getMonnifyAccessToken()
+  const response = await axios.post(
+    `${MONNIFY_BASE_URL}/api/v2/disbursements/single/resend-otp`,
+    { reference: cleanReference },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    },
+  )
+  const responseBody = response.data?.responseBody || {}
+  const responseMessage = String(
+    response.data?.responseMessage || responseBody.message || "Monnify OTP resent.",
+  ).trim()
+
+  if (response.data?.requestSuccessful === false) {
+    throw new Error(responseMessage || "Could not resend Monnify OTP.")
+  }
+
+  return {
+    ...responseBody,
+    responseMessage,
+  }
+}
+
 async function getCurrentUser() {
   return User.findOne().sort({ createdAt: -1 })
 }
@@ -2320,7 +2399,12 @@ async function sendPayoutToMonnify(payout, creator, actorType = "system", actorI
         payout.transferReference,
     ).trim() || payout.transferReference
   payout.providerMessage = String(
-    transferResponse.message || transferResponse.responseMessage || providerStatus || "",
+    [
+      providerStatus,
+      transferResponse.message || transferResponse.responseMessage || "",
+    ]
+      .filter(Boolean)
+      .join(" - "),
   ).trim()
   payout.completedAt = payoutStatus === "completed" ? new Date() : undefined
   await payout.save()
@@ -3703,8 +3787,14 @@ app.get("/admin/logs", requireAdminSession, async (req, res) => {
 app.get("/portal/settlements", requireAdminSession, async (_req, res) => {
   try {
     const payouts = await Payout.find({
-      status: "awaiting_review",
-      reviewStatus: "awaiting_review",
+      $or: [
+        { status: "awaiting_review", reviewStatus: "awaiting_review" },
+        {
+          status: "pending",
+          reviewStatus: { $in: ["approved", "not_required"] },
+          providerMessage: /authorization|otp/i,
+        },
+      ],
     })
       .populate("creatorId")
       .sort({ createdAt: 1 })
@@ -3722,6 +3812,9 @@ app.get("/portal/settlements", requireAdminSession, async (_req, res) => {
         accountNumber: payout.accountNumber,
         transferReference: payout.transferReference,
         providerMessage: payout.providerMessage || "",
+        requiresAuthorization:
+          payout.status === "pending" &&
+          /authorization|otp/i.test(payout.providerMessage || ""),
         createdAt: payout.createdAt,
         creator: sanitizeUser(payout.creatorId),
       })),
@@ -3780,6 +3873,87 @@ app.post("/portal/settlements/:id/approve", requireAdminSession, async (req, res
     console.error(error)
     res.status(502).json({
       error: error instanceof Error ? error.message : "Could not approve and send payout.",
+    })
+  }
+})
+
+app.post("/portal/settlements/:id/authorize", requireAdminSession, async (req, res) => {
+  try {
+    const payout = await Payout.findById(req.params.id)
+
+    if (!payout) {
+      return res.status(404).json({ error: "Payout not found." })
+    }
+
+    if (payout.status !== "pending" || !/authorization|otp/i.test(payout.providerMessage || "")) {
+      return res.status(409).json({ error: "This payout is not pending Monnify authorization." })
+    }
+
+    const authorizationCode = String(req.body?.authorizationCode || "").trim()
+
+    if (!authorizationCode) {
+      return res.status(400).json({ error: "Enter the Monnify OTP for this transfer." })
+    }
+
+    const authorization = await authorizeMonnifySingleDisbursement({
+      reference: payout.transferReference,
+      authorizationCode,
+    })
+    const updatedPayout = await updatePayoutFromProviderStatus(payout, authorization, "admin")
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.settlement.authorized",
+      message: `Admin authorized payout ${payout.transferReference} with Monnify OTP.`,
+      metadata: {
+        payoutId: payout._id.toString(),
+        transferReference: payout.transferReference,
+        providerStatus: authorization.status || authorization.paymentStatus || "",
+      },
+    })
+
+    res.json({ payout: updatedPayout })
+  } catch (error) {
+    console.error(error)
+    res.status(502).json({
+      error: error instanceof Error ? error.message : "Could not authorize Monnify payout.",
+    })
+  }
+})
+
+app.post("/portal/settlements/:id/resend-otp", requireAdminSession, async (req, res) => {
+  try {
+    const payout = await Payout.findById(req.params.id)
+
+    if (!payout) {
+      return res.status(404).json({ error: "Payout not found." })
+    }
+
+    if (payout.status !== "pending" || !/authorization|otp/i.test(payout.providerMessage || "")) {
+      return res.status(409).json({ error: "This payout is not pending Monnify authorization." })
+    }
+
+    const result = await resendMonnifySingleDisbursementOtp(payout.transferReference)
+    payout.providerMessage = result.responseMessage || "Monnify OTP resent."
+    await payout.save()
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.settlement.otp_resent",
+      message: `Admin requested a new Monnify OTP for payout ${payout.transferReference}.`,
+      metadata: {
+        payoutId: payout._id.toString(),
+        transferReference: payout.transferReference,
+      },
+    })
+
+    res.json({ payout, message: payout.providerMessage })
+  } catch (error) {
+    console.error(error)
+    res.status(502).json({
+      error: error instanceof Error ? error.message : "Could not resend Monnify OTP.",
     })
   }
 })
