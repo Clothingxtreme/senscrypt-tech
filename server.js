@@ -1263,35 +1263,69 @@ async function buildPortalSettlementFilter(query = {}) {
     }
   }
 
-  if (search) {
-    const regex = new RegExp(escapeRegex(search), "i")
-    const matchingUsers = await User.find({
-      $or: [
-        { email: regex },
-        { name: regex },
-        { firstName: regex },
-        { lastName: regex },
-        { "identity.firstName": regex },
-        { "identity.lastName": regex },
-      ],
-    })
-      .select("_id")
-      .limit(1000)
+  const searchFilter = await buildPortalSettlementSearchFilter(search)
 
-    filter.$or = [
-      { transferReference: regex },
-      { providerReference: regex },
-      { bankName: regex },
-      { accountName: regex },
-      { accountNumber: regex },
-    ]
-
-    if (matchingUsers.length) {
-      filter.$or.push({ creatorId: { $in: matchingUsers.map((user) => user._id) } })
-    }
+  if (searchFilter) {
+    filter.$and = [...(filter.$and || []), searchFilter]
   }
 
   return filter
+}
+
+async function buildPortalSettlementSearchFilter(search) {
+  const cleanSearch = String(search || "").trim()
+
+  if (!cleanSearch) {
+    return null
+  }
+
+  const regex = new RegExp(escapeRegex(cleanSearch), "i")
+  const matchingUsers = await User.find({
+    $or: [
+      { email: regex },
+      { name: regex },
+      { firstName: regex },
+      { lastName: regex },
+      { "identity.firstName": regex },
+      { "identity.lastName": regex },
+    ],
+  })
+    .select("_id")
+    .limit(1000)
+
+  const searchClauses = [
+    { transferReference: regex },
+    { providerReference: regex },
+    { bankName: regex },
+    { accountName: regex },
+    { accountNumber: regex },
+  ]
+
+  if (matchingUsers.length) {
+    searchClauses.push({ creatorId: { $in: matchingUsers.map((user) => user._id) } })
+  }
+
+  return { $or: searchClauses }
+}
+
+async function buildPortalSettlementQueueFilter(query = {}) {
+  const baseFilter = {
+    $or: [
+      { status: "awaiting_review", reviewStatus: "awaiting_review" },
+      {
+        status: "pending",
+        reviewStatus: { $in: ["approved", "not_required"] },
+        providerMessage: /authorization|otp/i,
+      },
+    ],
+  }
+  const searchFilter = await buildPortalSettlementSearchFilter(query.search)
+
+  if (!searchFilter) {
+    return baseFilter
+  }
+
+  return { $and: [baseFilter, searchFilter] }
 }
 
 function csvCell(value) {
@@ -2085,6 +2119,7 @@ function maskAccountNumber(value) {
 
 function getWithdrawalReviewReasonLabel(reasons = []) {
   const labels = {
+    portal_review_required: "Admin portal review required",
     first_withdrawal: "First withdrawal",
   }
   const cleanReasons = Array.isArray(reasons)
@@ -2349,6 +2384,40 @@ async function reconcilePendingPayouts() {
   }
 
   return { checked: pendingPayouts.length, updated }
+}
+
+async function failPayoutAndReleaseBalance({
+  payout,
+  actorId,
+  reason = "Payout failed and creator balance was released.",
+  eventType = "portal.payout.failed_released",
+}) {
+  payout.status = "failed"
+  payout.reviewStatus = payout.reviewStatus === "awaiting_review" ? "rejected" : payout.reviewStatus
+  payout.reviewedBy = actorId
+  payout.reviewedAt = new Date()
+  payout.rejectionReason = reason
+  payout.providerMessage = reason
+  payout.completedAt = new Date()
+  await payout.save()
+
+  io.to(getCreatorRoom(payout.creatorId)).emit("newPayout", payout)
+
+  await createAuditLog({
+    actorType: "admin",
+    actorId,
+    eventType,
+    message: `Admin marked payout ${payout.transferReference} as failed and released the creator balance.`,
+    metadata: {
+      payoutId: payout._id.toString(),
+      creatorId: payout.creatorId.toString(),
+      amount: payout.amount,
+      transferReference: payout.transferReference,
+      reason,
+    },
+  })
+
+  return payout
 }
 
 async function initiateMonnifyDisbursement({
@@ -3820,7 +3889,7 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
     }
 
     const transferReference = createTransferReference()
-    const requiresReviewReasons = []
+    const requiresReviewReasons = ["portal_review_required"]
 
     if (!hasCompletedWithdrawal) {
       requiresReviewReasons.push("first_withdrawal")
@@ -3833,14 +3902,12 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
       bankCode: payoutProfile.bankCode,
       accountNumber: payoutProfile.accountNumber,
       accountName: payoutProfile.accountName,
-      status: requiresReviewReasons.length ? "awaiting_review" : "pending",
-      reviewStatus: requiresReviewReasons.length ? "awaiting_review" : "not_required",
+      status: "awaiting_review",
+      reviewStatus: "awaiting_review",
       reviewReason: requiresReviewReasons.join(","),
       transferReference,
       providerReference: transferReference,
-      providerMessage: requiresReviewReasons.length
-        ? "Awaiting StreamTip settlement review before Monnify transfer."
-        : "Queued for Monnify transfer.",
+      providerMessage: "Awaiting StreamTip settlement review before Monnify transfer.",
       createdAt: new Date(),
     })
 
@@ -3848,10 +3915,8 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
 
     await createAuditLog({
       actorType: "system",
-      eventType: requiresReviewReasons.length ? "payout.awaiting_review" : "payout.auto_queued",
-      message: requiresReviewReasons.length
-        ? `Payout is awaiting review for ${payoutProfile.bankName}.`
-        : `Payout auto-queued for ${payoutProfile.bankName}.`,
+      eventType: "payout.awaiting_review",
+      message: `Payout is awaiting review for ${payoutProfile.bankName}.`,
       metadata: {
         amount: payoutAmount,
         bankName: payoutProfile.bankName,
@@ -3864,37 +3929,14 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
       },
     })
 
-    let responsePayout = payout
-
-    if (!requiresReviewReasons.length) {
-      try {
-        responsePayout = await sendPayoutToMonnify(payout, req.user)
-      } catch (error) {
-        void notifyWithdrawalRequestOnTelegram({
-          payout,
-          creator: req.user,
-          availableCreatorBalance,
-          reviewReasons: requiresReviewReasons,
-          providerError:
-            error instanceof Error ? error.message : "Failed to initiate payout with Monnify.",
-        })
-
-        return res.status(502).json({
-          error:
-            error instanceof Error ? error.message : "Failed to initiate payout with Monnify.",
-          payout,
-        })
-      }
-    }
-
     void notifyWithdrawalRequestOnTelegram({
-      payout: responsePayout,
+      payout,
       creator: req.user,
       availableCreatorBalance,
       reviewReasons: requiresReviewReasons,
     })
 
-    res.json(responsePayout)
+    res.json(payout)
   } catch (error) {
     console.error(error)
     res.status(400).json({
@@ -4073,23 +4115,25 @@ app.get("/admin/logs", requireAdminSession, async (req, res) => {
   }
 })
 
-app.get("/portal/settlements", requireAdminSession, async (_req, res) => {
+app.get("/portal/settlements", requireAdminSession, async (req, res) => {
   try {
-    const payouts = await Payout.find({
-      $or: [
-        { status: "awaiting_review", reviewStatus: "awaiting_review" },
-        {
-          status: "pending",
-          reviewStatus: { $in: ["approved", "not_required"] },
-          providerMessage: /authorization|otp/i,
-        },
-      ],
-    })
-      .populate("creatorId")
-      .sort({ createdAt: 1 })
+    const page = parsePositiveInteger(req.query.page, 1)
+    const limit = Math.min(parsePositiveInteger(req.query.limit, 20), 100)
+    const skip = (page - 1) * limit
+    const filter = await buildPortalSettlementQueueFilter(req.query)
+
+    const [payouts, total] = await Promise.all([
+      Payout.find(filter)
+        .populate("creatorId")
+        .sort({ createdAt: 1 })
+        .skip(skip)
+        .limit(limit),
+      Payout.countDocuments(filter),
+    ])
 
     res.json({
       payouts: payouts.map(sanitizePortalPayout),
+      pagination: getPaginationMeta({ page, limit, total }),
     })
   } catch (error) {
     console.error(error)
@@ -4628,6 +4672,74 @@ app.post("/portal/payouts/reconcile", requireAdminSession, async (req, res) => {
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to reconcile payouts." })
+  }
+})
+
+app.post("/portal/payouts/release-stuck-pending", requireAdminSession, async (req, res) => {
+  try {
+    const reason =
+      String(req.body?.reason || "").trim() ||
+      "Legacy auto-disbursement stayed pending at Monnify authorization. Marked failed so creator balance is released."
+    const stuckPayouts = await Payout.find({
+      status: "pending",
+      reviewStatus: "not_required",
+    }).sort({ createdAt: 1 })
+    let updated = 0
+
+    for (const payout of stuckPayouts) {
+      await failPayoutAndReleaseBalance({
+        payout,
+        actorId: req.adminSession._id.toString(),
+        reason,
+        eventType: "portal.payout.legacy_pending_failed",
+      })
+      updated += 1
+    }
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.payouts.legacy_pending_release_completed",
+      message: "Admin released legacy auto-pending payout balances.",
+      metadata: {
+        checked: stuckPayouts.length,
+        updated,
+        reason,
+      },
+    })
+
+    res.json({ checked: stuckPayouts.length, updated })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to release stuck pending payouts." })
+  }
+})
+
+app.post("/portal/payouts/:id/fail", requireAdminSession, async (req, res) => {
+  try {
+    const payout = await Payout.findById(req.params.id)
+
+    if (!payout) {
+      return res.status(404).json({ error: "Payout not found." })
+    }
+
+    if (!["pending", "awaiting_review", "failed"].includes(payout.status)) {
+      return res.status(409).json({ error: "Only pending, review, or failed payouts can be marked failed." })
+    }
+
+    const reason =
+      String(req.body?.reason || "").trim() ||
+      "Payout failed or expired at provider authorization. Creator balance released."
+    const updatedPayout = await failPayoutAndReleaseBalance({
+      payout,
+      actorId: req.adminSession._id.toString(),
+      reason,
+    })
+
+    res.json({ payout: updatedPayout })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to mark payout failed." })
   }
 })
 
