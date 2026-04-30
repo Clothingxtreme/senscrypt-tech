@@ -40,6 +40,10 @@ const GOOGLE_CLIENT_ID = readEnv("GOOGLE_CLIENT_ID")
 const APPLE_CLIENT_ID = readEnv("APPLE_CLIENT_ID")
 const ADMIN_EMAIL = readEnv("ADMIN_EMAIL")
 const ADMIN_PASSWORD = readEnv("ADMIN_PASSWORD")
+const TELEGRAM_BOT_TOKEN = readEnv("TELEGRAM_BOT_TOKEN")
+const TELEGRAM_WITHDRAWAL_CHAT_ID =
+  readEnv("TELEGRAM_WITHDRAWAL_CHAT_ID") || readEnv("TELEGRAM_CHAT_ID")
+const PORTAL_URL = readEnv("PORTAL_URL") || "http://localhost:5001"
 const MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER = readEnv(
   "MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER",
 )
@@ -1165,6 +1169,141 @@ function sanitizeUser(user) {
   }
 }
 
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function parsePositiveInteger(value, fallback) {
+  const parsed = Number.parseInt(value, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function getPaginationMeta({ page, limit, total }) {
+  const totalPages = Math.max(1, Math.ceil(total / limit))
+
+  return {
+    page,
+    limit,
+    total,
+    totalPages,
+    hasPrevious: page > 1,
+    hasNext: page < totalPages,
+  }
+}
+
+function sanitizePortalPayout(payout) {
+  if (!payout) return null
+
+  const creator =
+    payout.creatorId && typeof payout.creatorId === "object" && (payout.creatorId._id || payout.creatorId.email)
+      ? sanitizeUser(payout.creatorId)
+      : undefined
+
+  return {
+    id: payout._id,
+    amount: payout.amount,
+    status: payout.status,
+    reviewStatus: payout.reviewStatus,
+    reviewReason: payout.reviewReason || "",
+    reviewedBy: payout.reviewedBy || "",
+    reviewedAt: payout.reviewedAt || "",
+    rejectionReason: payout.rejectionReason || "",
+    bankName: payout.bankName,
+    bankCode: payout.bankCode,
+    accountName: payout.accountName,
+    accountNumber: payout.accountNumber,
+    transferReference: payout.transferReference,
+    providerReference: payout.providerReference || "",
+    providerMessage: payout.providerMessage || "",
+    requiresAuthorization:
+      payout.status === "pending" &&
+      /authorization|otp/i.test(payout.providerMessage || ""),
+    createdAt: payout.createdAt,
+    completedAt: payout.completedAt || "",
+    creator,
+  }
+}
+
+async function buildPortalSettlementFilter(query = {}) {
+  const filter = {}
+  const status = String(query.status || "").trim()
+  const reviewStatus = String(query.reviewStatus || "").trim()
+  const from = String(query.from || "").trim()
+  const to = String(query.to || "").trim()
+  const search = String(query.search || "").trim()
+
+  if (status && status !== "all") {
+    filter.status = status
+  }
+
+  if (reviewStatus && reviewStatus !== "all") {
+    filter.reviewStatus = reviewStatus
+  }
+
+  if (from || to) {
+    filter.createdAt = {}
+
+    if (from) {
+      const fromDate = new Date(from)
+      if (!Number.isNaN(fromDate.getTime())) {
+        filter.createdAt.$gte = fromDate
+      }
+    }
+
+    if (to) {
+      const toDate = new Date(to)
+      if (!Number.isNaN(toDate.getTime())) {
+        toDate.setHours(23, 59, 59, 999)
+        filter.createdAt.$lte = toDate
+      }
+    }
+
+    if (!Object.keys(filter.createdAt).length) {
+      delete filter.createdAt
+    }
+  }
+
+  if (search) {
+    const regex = new RegExp(escapeRegex(search), "i")
+    const matchingUsers = await User.find({
+      $or: [
+        { email: regex },
+        { name: regex },
+        { firstName: regex },
+        { lastName: regex },
+        { "identity.firstName": regex },
+        { "identity.lastName": regex },
+      ],
+    })
+      .select("_id")
+      .limit(1000)
+
+    filter.$or = [
+      { transferReference: regex },
+      { providerReference: regex },
+      { bankName: regex },
+      { accountName: regex },
+      { accountNumber: regex },
+    ]
+
+    if (matchingUsers.length) {
+      filter.$or.push({ creatorId: { $in: matchingUsers.map((user) => user._id) } })
+    }
+  }
+
+  return filter
+}
+
+function csvCell(value) {
+  const safeValue = String(value ?? "")
+  return `"${safeValue.replace(/"/g, '""')}"`
+}
+
+function settlementReportFilename() {
+  const stamp = new Date().toISOString().slice(0, 10)
+  return `streamtip-settlements-${stamp}.csv`
+}
+
 function sanitizePublicOverlayUser(user) {
   const sanitized = sanitizeUser(user)
 
@@ -1919,6 +2058,138 @@ async function removeVirtualAccountForUser(user) {
 
 function createTransferReference(prefix = "STIP-PAYOUT") {
   return `${prefix}-${Date.now()}-${Math.round(Math.random() * 1_000_000)}`
+}
+
+function formatNotificationCurrency(value) {
+  return `NGN ${Number(value || 0).toLocaleString("en-NG")}`
+}
+
+function formatNotificationDate(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value)
+
+  if (Number.isNaN(date.getTime())) {
+    return new Date().toISOString()
+  }
+
+  return new Intl.DateTimeFormat("en-NG", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: "Africa/Lagos",
+  }).format(date)
+}
+
+function maskAccountNumber(value) {
+  const accountNumber = String(value || "")
+  return accountNumber ? `**** ${accountNumber.slice(-4)}` : "No account"
+}
+
+function getWithdrawalReviewReasonLabel(reasons = []) {
+  const labels = {
+    first_withdrawal: "First withdrawal",
+  }
+  const cleanReasons = Array.isArray(reasons)
+    ? reasons.filter(Boolean)
+    : String(reasons || "").split(",").filter(Boolean)
+
+  if (!cleanReasons.length) {
+    return "Standard withdrawal"
+  }
+
+  return cleanReasons.map((reason) => labels[reason] || String(reason).replace(/_/g, " ")).join(", ")
+}
+
+function getWithdrawalNotificationStatus({ payout, reviewReasons, providerError }) {
+  if (providerError) {
+    return "Monnify initiation failed"
+  }
+
+  if (reviewReasons?.length || payout.reviewStatus === "awaiting_review") {
+    return "Awaiting admin review"
+  }
+
+  if (payout.status === "completed") {
+    return "Sent successfully"
+  }
+
+  if (payout.status === "pending") {
+    return "Queued with Monnify"
+  }
+
+  return payout.status || "Requested"
+}
+
+function buildWithdrawalTelegramMessage({
+  payout,
+  creator,
+  availableCreatorBalance,
+  reviewReasons = [],
+  providerError = "",
+}) {
+  const portalUrl = PORTAL_URL.replace(/\/$/, "")
+  const status = getWithdrawalNotificationStatus({ payout, reviewReasons, providerError })
+  const lines = [
+    "StreamTip withdrawal request",
+    "",
+    `Streamer: ${creator.name || "Creator"}`,
+    `Email: ${creator.email || "Not available"}`,
+    `Amount: ${formatNotificationCurrency(payout.amount)}`,
+    `Available balance before request: ${formatNotificationCurrency(availableCreatorBalance)}`,
+    `Status: ${status}`,
+    `Review reason: ${getWithdrawalReviewReasonLabel(reviewReasons)}`,
+    `Bank: ${payout.bankName || "Not available"}`,
+    `Account: ${payout.accountName || "No account name"} - ${maskAccountNumber(payout.accountNumber)}`,
+    `Transfer ref: ${payout.transferReference || "Not available"}`,
+    `Requested: ${formatNotificationDate(payout.createdAt || new Date())}`,
+  ]
+
+  if (providerError) {
+    lines.push(`Provider error: ${providerError}`)
+  }
+
+  if (portalUrl) {
+    lines.push("", `Portal: ${portalUrl}`)
+  }
+
+  return lines.join("\n")
+}
+
+async function sendTelegramMessage(text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_WITHDRAWAL_CHAT_ID) {
+    return { skipped: true, reason: "Telegram withdrawal notification env is not configured." }
+  }
+
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`
+
+  await axios.post(
+    url,
+    {
+      chat_id: TELEGRAM_WITHDRAWAL_CHAT_ID,
+      text,
+      disable_web_page_preview: true,
+    },
+    { timeout: 10_000 },
+  )
+
+  return { skipped: false }
+}
+
+async function notifyWithdrawalRequestOnTelegram(options) {
+  try {
+    const result = await sendTelegramMessage(buildWithdrawalTelegramMessage(options))
+
+    if (result.skipped) {
+      console.warn("telegram.withdrawal_notification_skipped", result.reason)
+    }
+  } catch (error) {
+    const message =
+      error instanceof AxiosError
+        ? getAxiosErrorMessage(error, "Telegram withdrawal notification failed.")
+        : error instanceof Error
+          ? error.message
+          : "Telegram withdrawal notification failed."
+
+    console.error("telegram.withdrawal_notification_failed", message)
+  }
 }
 
 function normalizeMonnifyTransferStatus(status) {
@@ -3593,10 +3864,21 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
       },
     })
 
+    let responsePayout = payout
+
     if (!requiresReviewReasons.length) {
       try {
-        await sendPayoutToMonnify(payout, req.user)
+        responsePayout = await sendPayoutToMonnify(payout, req.user)
       } catch (error) {
+        void notifyWithdrawalRequestOnTelegram({
+          payout,
+          creator: req.user,
+          availableCreatorBalance,
+          reviewReasons: requiresReviewReasons,
+          providerError:
+            error instanceof Error ? error.message : "Failed to initiate payout with Monnify.",
+        })
+
         return res.status(502).json({
           error:
             error instanceof Error ? error.message : "Failed to initiate payout with Monnify.",
@@ -3605,7 +3887,14 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
       }
     }
 
-    res.json(payout)
+    void notifyWithdrawalRequestOnTelegram({
+      payout: responsePayout,
+      creator: req.user,
+      availableCreatorBalance,
+      reviewReasons: requiresReviewReasons,
+    })
+
+    res.json(responsePayout)
   } catch (error) {
     console.error(error)
     res.status(400).json({
@@ -3800,28 +4089,105 @@ app.get("/portal/settlements", requireAdminSession, async (_req, res) => {
       .sort({ createdAt: 1 })
 
     res.json({
-      payouts: payouts.map((payout) => ({
-        id: payout._id,
-        amount: payout.amount,
-        status: payout.status,
-        reviewStatus: payout.reviewStatus,
-        reviewReason: payout.reviewReason || "",
-        bankName: payout.bankName,
-        bankCode: payout.bankCode,
-        accountName: payout.accountName,
-        accountNumber: payout.accountNumber,
-        transferReference: payout.transferReference,
-        providerMessage: payout.providerMessage || "",
-        requiresAuthorization:
-          payout.status === "pending" &&
-          /authorization|otp/i.test(payout.providerMessage || ""),
-        createdAt: payout.createdAt,
-        creator: sanitizeUser(payout.creatorId),
-      })),
+      payouts: payouts.map(sanitizePortalPayout),
     })
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to load settlement queue." })
+  }
+})
+
+app.get("/portal/settlements/history", requireAdminSession, async (req, res) => {
+  try {
+    const page = parsePositiveInteger(req.query.page, 1)
+    const limit = Math.min(parsePositiveInteger(req.query.limit, 20), 100)
+    const skip = (page - 1) * limit
+    const filter = await buildPortalSettlementFilter(req.query)
+
+    const [payouts, total] = await Promise.all([
+      Payout.find(filter)
+        .populate("creatorId")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+      Payout.countDocuments(filter),
+    ])
+
+    res.json({
+      payouts: payouts.map(sanitizePortalPayout),
+      pagination: getPaginationMeta({ page, limit, total }),
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load settlement history." })
+  }
+})
+
+app.get("/portal/settlements/report", requireAdminSession, async (req, res) => {
+  try {
+    const filter = await buildPortalSettlementFilter(req.query)
+    const headers = [
+      "Payout ID",
+      "Creator First Name",
+      "Creator Last Name",
+      "Creator Email",
+      "Amount",
+      "Status",
+      "Review Status",
+      "Review Reason",
+      "Rejection Reason",
+      "Bank",
+      "Account Name",
+      "Account Number",
+      "Transfer Reference",
+      "Provider Reference",
+      "Provider Message",
+      "Requested At",
+      "Reviewed At",
+      "Completed At",
+    ]
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8")
+    res.setHeader("Content-Disposition", `attachment; filename="${settlementReportFilename()}"`)
+    res.write(`${headers.map(csvCell).join(",")}\n`)
+
+    const cursor = Payout.find(filter).populate("creatorId").sort({ createdAt: -1 }).cursor()
+
+    for await (const payout of cursor) {
+      const item = sanitizePortalPayout(payout)
+      const creator = item.creator || {}
+      const row = [
+        item.id,
+        creator.firstName || "",
+        creator.lastName || "",
+        creator.email || "",
+        item.amount || 0,
+        item.status || "",
+        item.reviewStatus || "",
+        item.reviewReason || "",
+        item.rejectionReason || "",
+        item.bankName || "",
+        item.accountName || "",
+        item.accountNumber || "",
+        item.transferReference || "",
+        item.providerReference || "",
+        item.providerMessage || "",
+        item.createdAt ? new Date(item.createdAt).toISOString() : "",
+        item.reviewedAt ? new Date(item.reviewedAt).toISOString() : "",
+        item.completedAt ? new Date(item.completedAt).toISOString() : "",
+      ]
+
+      res.write(`${row.map(csvCell).join(",")}\n`)
+    }
+
+    res.end()
+  } catch (error) {
+    console.error(error)
+    if (res.headersSent) {
+      res.end()
+      return
+    }
+    res.status(500).json({ error: "Failed to export settlement report." })
   }
 })
 
@@ -4003,13 +4369,59 @@ app.post("/portal/settlements/:id/reject", requireAdminSession, async (req, res)
   }
 })
 
-app.get("/portal/users", requireAdminSession, async (_req, res) => {
+app.get("/portal/users", requireAdminSession, async (req, res) => {
   try {
-    const users = await User.find().sort({ createdAt: -1 })
-    res.json({ users: users.map(sanitizeUser) })
+    const page = parsePositiveInteger(req.query.page, 1)
+    const limit = Math.min(parsePositiveInteger(req.query.limit, 25), 100)
+    const skip = (page - 1) * limit
+    const search = String(req.query.search || "").trim()
+    const filter = {}
+
+    if (search) {
+      filter.email = { $regex: escapeRegex(search), $options: "i" }
+    }
+
+    const [users, total] = await Promise.all([
+      User.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+      User.countDocuments(filter),
+    ])
+
+    res.json({
+      users: users.map(sanitizeUser),
+      pagination: getPaginationMeta({ page, limit, total }),
+      search,
+    })
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to load portal users." })
+  }
+})
+
+app.get("/portal/users/:id", requireAdminSession, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid user ID." })
+    }
+
+    const user = await User.findById(req.params.id)
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found." })
+    }
+
+    const [payouts, changeRequests] = await Promise.all([
+      Payout.find({ creatorId: user._id }).sort({ createdAt: -1 }).limit(25),
+      PayoutProfileChangeRequest.find({ creatorId: user._id }).sort({ createdAt: -1 }).limit(10),
+    ])
+
+    res.json({
+      user: sanitizeUser(user),
+      payouts: payouts.map(sanitizePortalPayout),
+      changeRequests: changeRequests.map(sanitizePayoutProfileChangeRequest),
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load portal user details." })
   }
 })
 
