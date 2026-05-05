@@ -416,6 +416,46 @@ donationSchema.index({ date: -1 })
 
 const Donation = mongoose.model("Donation", donationSchema)
 
+const complianceInflowStatuses = ["held", "unmatched", "paid", "reversed", "resolved"]
+
+const complianceInflowSchema = new mongoose.Schema({
+  sourceAccountName: String,
+  sourceAccountNumber: String,
+  sourceBankName: String,
+  sourceBankCode: String,
+  sourceSessionId: String,
+  amount: Number,
+  currency: String,
+  paymentStatus: String,
+  paymentMethod: String,
+  eventType: String,
+  paidOn: Date,
+  destinationAccountNumber: String,
+  destinationBankName: String,
+  destinationBankCode: String,
+  reservedAccountReference: String,
+  monnifyTransactionReference: { type: String, index: true, sparse: true },
+  monnifyPaymentReference: { type: String, index: true, sparse: true },
+  rawMonnifyPayload: { type: mongoose.Schema.Types.Mixed, default: undefined },
+  status: { type: String, enum: complianceInflowStatuses, default: "held", index: true },
+  validationReason: String,
+  adminNotes: String,
+  linkedCreatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
+  linkedCreatorEmail: String,
+  linkedDonationId: { type: mongoose.Schema.Types.ObjectId, ref: "Donation", index: true },
+  resolvedBy: String,
+  resolvedAt: Date,
+  date: { type: Date, default: Date.now, index: true },
+  updatedAt: Date,
+})
+
+complianceInflowSchema.index({ sourceSessionId: 1 }, { sparse: true })
+complianceInflowSchema.index({ sourceAccountNumber: 1 }, { sparse: true })
+complianceInflowSchema.index({ destinationAccountNumber: 1 }, { sparse: true })
+complianceInflowSchema.index({ reservedAccountReference: 1 }, { sparse: true })
+
+const ComplianceInflow = mongoose.model("ComplianceInflow", complianceInflowSchema)
+
 const payoutSchema = new mongoose.Schema({
   creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
   amount: Number,
@@ -432,6 +472,8 @@ const payoutSchema = new mongoose.Schema({
   transferReference: String,
   providerReference: String,
   providerMessage: String,
+  previousTransferReferences: { type: [String], default: undefined },
+  retryCount: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now },
   completedAt: Date,
 })
@@ -966,10 +1008,14 @@ function getPaymentSourceObjects(eventData, data) {
     eventData?.paymentSourceInformation,
     eventData?.sourceAccountInformation,
     eventData?.originatorAccountInformation,
+    eventData?.accountDetails,
+    eventData?.accountPayments,
     eventData?.payer,
     data?.paymentSourceInformation,
     data?.sourceAccountInformation,
     data?.originatorAccountInformation,
+    data?.accountDetails,
+    data?.accountPayments,
     data?.payer,
   ].filter(Boolean)
 }
@@ -990,6 +1036,8 @@ function getDonationSourceDetails(eventData, data) {
       firstStringFromPaths(sources, [
         "originatorAccountName",
         "sourceAccountName",
+        "accountDetails.accountName",
+        "accountPayments.accountName",
         "payerName",
         "payer.accountName",
         "payer.name",
@@ -1004,6 +1052,8 @@ function getDonationSourceDetails(eventData, data) {
       firstStringFromPaths(sources, [
         "originatorAccountNumber",
         "sourceAccountNumber",
+        "accountDetails.accountNumber",
+        "accountPayments.accountNumber",
         "payer.accountNumber",
       ]),
     sourceBankName:
@@ -1016,6 +1066,8 @@ function getDonationSourceDetails(eventData, data) {
       firstStringFromPaths(sources, [
         "originatorBankName",
         "sourceBankName",
+        "accountDetails.bankName",
+        "accountPayments.bankName",
         "payer.bankName",
       ]),
     sourceBankCode:
@@ -1027,6 +1079,8 @@ function getDonationSourceDetails(eventData, data) {
       firstStringFromPaths(sources, [
         "originatorBankCode",
         "sourceBankCode",
+        "accountDetails.bankCode",
+        "accountPayments.bankCode",
         "payer.bankCode",
       ]),
     sourceSessionId:
@@ -1040,6 +1094,8 @@ function getDonationSourceDetails(eventData, data) {
         "sessionId",
         "sessionID",
         "sourceSessionId",
+        "accountDetails.sessionId",
+        "accountPayments.sessionId",
         "paymentSourceInformation.sessionId",
       ]),
   }
@@ -1048,21 +1104,231 @@ function getDonationSourceDetails(eventData, data) {
 function getDonationDestinationDetails(eventData, data) {
   const destinationObjects = [
     eventData?.destinationAccountInformation,
+    eventData?.accountDetails,
+    eventData?.accountPayments,
     data?.destinationAccountInformation,
+    data?.accountDetails,
+    data?.accountPayments,
   ].filter(Boolean)
   const sources = [eventData, data]
 
   return {
     destinationAccountNumber:
-      firstStringFromObjects(destinationObjects, ["accountNumber", "destinationAccountNumber"]) ||
-      firstStringFromPaths(sources, ["destinationAccountNumber"]),
+      firstStringFromObjects(destinationObjects, ["destinationAccountNumber", "accountNumber"]) ||
+      firstStringFromPaths(sources, [
+        "destinationAccountNumber",
+        "accountDetails.destinationAccountNumber",
+        "accountPayments.destinationAccountNumber",
+      ]),
     destinationBankName:
       firstStringFromObjects(destinationObjects, ["bankName", "bank", "destinationBankName"]) ||
-      firstStringFromPaths(sources, ["destinationBankName"]),
+      firstStringFromPaths(sources, [
+        "destinationBankName",
+        "accountDetails.destinationBankName",
+        "accountPayments.destinationBankName",
+      ]),
     destinationBankCode:
       firstStringFromObjects(destinationObjects, ["bankCode", "destinationBankCode"]) ||
-      firstStringFromPaths(sources, ["destinationBankCode"]),
+      firstStringFromPaths(sources, [
+        "destinationBankCode",
+        "accountDetails.destinationBankCode",
+        "accountPayments.destinationBankCode",
+      ]),
   }
+}
+
+function getReservedAccountReference(eventData = {}, data = {}) {
+  return (
+    firstStringFromPaths([eventData, data], [
+      "product.reference",
+      "product.accountReference",
+      "product.reservationReference",
+      "accountReference",
+      "reservedAccountReference",
+      "reservationReference",
+      "accountDetails.accountReference",
+      "accountPayments.accountReference",
+    ]) || ""
+  )
+}
+
+function getMonnifyPaymentReferences(eventData = {}, data = {}) {
+  return {
+    transactionReference: compactString(
+      eventData.transactionReference ||
+        eventData.transactionRef ||
+        data.transactionReference ||
+        data.transactionRef,
+    ),
+    paymentReference: compactString(
+      eventData.paymentReference ||
+        eventData.transactionHash ||
+        data.paymentReference ||
+        data.transactionHash,
+    ),
+  }
+}
+
+function normalizeComplianceInflowStatus({ paymentStatus, creator, destinationAccountNumber, amount, donation }) {
+  const normalizedPaymentStatus = String(paymentStatus || "").toUpperCase()
+
+  if (donation) {
+    return "resolved"
+  }
+
+  if (/REVERSE|REVERSED|REFUND|REFUNDED|CHARGEBACK/i.test(normalizedPaymentStatus)) {
+    return "reversed"
+  }
+
+  if (normalizedPaymentStatus === "PAID") {
+    if (!creator || !destinationAccountNumber || !(Number(amount) > 0)) {
+      return "unmatched"
+    }
+
+    return "paid"
+  }
+
+  return "held"
+}
+
+function getComplianceInflowValidationReason({
+  paymentStatus,
+  creator,
+  destinationAccountNumber,
+  amount,
+  donation,
+  existingDonation,
+}) {
+  const normalizedPaymentStatus = String(paymentStatus || "").toUpperCase()
+
+  if (donation) {
+    return "Resolved into a StreamTip gift donation."
+  }
+
+  if (existingDonation) {
+    return "Duplicate Monnify webhook; donation already existed."
+  }
+
+  if (normalizedPaymentStatus && normalizedPaymentStatus !== "PAID") {
+    return `Provider status is ${normalizedPaymentStatus}; waiting for final payment validation.`
+  }
+
+  if (!destinationAccountNumber) {
+    return "Missing destination virtual account number."
+  }
+
+  if (!creator) {
+    return "Destination account could not be matched to a StreamTip creator."
+  }
+
+  if (!(Number(amount) > 0)) {
+    return "Paid webhook had no valid amount."
+  }
+
+  return "Paid inflow is pending admin validation."
+}
+
+async function upsertComplianceInflowFromMonnify({
+  eventType,
+  eventData = {},
+  data = {},
+  creator = null,
+  donation = null,
+  existingDonation = null,
+  status,
+  validationReason,
+}) {
+  const sourceDetails = getDonationSourceDetails(eventData, data)
+  const destinationDetails = getDonationDestinationDetails(eventData, data)
+  const references = getMonnifyPaymentReferences(eventData, data)
+  const paymentStatus = String(
+    eventData.paymentStatus || eventData.status || data.paymentStatus || data.status || "PENDING",
+  ).toUpperCase()
+  const amount = firstValidMoneyAmount(
+    eventData.amountPaid,
+    eventData.amount,
+    eventData.settlementAmount,
+    eventData.totalPayable,
+    data.amount,
+    data.amountPaid,
+  )
+  const linkedCreator = creator || null
+  const linkedDonation = donation || existingDonation || null
+  const searchClauses = []
+
+  if (references.transactionReference) {
+    searchClauses.push({ monnifyTransactionReference: references.transactionReference })
+  }
+
+  if (references.paymentReference) {
+    searchClauses.push({ monnifyPaymentReference: references.paymentReference })
+  }
+
+  if (sourceDetails.sourceSessionId) {
+    searchClauses.push({ sourceSessionId: sourceDetails.sourceSessionId })
+  }
+
+  const computedStatus =
+    status ||
+    normalizeComplianceInflowStatus({
+      paymentStatus,
+      creator: linkedCreator,
+      destinationAccountNumber: destinationDetails.destinationAccountNumber,
+      amount,
+      donation: linkedDonation,
+    })
+  const computedReason =
+    validationReason ||
+    getComplianceInflowValidationReason({
+      paymentStatus,
+      creator: linkedCreator,
+      destinationAccountNumber: destinationDetails.destinationAccountNumber,
+      amount,
+      donation,
+      existingDonation,
+    })
+
+  const inflow =
+    searchClauses.length > 0 ? await ComplianceInflow.findOne({ $or: searchClauses }) : null
+  const record = inflow || new ComplianceInflow({ date: new Date() })
+  const linkedCreatorId =
+    linkedCreator?._id || linkedDonation?.creatorId || record.linkedCreatorId || undefined
+
+  record.sourceAccountName = sourceDetails.sourceAccountName || record.sourceAccountName
+  record.sourceAccountNumber = sourceDetails.sourceAccountNumber || record.sourceAccountNumber
+  record.sourceBankName = sourceDetails.sourceBankName || record.sourceBankName
+  record.sourceBankCode = sourceDetails.sourceBankCode || record.sourceBankCode
+  record.sourceSessionId = sourceDetails.sourceSessionId || record.sourceSessionId
+  record.amount = Number(amount) > 0 ? amount : record.amount
+  record.currency = compactString(eventData.currency || data.currency || "NGN") || record.currency
+  record.paymentStatus = paymentStatus || record.paymentStatus
+  record.paymentMethod = compactString(eventData.paymentMethod || data.paymentMethod) || record.paymentMethod
+  record.eventType = eventType || record.eventType
+  record.paidOn =
+    parseProviderDate(eventData.paidOn || eventData.paidAt || data.paidOn || data.paidAt) || record.paidOn
+  record.destinationAccountNumber =
+    destinationDetails.destinationAccountNumber || record.destinationAccountNumber
+  record.destinationBankName = destinationDetails.destinationBankName || record.destinationBankName
+  record.destinationBankCode = destinationDetails.destinationBankCode || record.destinationBankCode
+  record.reservedAccountReference = getReservedAccountReference(eventData, data) || record.reservedAccountReference
+  record.monnifyTransactionReference =
+    references.transactionReference || record.monnifyTransactionReference
+  record.monnifyPaymentReference = references.paymentReference || record.monnifyPaymentReference
+  record.rawMonnifyPayload = data
+  record.status = computedStatus
+  record.validationReason = computedReason
+  record.linkedCreatorId = linkedCreatorId
+  record.linkedCreatorEmail =
+    linkedCreator?.email || linkedDonation?.creatorEmail || record.linkedCreatorEmail
+  record.linkedDonationId = linkedDonation?._id || record.linkedDonationId
+  record.updatedAt = new Date()
+
+  if (computedStatus === "resolved" && !record.resolvedAt) {
+    record.resolvedAt = new Date()
+  }
+
+  await record.save()
+  return record
 }
 
 function sanitizeDonorDisplayName(value) {
@@ -1284,6 +1550,8 @@ function getDonationSenderName(eventData, data, creator) {
     "paymentSourceInformation.originatorAccountName",
     "sourceAccountInformation.accountName",
     "sourceAccountInformation.accountHolderName",
+    "accountDetails.accountName",
+    "accountPayments.accountName",
     "originatorAccountName",
     "sourceAccountName",
     "accountName",
@@ -1373,6 +1641,43 @@ function getPaginationMeta({ page, limit, total }) {
   }
 }
 
+const MONNIFY_AUTHORIZATION_MESSAGE_REGEX = /authorization|otp|expired|expire/i
+const MONNIFY_RETRYABLE_MESSAGE_REGEX = /authorization|otp|expired|expire|provider|monnify/i
+
+function hasPendingMonnifyAuthorizationMessage(value) {
+  return MONNIFY_AUTHORIZATION_MESSAGE_REGEX.test(String(value || ""))
+}
+
+function hasRetryableMonnifyMessage(value) {
+  return MONNIFY_RETRYABLE_MESSAGE_REGEX.test(String(value || ""))
+}
+
+function isExpiredMonnifyTransferStatus(status) {
+  return /EXPIRED|EXPIRY|OTP_EXPIRED|AUTHORIZATION_EXPIRED|TIMED_OUT|TIMEOUT/i.test(
+    String(status || ""),
+  )
+}
+
+function payoutRequiresMonnifyAuthorization(payout) {
+  return payout?.status === "pending" && hasPendingMonnifyAuthorizationMessage(payout.providerMessage)
+}
+
+function canRetryMonnifyPayout(payout) {
+  if (!payout || !["approved", "not_required"].includes(payout.reviewStatus || "not_required")) {
+    return false
+  }
+
+  if (payout.status === "pending") {
+    return payoutRequiresMonnifyAuthorization(payout)
+  }
+
+  if (["failed", "cancelled"].includes(payout.status)) {
+    return payout.reviewStatus === "approved" && hasRetryableMonnifyMessage(payout.providerMessage)
+  }
+
+  return false
+}
+
 function sanitizePortalPayout(payout) {
   if (!payout) return null
 
@@ -1397,9 +1702,10 @@ function sanitizePortalPayout(payout) {
     transferReference: payout.transferReference,
     providerReference: payout.providerReference || "",
     providerMessage: payout.providerMessage || "",
-    requiresAuthorization:
-      payout.status === "pending" &&
-      /authorization|otp/i.test(payout.providerMessage || ""),
+    requiresAuthorization: payoutRequiresMonnifyAuthorization(payout),
+    canRetryTransfer: canRetryMonnifyPayout(payout),
+    previousTransferReferences: payout.previousTransferReferences || [],
+    retryCount: payout.retryCount || 0,
     createdAt: payout.createdAt,
     completedAt: payout.completedAt || "",
     creator,
@@ -1450,6 +1756,65 @@ function sanitizePortalDonation(donation, options = {}) {
 
   if (options.includeProviderPayload) {
     item.providerPayload = donation.providerPayload || null
+  }
+
+  return item
+}
+
+function sanitizePortalComplianceInflow(inflow, options = {}) {
+  if (!inflow) return null
+
+  const linkedCreator =
+    inflow.linkedCreatorId &&
+    typeof inflow.linkedCreatorId === "object" &&
+    (inflow.linkedCreatorId._id || inflow.linkedCreatorId.email)
+      ? sanitizeUser(inflow.linkedCreatorId)
+      : undefined
+
+  const linkedDonation =
+    inflow.linkedDonationId &&
+    typeof inflow.linkedDonationId === "object" &&
+    inflow.linkedDonationId._id
+      ? sanitizePortalDonation(inflow.linkedDonationId)
+      : undefined
+
+  const item = {
+    id: inflow._id,
+    sourceAccountName: inflow.sourceAccountName || "",
+    sourceAccountNumber: inflow.sourceAccountNumber || "",
+    sourceBankName: inflow.sourceBankName || "",
+    sourceBankCode: inflow.sourceBankCode || "",
+    sourceSessionId: inflow.sourceSessionId || "",
+    amount: inflow.amount || 0,
+    currency: inflow.currency || "NGN",
+    paymentStatus: inflow.paymentStatus || "",
+    paymentMethod: inflow.paymentMethod || "",
+    eventType: inflow.eventType || "",
+    paidOn: inflow.paidOn || "",
+    destinationAccountNumber: inflow.destinationAccountNumber || "",
+    destinationBankName: inflow.destinationBankName || "",
+    destinationBankCode: inflow.destinationBankCode || "",
+    reservedAccountReference: inflow.reservedAccountReference || "",
+    monnifyTransactionReference: inflow.monnifyTransactionReference || "",
+    monnifyPaymentReference: inflow.monnifyPaymentReference || "",
+    status: inflow.status || "held",
+    validationReason: inflow.validationReason || "",
+    adminNotes: inflow.adminNotes || "",
+    linkedCreatorId:
+      linkedCreator?.id || inflow.linkedCreatorId?.toString?.() || inflow.linkedCreatorId || "",
+    linkedCreatorEmail: inflow.linkedCreatorEmail || linkedCreator?.email || "",
+    linkedCreator,
+    linkedDonationId:
+      linkedDonation?.id || inflow.linkedDonationId?.toString?.() || inflow.linkedDonationId || "",
+    linkedDonation,
+    resolvedBy: inflow.resolvedBy || "",
+    resolvedAt: inflow.resolvedAt || "",
+    date: inflow.date,
+    updatedAt: inflow.updatedAt || "",
+  }
+
+  if (options.includeRawPayload) {
+    item.rawMonnifyPayload = inflow.rawMonnifyPayload || null
   }
 
   return item
@@ -1546,7 +1911,12 @@ async function buildPortalSettlementQueueFilter(query = {}) {
       {
         status: "pending",
         reviewStatus: { $in: ["approved", "not_required"] },
-        providerMessage: /authorization|otp/i,
+        providerMessage: MONNIFY_AUTHORIZATION_MESSAGE_REGEX,
+      },
+      {
+        status: { $in: ["failed", "cancelled"] },
+        reviewStatus: "approved",
+        providerMessage: MONNIFY_RETRYABLE_MESSAGE_REGEX,
       },
     ],
   }
@@ -1654,6 +2024,105 @@ async function buildPortalDonationSearchFilter(search) {
   return { $or: searchClauses }
 }
 
+async function buildPortalComplianceInflowFilter(query = {}) {
+  const filter = {}
+  const status = String(query.status || "").trim()
+  const from = String(query.from || "").trim()
+  const to = String(query.to || "").trim()
+  const search = String(query.search || "").trim()
+
+  if (status && status !== "all") {
+    filter.status = status
+  }
+
+  if (from || to) {
+    filter.date = {}
+
+    if (from) {
+      const fromDate = new Date(from)
+      if (!Number.isNaN(fromDate.getTime())) {
+        filter.date.$gte = fromDate
+      }
+    }
+
+    if (to) {
+      const toDate = new Date(to)
+      if (!Number.isNaN(toDate.getTime())) {
+        toDate.setHours(23, 59, 59, 999)
+        filter.date.$lte = toDate
+      }
+    }
+
+    if (!Object.keys(filter.date).length) {
+      delete filter.date
+    }
+  }
+
+  const searchFilter = await buildPortalComplianceInflowSearchFilter(search)
+
+  if (searchFilter) {
+    filter.$and = [...(filter.$and || []), searchFilter]
+  }
+
+  return filter
+}
+
+async function buildPortalComplianceInflowSearchFilter(search) {
+  const cleanSearch = String(search || "").trim()
+
+  if (!cleanSearch) {
+    return null
+  }
+
+  const regex = new RegExp(escapeRegex(cleanSearch), "i")
+  const matchingUsers = await User.find({
+    $or: [
+      { email: regex },
+      { name: regex },
+      { firstName: regex },
+      { lastName: regex },
+      { "identity.firstName": regex },
+      { "identity.lastName": regex },
+      { "virtualAccount.accountNumber": regex },
+      { "virtualAccount.accountReference": regex },
+      { "virtualAccount.reservationReference": regex },
+    ],
+  })
+    .select("_id")
+    .limit(1000)
+
+  const searchClauses = [
+    { sourceAccountName: regex },
+    { sourceAccountNumber: regex },
+    { sourceBankName: regex },
+    { sourceBankCode: regex },
+    { sourceSessionId: regex },
+    { destinationAccountNumber: regex },
+    { destinationBankName: regex },
+    { destinationBankCode: regex },
+    { reservedAccountReference: regex },
+    { monnifyTransactionReference: regex },
+    { monnifyPaymentReference: regex },
+    { paymentStatus: regex },
+    { eventType: regex },
+    { validationReason: regex },
+    { adminNotes: regex },
+    { linkedCreatorEmail: regex },
+  ]
+
+  if (mongoose.Types.ObjectId.isValid(cleanSearch)) {
+    searchClauses.push({ _id: cleanSearch })
+    searchClauses.push({ linkedCreatorId: cleanSearch })
+    searchClauses.push({ linkedDonationId: cleanSearch })
+  }
+
+  if (matchingUsers.length) {
+    searchClauses.push({ linkedCreatorId: { $in: matchingUsers.map((user) => user._id) } })
+  }
+
+  return { $or: searchClauses }
+}
+
 function csvCell(value) {
   const safeValue = String(value ?? "")
   return `"${safeValue.replace(/"/g, '""')}"`
@@ -1667,6 +2136,11 @@ function settlementReportFilename() {
 function donationReportFilename() {
   const stamp = new Date().toISOString().slice(0, 10)
   return `streamtip-gifts-${stamp}.csv`
+}
+
+function complianceInflowReportFilename() {
+  const stamp = new Date().toISOString().slice(0, 10)
+  return `streamtip-compliance-inflows-${stamp}.csv`
 }
 
 function sanitizePublicOverlayUser(user) {
@@ -2133,6 +2607,93 @@ async function getMonnifyAccessToken() {
   return response.data?.responseBody?.accessToken
 }
 
+async function getMonnifyTransactionStatus(transactionReference) {
+  if (!isMonnifyConfigured()) {
+    throw new Error("Monnify is not configured yet.")
+  }
+
+  const normalizedReference = String(transactionReference || "").trim()
+
+  if (!normalizedReference) {
+    throw new Error("A Monnify transaction reference is required.")
+  }
+
+  const accessToken = await getMonnifyAccessToken()
+  const response = await axios.get(
+    `${MONNIFY_BASE_URL}/api/v2/transactions/${encodeURIComponent(normalizedReference)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+      },
+    },
+  )
+
+  return response.data?.responseBody || response.data || {}
+}
+
+function assignIfPresent(target, field, value) {
+  const normalizedValue = value instanceof Date ? value : compactString(value)
+
+  if (normalizedValue) {
+    target[field] = normalizedValue
+  }
+}
+
+async function syncDonationFromMonnifyTransaction(donation) {
+  if (!donation) {
+    throw new Error("Donation not found.")
+  }
+
+  const transactionReference = String(
+    donation.monnifyTransactionReference || donation.monnifyPaymentReference || "",
+  ).trim()
+
+  if (!transactionReference) {
+    throw new Error("This donation does not have a Monnify reference to refresh.")
+  }
+
+  const providerPayload = await getMonnifyTransactionStatus(transactionReference)
+  const sourceDetails = getDonationSourceDetails(providerPayload, providerPayload)
+  const destinationDetails = getDonationDestinationDetails(providerPayload, providerPayload)
+  const paidOn = parseProviderDate(providerPayload.paidOn || providerPayload.paidAt)
+  const split = calculateRevenueSplit(
+    firstValidMoneyAmount(
+      providerPayload.amountPaid,
+      providerPayload.amount,
+      providerPayload.settlementAmount,
+      providerPayload.totalPayable,
+      donation.amount,
+    ),
+  )
+
+  assignIfPresent(donation, "sourceAccountName", sourceDetails.sourceAccountName)
+  assignIfPresent(donation, "sourceAccountNumber", sourceDetails.sourceAccountNumber)
+  assignIfPresent(donation, "sourceBankName", sourceDetails.sourceBankName)
+  assignIfPresent(donation, "sourceBankCode", sourceDetails.sourceBankCode)
+  assignIfPresent(donation, "sourceSessionId", sourceDetails.sourceSessionId)
+  assignIfPresent(donation, "destinationAccountNumber", destinationDetails.destinationAccountNumber)
+  assignIfPresent(donation, "destinationBankName", destinationDetails.destinationBankName)
+  assignIfPresent(donation, "destinationBankCode", destinationDetails.destinationBankCode)
+  assignIfPresent(donation, "paymentMethod", providerPayload.paymentMethod)
+  assignIfPresent(donation, "paymentStatus", providerPayload.paymentStatus)
+  assignIfPresent(donation, "currency", providerPayload.currency)
+  assignIfPresent(donation, "paidOn", paidOn)
+  assignIfPresent(donation, "monnifyTransactionReference", providerPayload.transactionReference)
+  assignIfPresent(donation, "monnifyPaymentReference", providerPayload.paymentReference)
+
+  if (split.gross > 0) {
+    donation.amount = split.gross
+    donation.platformFee = split.platformFee
+    donation.creatorShare = split.creatorShare
+  }
+
+  donation.providerPayload = providerPayload
+  await donation.save()
+
+  return donation
+}
+
 async function getSupportedBanks() {
   if (!isMonnifyConfigured()) {
     return fallbackBanks
@@ -2565,7 +3126,11 @@ function normalizeMonnifyTransferStatus(status) {
     return "completed"
   }
 
-  if (["CANCELLED", "CANCELED", "EXPIRED"].includes(normalized)) {
+  if (isExpiredMonnifyTransferStatus(normalized)) {
+    return "pending"
+  }
+
+  if (["CANCELLED", "CANCELED"].includes(normalized)) {
     return "cancelled"
   }
 
@@ -2654,6 +3219,8 @@ async function updatePayoutFromProviderStatus(payout, providerPayload = {}, acto
 
   if (["completed", "failed", "cancelled"].includes(normalizedStatus)) {
     payout.completedAt = payout.completedAt || new Date()
+  } else {
+    payout.completedAt = undefined
   }
 
   await payout.save()
@@ -2749,6 +3316,65 @@ async function failPayoutAndReleaseBalance({
   })
 
   return payout
+}
+
+async function retryPayoutWithNewTransferReference({ payout, creator, actorId }) {
+  if (!canRetryMonnifyPayout(payout)) {
+    throw new Error("This payout is not eligible for a Monnify retry.")
+  }
+
+  if (["failed", "cancelled"].includes(payout.status)) {
+    const totals = await getRevenueTotals({ creatorId: payout.creatorId })
+    const availableBalance = Number(totals.creatorAvailableBalance) || 0
+
+    if (availableBalance < (Number(payout.amount) || 0)) {
+      throw new Error(
+        "This payout balance has already been released and is no longer available for retry.",
+      )
+    }
+  }
+
+  const previousTransferReference = String(payout.transferReference || "").trim()
+  const previousProviderReference = String(payout.providerReference || "").trim()
+  const nextTransferReference = createTransferReference()
+  const previousReferences = Array.isArray(payout.previousTransferReferences)
+    ? payout.previousTransferReferences
+    : []
+
+  payout.status = "pending"
+  payout.transferReference = nextTransferReference
+  payout.providerReference = nextTransferReference
+  payout.providerMessage = previousTransferReference
+    ? `Retrying Monnify transfer after expired authorization. Previous transfer ref: ${previousTransferReference}.`
+    : "Retrying Monnify transfer after expired authorization."
+  payout.rejectionReason = ""
+  payout.completedAt = undefined
+  payout.previousTransferReferences = Array.from(
+    new Set([...previousReferences, previousTransferReference].filter(Boolean)),
+  ).slice(-10)
+  payout.retryCount = (Number(payout.retryCount) || 0) + 1
+  await payout.save()
+
+  const sentPayout = await sendPayoutToMonnify(payout, creator, "admin", actorId)
+
+  await createAuditLog({
+    actorType: "admin",
+    actorId,
+    eventType: "portal.settlement.retried",
+    message: `Admin retried payout ${previousTransferReference || payout._id} with a new Monnify reference.`,
+    metadata: {
+      payoutId: payout._id.toString(),
+      creatorId: creator._id.toString(),
+      amount: payout.amount,
+      previousTransferReference,
+      previousProviderReference,
+      transferReference: sentPayout.transferReference,
+      providerReference: sentPayout.providerReference || "",
+      retryCount: sentPayout.retryCount || 0,
+    },
+  })
+
+  return sentPayout
 }
 
 async function initiateMonnifyDisbursement({
@@ -3737,14 +4363,38 @@ app.post("/webhook/monnify", async (req, res) => {
     const paymentStatus = String(
       eventData.paymentStatus || eventData.status || data.paymentStatus || "PENDING",
     ).toUpperCase()
-    const transactionReference = String(
-      eventData.transactionReference || eventData.transactionRef || "",
-    ).trim()
-    const paymentReference = String(
-      eventData.paymentReference || eventData.transactionHash || "",
-    ).trim()
+    const { transactionReference, paymentReference } = getMonnifyPaymentReferences(eventData, data)
+    const destinationDetails = getDonationDestinationDetails(eventData, data)
+    const destinationAccountNumber = destinationDetails.destinationAccountNumber
+    const destinationBankName = destinationDetails.destinationBankName
+    const sourceDetails = getDonationSourceDetails(eventData, data)
+    const paymentMethod = compactString(eventData.paymentMethod || data.paymentMethod)
+    const currency = compactString(eventData.currency || data.currency || "NGN")
+    const paidOn = parseProviderDate(eventData.paidOn || eventData.paidAt || data.paidOn || data.paidAt)
+    const grossAmount = firstValidMoneyAmount(
+      eventData.amountPaid,
+      eventData.amount,
+      eventData.settlementAmount,
+      eventData.totalPayable,
+      data.amount,
+      data.amountPaid,
+    )
+    const split = calculateRevenueSplit(grossAmount)
 
     if (paymentStatus && paymentStatus !== "PAID") {
+      await upsertComplianceInflowFromMonnify({
+        eventType,
+        eventData,
+        data,
+        creator,
+        status: normalizeComplianceInflowStatus({
+          paymentStatus,
+          creator,
+          destinationAccountNumber,
+          amount: grossAmount,
+        }),
+      })
+
       await createAuditLog({
         actorType: "system",
         eventType: "webhook.monnify.ignored",
@@ -3766,6 +4416,13 @@ app.post("/webhook/monnify", async (req, res) => {
       })
 
       if (existingByTransactionRef) {
+        await upsertComplianceInflowFromMonnify({
+          eventType,
+          eventData,
+          data,
+          existingDonation: existingByTransactionRef,
+          status: "resolved",
+        })
         return res.sendStatus(200)
       }
     }
@@ -3776,28 +4433,26 @@ app.post("/webhook/monnify", async (req, res) => {
       })
 
       if (existingByPaymentRef) {
+        await upsertComplianceInflowFromMonnify({
+          eventType,
+          eventData,
+          data,
+          existingDonation: existingByPaymentRef,
+          status: "resolved",
+        })
         return res.sendStatus(200)
       }
     }
 
-    const destinationDetails = getDonationDestinationDetails(eventData, data)
-    const destinationAccountNumber = destinationDetails.destinationAccountNumber
-    const destinationBankName = destinationDetails.destinationBankName
-    const sourceDetails = getDonationSourceDetails(eventData, data)
-    const paymentMethod = compactString(eventData.paymentMethod || data.paymentMethod)
-    const currency = compactString(eventData.currency || data.currency || "NGN")
-    const paidOn = parseProviderDate(eventData.paidOn || eventData.paidAt || data.paidOn || data.paidAt)
-    const grossAmount = firstValidMoneyAmount(
-      eventData.amountPaid,
-      eventData.amount,
-      eventData.settlementAmount,
-      eventData.totalPayable,
-      data.amount,
-      data.amountPaid,
-    )
-    const split = calculateRevenueSplit(grossAmount)
-
     if (split.gross <= 0) {
+      await upsertComplianceInflowFromMonnify({
+        eventType,
+        eventData,
+        data,
+        creator,
+        status: "unmatched",
+      })
+
       await createAuditLog({
         actorType: "system",
         eventType: "webhook.monnify.invalid_amount",
@@ -3816,6 +4471,13 @@ app.post("/webhook/monnify", async (req, res) => {
     }
 
     if (!creator) {
+      await upsertComplianceInflowFromMonnify({
+        eventType,
+        eventData,
+        data,
+        status: "unmatched",
+      })
+
       await createAuditLog({
         actorType: "system",
         eventType: "webhook.monnify.unmatched_creator",
@@ -3875,6 +4537,15 @@ app.post("/webhook/monnify", async (req, res) => {
       monnifyTransactionReference: transactionReference || undefined,
       monnifyPaymentReference: paymentReference || undefined,
       providerPayload: data,
+    })
+
+    await upsertComplianceInflowFromMonnify({
+      eventType,
+      eventData,
+      data,
+      creator,
+      donation,
+      status: "resolved",
     })
 
     io.to(getCreatorRoom(creator._id)).emit("newDonation", donation)
@@ -4472,6 +5143,227 @@ app.get("/admin/logs", requireAdminSession, async (req, res) => {
   }
 })
 
+app.get("/portal/compliance-inflows", requireAdminSession, async (req, res) => {
+  try {
+    const page = parsePositiveInteger(req.query.page, 1)
+    const limit = Math.min(parsePositiveInteger(req.query.limit, 25), 100)
+    const skip = (page - 1) * limit
+    const filter = await buildPortalComplianceInflowFilter(req.query)
+
+    const [inflows, total] = await Promise.all([
+      ComplianceInflow.find(filter)
+        .populate("linkedCreatorId")
+        .populate("linkedDonationId")
+        .sort({ date: -1 })
+        .skip(skip)
+        .limit(limit),
+      ComplianceInflow.countDocuments(filter),
+    ])
+
+    res.json({
+      inflows: inflows.map((inflow) => sanitizePortalComplianceInflow(inflow)),
+      pagination: getPaginationMeta({ page, limit, total }),
+      statuses: complianceInflowStatuses,
+      search: String(req.query.search || "").trim(),
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load compliance inflows." })
+  }
+})
+
+app.get("/portal/compliance-inflows/report", requireAdminSession, async (req, res) => {
+  try {
+    const filter = await buildPortalComplianceInflowFilter(req.query)
+    const headers = [
+      "Compliance Inflow ID",
+      "Date",
+      "Paid At",
+      "Status",
+      "Validation Reason",
+      "Admin Notes",
+      "Linked Creator",
+      "Linked Creator Email",
+      "Linked Donation ID",
+      "Amount",
+      "Currency",
+      "Payment Status",
+      "Payment Method",
+      "Source Account Name",
+      "Source Account Number",
+      "Source Bank",
+      "Source Bank Code",
+      "Source Session ID",
+      "Destination Account Number",
+      "Destination Bank",
+      "Destination Bank Code",
+      "Reserved Account Reference",
+      "Monnify Transaction Reference",
+      "Monnify Payment Reference",
+      "Event Type",
+      "Resolved At",
+      "Updated At",
+    ]
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8")
+    res.setHeader("Content-Disposition", `attachment; filename="${complianceInflowReportFilename()}"`)
+    res.write(`${headers.map(csvCell).join(",")}\n`)
+
+    const cursor = ComplianceInflow.find(filter)
+      .populate("linkedCreatorId")
+      .populate("linkedDonationId")
+      .sort({ date: -1 })
+      .cursor()
+
+    for await (const inflow of cursor) {
+      const item = sanitizePortalComplianceInflow(inflow)
+      const row = [
+        item.id,
+        item.date ? new Date(item.date).toISOString() : "",
+        item.paidOn ? new Date(item.paidOn).toISOString() : "",
+        item.status || "",
+        item.validationReason || "",
+        item.adminNotes || "",
+        item.linkedCreator?.name || "",
+        item.linkedCreatorEmail || item.linkedCreator?.email || "",
+        item.linkedDonationId || "",
+        item.amount || 0,
+        item.currency || "",
+        item.paymentStatus || "",
+        item.paymentMethod || "",
+        item.sourceAccountName || "",
+        item.sourceAccountNumber || "",
+        item.sourceBankName || "",
+        item.sourceBankCode || "",
+        item.sourceSessionId || "",
+        item.destinationAccountNumber || "",
+        item.destinationBankName || "",
+        item.destinationBankCode || "",
+        item.reservedAccountReference || "",
+        item.monnifyTransactionReference || "",
+        item.monnifyPaymentReference || "",
+        item.eventType || "",
+        item.resolvedAt ? new Date(item.resolvedAt).toISOString() : "",
+        item.updatedAt ? new Date(item.updatedAt).toISOString() : "",
+      ]
+
+      res.write(`${row.map(csvCell).join(",")}\n`)
+    }
+
+    res.end()
+  } catch (error) {
+    console.error(error)
+    if (res.headersSent) {
+      res.end()
+      return
+    }
+    res.status(500).json({ error: "Failed to export compliance inflow report." })
+  }
+})
+
+app.get("/portal/compliance-inflows/:id", requireAdminSession, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid compliance inflow ID." })
+    }
+
+    const inflow = await ComplianceInflow.findById(req.params.id)
+      .populate("linkedCreatorId")
+      .populate("linkedDonationId")
+
+    if (!inflow) {
+      return res.status(404).json({ error: "Compliance inflow not found." })
+    }
+
+    res.json({
+      inflow: sanitizePortalComplianceInflow(inflow, { includeRawPayload: true }),
+      statuses: complianceInflowStatuses,
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load compliance inflow." })
+  }
+})
+
+app.patch("/portal/compliance-inflows/:id", requireAdminSession, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid compliance inflow ID." })
+    }
+
+    const inflow = await ComplianceInflow.findById(req.params.id)
+
+    if (!inflow) {
+      return res.status(404).json({ error: "Compliance inflow not found." })
+    }
+
+    const nextStatus = String(req.body?.status || inflow.status || "").trim()
+    const adminNotes = String(req.body?.adminNotes ?? inflow.adminNotes ?? "").trim()
+    const linkedCreatorId = String(req.body?.linkedCreatorId || "").trim()
+
+    if (nextStatus && !complianceInflowStatuses.includes(nextStatus)) {
+      return res.status(400).json({ error: "Invalid compliance inflow status." })
+    }
+
+    if (linkedCreatorId) {
+      if (!mongoose.Types.ObjectId.isValid(linkedCreatorId)) {
+        return res.status(400).json({ error: "Invalid linked creator ID." })
+      }
+
+      const linkedCreator = await User.findById(linkedCreatorId)
+
+      if (!linkedCreator) {
+        return res.status(404).json({ error: "Linked creator not found." })
+      }
+
+      inflow.linkedCreatorId = linkedCreator._id
+      inflow.linkedCreatorEmail = linkedCreator.email
+    } else if (Object.prototype.hasOwnProperty.call(req.body || {}, "linkedCreatorId")) {
+      inflow.linkedCreatorId = undefined
+      inflow.linkedCreatorEmail = ""
+    }
+
+    if (nextStatus) {
+      inflow.status = nextStatus
+    }
+
+    inflow.adminNotes = adminNotes
+    inflow.updatedAt = new Date()
+
+    if (inflow.status === "resolved" && !inflow.resolvedAt) {
+      inflow.resolvedAt = new Date()
+      inflow.resolvedBy = req.adminSession._id.toString()
+    }
+
+    await inflow.save()
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.compliance_inflow.updated",
+      message: `Admin updated compliance inflow ${inflow._id}.`,
+      metadata: {
+        inflowId: inflow._id.toString(),
+        status: inflow.status,
+        linkedCreatorId: inflow.linkedCreatorId?.toString?.() || "",
+        monnifyTransactionReference: inflow.monnifyTransactionReference || "",
+        monnifyPaymentReference: inflow.monnifyPaymentReference || "",
+      },
+    })
+
+    const populated = await ComplianceInflow.findById(inflow._id)
+      .populate("linkedCreatorId")
+      .populate("linkedDonationId")
+
+    res.json({
+      inflow: sanitizePortalComplianceInflow(populated || inflow, { includeRawPayload: true }),
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to update compliance inflow." })
+  }
+})
+
 app.get("/portal/donations", requireAdminSession, async (req, res) => {
   try {
     const page = parsePositiveInteger(req.query.page, 1)
@@ -4596,6 +5488,46 @@ app.get("/portal/donations/:id", requireAdminSession, async (req, res) => {
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to load donation transaction." })
+  }
+})
+
+app.post("/portal/donations/:id/sync-provider", requireAdminSession, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid donation ID." })
+    }
+
+    const donation = await Donation.findById(req.params.id)
+
+    if (!donation) {
+      return res.status(404).json({ error: "Donation not found." })
+    }
+
+    const syncedDonation = await syncDonationFromMonnifyTransaction(donation)
+    const populatedDonation = await Donation.findById(syncedDonation._id).populate("creatorId")
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.donation.provider_synced",
+      message: `Admin refreshed donation ${syncedDonation._id} from Monnify.`,
+      metadata: {
+        donationId: syncedDonation._id.toString(),
+        transactionReference: syncedDonation.monnifyTransactionReference || "",
+        sourceAccountName: syncedDonation.sourceAccountName || "",
+        sourceAccountNumber: syncedDonation.sourceAccountNumber || "",
+        sourceSessionId: syncedDonation.sourceSessionId || "",
+      },
+    })
+
+    res.json({
+      donation: sanitizePortalDonation(populatedDonation || syncedDonation, { includeProviderPayload: true }),
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(502).json({
+      error: error instanceof Error ? error.message : "Failed to refresh donation from Monnify.",
+    })
   }
 })
 
@@ -4779,7 +5711,7 @@ app.post("/portal/settlements/:id/authorize", requireAdminSession, async (req, r
       return res.status(404).json({ error: "Payout not found." })
     }
 
-    if (payout.status !== "pending" || !/authorization|otp/i.test(payout.providerMessage || "")) {
+    if (!payoutRequiresMonnifyAuthorization(payout)) {
       return res.status(409).json({ error: "This payout is not pending Monnify authorization." })
     }
 
@@ -4824,7 +5756,7 @@ app.post("/portal/settlements/:id/resend-otp", requireAdminSession, async (req, 
       return res.status(404).json({ error: "Payout not found." })
     }
 
-    if (payout.status !== "pending" || !/authorization|otp/i.test(payout.providerMessage || "")) {
+    if (!payoutRequiresMonnifyAuthorization(payout)) {
       return res.status(409).json({ error: "This payout is not pending Monnify authorization." })
     }
 
@@ -4848,6 +5780,41 @@ app.post("/portal/settlements/:id/resend-otp", requireAdminSession, async (req, 
     console.error(error)
     res.status(502).json({
       error: error instanceof Error ? error.message : "Could not resend Monnify OTP.",
+    })
+  }
+})
+
+app.post("/portal/settlements/:id/retry", requireAdminSession, async (req, res) => {
+  try {
+    const payout = await Payout.findById(req.params.id)
+
+    if (!payout) {
+      return res.status(404).json({ error: "Payout not found." })
+    }
+
+    if (!canRetryMonnifyPayout(payout)) {
+      return res.status(409).json({
+        error: "This payout cannot be retried. Only approved Monnify authorization failures can be retried.",
+      })
+    }
+
+    const creator = await User.findById(payout.creatorId)
+
+    if (!creator) {
+      return res.status(404).json({ error: "Creator not found." })
+    }
+
+    const retriedPayout = await retryPayoutWithNewTransferReference({
+      payout,
+      creator,
+      actorId: req.adminSession._id.toString(),
+    })
+
+    res.json({ payout: retriedPayout, creator: sanitizeUser(creator) })
+  } catch (error) {
+    console.error(error)
+    res.status(502).json({
+      error: error instanceof Error ? error.message : "Could not retry Monnify payout.",
     })
   }
 })
@@ -5213,6 +6180,12 @@ app.post("/portal/payouts/:id/fail", requireAdminSession, async (req, res) => {
       return res.status(409).json({ error: "Only pending, review, or failed payouts can be marked failed." })
     }
 
+    if (payoutRequiresMonnifyAuthorization(payout) && req.body?.confirmRelease !== true) {
+      return res.status(400).json({
+        error: "This payout is waiting for Monnify OTP. Retry the transfer, or explicitly confirm balance release.",
+      })
+    }
+
     const reason =
       String(req.body?.reason || "").trim() ||
       "Payout failed or expired at provider authorization. Creator balance released."
@@ -5239,6 +6212,12 @@ app.post("/portal/payouts/:id/cancel", requireAdminSession, async (req, res) => 
 
     if (!["pending", "awaiting_review", "failed"].includes(payout.status)) {
       return res.status(409).json({ error: "Only pending, review, or failed payouts can be cancelled." })
+    }
+
+    if (payoutRequiresMonnifyAuthorization(payout) && req.body?.confirmCancel !== true) {
+      return res.status(400).json({
+        error: "This payout is waiting for Monnify OTP. Retry the transfer, or explicitly confirm cancellation.",
+      })
     }
 
     const reason = String(req.body?.reason || "").trim()
