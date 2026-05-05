@@ -392,12 +392,27 @@ const donationSchema = new mongoose.Schema({
   creatorShare: Number,
   eventType: String,
   paymentStatus: String,
+  paymentMethod: String,
+  currency: String,
+  paidOn: Date,
+  sourceAccountName: String,
+  sourceAccountNumber: String,
+  sourceBankName: String,
+  sourceBankCode: String,
+  sourceSessionId: String,
   destinationAccountNumber: String,
   destinationBankName: String,
+  destinationBankCode: String,
   monnifyTransactionReference: { type: String, index: true, sparse: true },
   monnifyPaymentReference: { type: String, index: true, sparse: true },
+  providerPayload: { type: mongoose.Schema.Types.Mixed, default: undefined },
   date: { type: Date, default: Date.now },
 })
+
+donationSchema.index({ sourceSessionId: 1 }, { sparse: true })
+donationSchema.index({ sourceAccountNumber: 1 }, { sparse: true })
+donationSchema.index({ destinationAccountNumber: 1 }, { sparse: true })
+donationSchema.index({ date: -1 })
 
 const Donation = mongoose.model("Donation", donationSchema)
 
@@ -883,6 +898,173 @@ function getNestedValue(source, path) {
   }, source)
 }
 
+function compactString(value) {
+  return String(value ?? "").trim()
+}
+
+function firstObject(value) {
+  if (Array.isArray(value)) {
+    return value.find((item) => item && typeof item === "object" && !Array.isArray(item)) || {}
+  }
+
+  if (value && typeof value === "object") {
+    return value
+  }
+
+  return {}
+}
+
+function firstStringFromObjects(objects, keys) {
+  for (const source of objects) {
+    const object = firstObject(source)
+
+    for (const key of keys) {
+      const value = compactString(object[key])
+
+      if (value) {
+        return value
+      }
+    }
+  }
+
+  return ""
+}
+
+function firstStringFromPaths(sources, paths) {
+  for (const source of sources) {
+    for (const path of paths) {
+      const value = compactString(getNestedValue(source, path))
+
+      if (value) {
+        return value
+      }
+    }
+  }
+
+  return ""
+}
+
+function parseProviderDate(value) {
+  const raw = compactString(value)
+
+  if (!raw) {
+    return undefined
+  }
+
+  const normalized = raw.includes("T") ? raw : raw.replace(" ", "T")
+  const date = new Date(normalized)
+
+  if (Number.isNaN(date.getTime())) {
+    return undefined
+  }
+
+  return date
+}
+
+function getPaymentSourceObjects(eventData, data) {
+  return [
+    eventData?.paymentSourceInformation,
+    eventData?.sourceAccountInformation,
+    eventData?.originatorAccountInformation,
+    eventData?.payer,
+    data?.paymentSourceInformation,
+    data?.sourceAccountInformation,
+    data?.originatorAccountInformation,
+    data?.payer,
+  ].filter(Boolean)
+}
+
+function getDonationSourceDetails(eventData, data) {
+  const sourceObjects = getPaymentSourceObjects(eventData, data)
+  const sources = [eventData, data]
+
+  return {
+    sourceAccountName:
+      firstStringFromObjects(sourceObjects, [
+        "accountName",
+        "accountHolderName",
+        "originatorAccountName",
+        "sourceAccountName",
+        "name",
+      ]) ||
+      firstStringFromPaths(sources, [
+        "originatorAccountName",
+        "sourceAccountName",
+        "payerName",
+        "payer.accountName",
+        "payer.name",
+      ]),
+    sourceAccountNumber:
+      firstStringFromObjects(sourceObjects, [
+        "accountNumber",
+        "originatorAccountNumber",
+        "sourceAccountNumber",
+        "nuban",
+      ]) ||
+      firstStringFromPaths(sources, [
+        "originatorAccountNumber",
+        "sourceAccountNumber",
+        "payer.accountNumber",
+      ]),
+    sourceBankName:
+      firstStringFromObjects(sourceObjects, [
+        "bankName",
+        "bank",
+        "originatorBankName",
+        "sourceBankName",
+      ]) ||
+      firstStringFromPaths(sources, [
+        "originatorBankName",
+        "sourceBankName",
+        "payer.bankName",
+      ]),
+    sourceBankCode:
+      firstStringFromObjects(sourceObjects, [
+        "bankCode",
+        "originatorBankCode",
+        "sourceBankCode",
+      ]) ||
+      firstStringFromPaths(sources, [
+        "originatorBankCode",
+        "sourceBankCode",
+        "payer.bankCode",
+      ]),
+    sourceSessionId:
+      firstStringFromObjects(sourceObjects, [
+        "sessionId",
+        "sessionID",
+        "session_id",
+        "sourceSessionId",
+      ]) ||
+      firstStringFromPaths(sources, [
+        "sessionId",
+        "sessionID",
+        "sourceSessionId",
+        "paymentSourceInformation.sessionId",
+      ]),
+  }
+}
+
+function getDonationDestinationDetails(eventData, data) {
+  const destinationObjects = [
+    eventData?.destinationAccountInformation,
+    data?.destinationAccountInformation,
+  ].filter(Boolean)
+  const sources = [eventData, data]
+
+  return {
+    destinationAccountNumber:
+      firstStringFromObjects(destinationObjects, ["accountNumber", "destinationAccountNumber"]) ||
+      firstStringFromPaths(sources, ["destinationAccountNumber"]),
+    destinationBankName:
+      firstStringFromObjects(destinationObjects, ["bankName", "bank", "destinationBankName"]) ||
+      firstStringFromPaths(sources, ["destinationBankName"]),
+    destinationBankCode:
+      firstStringFromObjects(destinationObjects, ["bankCode", "destinationBankCode"]) ||
+      firstStringFromPaths(sources, ["destinationBankCode"]),
+  }
+}
+
 function sanitizeDonorDisplayName(value) {
   return String(value || "")
     .replace(/[\r\n\t]+/g, " ")
@@ -1224,6 +1406,55 @@ function sanitizePortalPayout(payout) {
   }
 }
 
+function sanitizePortalDonation(donation, options = {}) {
+  if (!donation) return null
+
+  const creator =
+    donation.creatorId && typeof donation.creatorId === "object" && (donation.creatorId._id || donation.creatorId.email)
+      ? sanitizeUser(donation.creatorId)
+      : undefined
+  const creatorId = creator?.id || donation.creatorId?.toString?.() || donation.creatorId || ""
+  const item = {
+    id: donation._id,
+    creatorId,
+    creatorEmail: donation.creatorEmail || creator?.email || "",
+    creator,
+    sender: donation.sender || "Anonymous",
+    senderNameSource: donation.senderNameSource || "",
+    amount: donation.amount || 0,
+    platformFee:
+      typeof donation.platformFee === "number"
+        ? donation.platformFee
+        : calculateRevenueSplit(donation.amount).platformFee,
+    creatorShare:
+      typeof donation.creatorShare === "number"
+        ? donation.creatorShare
+        : calculateRevenueSplit(donation.amount).creatorShare,
+    eventType: donation.eventType || "",
+    paymentStatus: donation.paymentStatus || "",
+    paymentMethod: donation.paymentMethod || "",
+    currency: donation.currency || "NGN",
+    paidOn: donation.paidOn || "",
+    sourceAccountName: donation.sourceAccountName || "",
+    sourceAccountNumber: donation.sourceAccountNumber || "",
+    sourceBankName: donation.sourceBankName || "",
+    sourceBankCode: donation.sourceBankCode || "",
+    sourceSessionId: donation.sourceSessionId || "",
+    destinationAccountNumber: donation.destinationAccountNumber || "",
+    destinationBankName: donation.destinationBankName || "",
+    destinationBankCode: donation.destinationBankCode || "",
+    monnifyTransactionReference: donation.monnifyTransactionReference || "",
+    monnifyPaymentReference: donation.monnifyPaymentReference || "",
+    date: donation.date,
+  }
+
+  if (options.includeProviderPayload) {
+    item.providerPayload = donation.providerPayload || null
+  }
+
+  return item
+}
+
 async function buildPortalSettlementFilter(query = {}) {
   const filter = {}
   const status = String(query.status || "").trim()
@@ -1328,6 +1559,101 @@ async function buildPortalSettlementQueueFilter(query = {}) {
   return { $and: [baseFilter, searchFilter] }
 }
 
+async function buildPortalDonationFilter(query = {}) {
+  const filter = {}
+  const search = String(query.search || "").trim()
+  const creatorId = String(query.creatorId || "").trim()
+  const from = String(query.from || "").trim()
+  const to = String(query.to || "").trim()
+
+  if (creatorId && mongoose.Types.ObjectId.isValid(creatorId)) {
+    filter.creatorId = creatorId
+  }
+
+  if (from || to) {
+    filter.date = {}
+
+    if (from) {
+      const fromDate = new Date(from)
+      if (!Number.isNaN(fromDate.getTime())) {
+        filter.date.$gte = fromDate
+      }
+    }
+
+    if (to) {
+      const toDate = new Date(to)
+      if (!Number.isNaN(toDate.getTime())) {
+        toDate.setHours(23, 59, 59, 999)
+        filter.date.$lte = toDate
+      }
+    }
+
+    if (!Object.keys(filter.date).length) {
+      delete filter.date
+    }
+  }
+
+  const searchFilter = await buildPortalDonationSearchFilter(search)
+
+  if (searchFilter) {
+    filter.$and = [...(filter.$and || []), searchFilter]
+  }
+
+  return filter
+}
+
+async function buildPortalDonationSearchFilter(search) {
+  const cleanSearch = String(search || "").trim()
+
+  if (!cleanSearch) {
+    return null
+  }
+
+  const regex = new RegExp(escapeRegex(cleanSearch), "i")
+  const matchingUsers = await User.find({
+    $or: [
+      { email: regex },
+      { name: regex },
+      { firstName: regex },
+      { lastName: regex },
+      { "identity.firstName": regex },
+      { "identity.lastName": regex },
+      { "virtualAccount.accountNumber": regex },
+      { "virtualAccount.accountName": regex },
+      { "virtualAccount.bankName": regex },
+    ],
+  })
+    .select("_id")
+    .limit(1000)
+
+  const searchClauses = [
+    { creatorEmail: regex },
+    { sender: regex },
+    { sourceAccountName: regex },
+    { sourceAccountNumber: regex },
+    { sourceBankName: regex },
+    { sourceBankCode: regex },
+    { sourceSessionId: regex },
+    { destinationAccountNumber: regex },
+    { destinationBankName: regex },
+    { destinationBankCode: regex },
+    { monnifyTransactionReference: regex },
+    { monnifyPaymentReference: regex },
+    { paymentMethod: regex },
+    { eventType: regex },
+  ]
+
+  if (mongoose.Types.ObjectId.isValid(cleanSearch)) {
+    searchClauses.push({ _id: cleanSearch })
+  }
+
+  if (matchingUsers.length) {
+    searchClauses.push({ creatorId: { $in: matchingUsers.map((user) => user._id) } })
+  }
+
+  return { $or: searchClauses }
+}
+
 function csvCell(value) {
   const safeValue = String(value ?? "")
   return `"${safeValue.replace(/"/g, '""')}"`
@@ -1336,6 +1662,11 @@ function csvCell(value) {
 function settlementReportFilename() {
   const stamp = new Date().toISOString().slice(0, 10)
   return `streamtip-settlements-${stamp}.csv`
+}
+
+function donationReportFilename() {
+  const stamp = new Date().toISOString().slice(0, 10)
+  return `streamtip-gifts-${stamp}.csv`
 }
 
 function sanitizePublicOverlayUser(user) {
@@ -3449,12 +3780,13 @@ app.post("/webhook/monnify", async (req, res) => {
       }
     }
 
-    const destinationAccountNumber = String(
-      eventData.destinationAccountInformation?.accountNumber || "",
-    ).trim()
-    const destinationBankName = String(
-      eventData.destinationAccountInformation?.bankName || "",
-    ).trim()
+    const destinationDetails = getDonationDestinationDetails(eventData, data)
+    const destinationAccountNumber = destinationDetails.destinationAccountNumber
+    const destinationBankName = destinationDetails.destinationBankName
+    const sourceDetails = getDonationSourceDetails(eventData, data)
+    const paymentMethod = compactString(eventData.paymentMethod || data.paymentMethod)
+    const currency = compactString(eventData.currency || data.currency || "NGN")
+    const paidOn = parseProviderDate(eventData.paidOn || eventData.paidAt || data.paidOn || data.paidAt)
     const grossAmount = firstValidMoneyAmount(
       eventData.amountPaid,
       eventData.amount,
@@ -3501,11 +3833,19 @@ app.post("/webhook/monnify", async (req, res) => {
     }
 
     const senderDisplay = getDonationSenderName(eventData, data, creator)
+    const resolvedSenderDisplay =
+      senderDisplay.name === "Anonymous" && sourceDetails.sourceAccountName
+        ? {
+            ...senderDisplay,
+            name: getFirstNameOnly(sourceDetails.sourceAccountName),
+            source: "source_account_first_name",
+          }
+        : senderDisplay
     const senderNameResolutionMetadata = {
-      sender: senderDisplay.name,
-      senderNameSource: senderDisplay.source,
-      checkedNarrations: senderDisplay.checkedNarrations || [],
-      checkedNarrationFields: (senderDisplay.checkedNarrationFields || []).map((entry) => ({
+      sender: resolvedSenderDisplay.name,
+      senderNameSource: resolvedSenderDisplay.source,
+      checkedNarrations: resolvedSenderDisplay.checkedNarrations || [],
+      checkedNarrationFields: (resolvedSenderDisplay.checkedNarrationFields || []).map((entry) => ({
         ...entry,
         rejectedAsSystem: isSystemNarration(entry.value, []),
       })),
@@ -3518,17 +3858,23 @@ app.post("/webhook/monnify", async (req, res) => {
     const donation = await Donation.create({
       creatorId: creator._id,
       creatorEmail: creator.email,
-      sender: senderDisplay.name,
-      senderNameSource: senderDisplay.source,
+      sender: resolvedSenderDisplay.name,
+      senderNameSource: resolvedSenderDisplay.source,
       amount: split.gross,
       platformFee: split.platformFee,
       creatorShare: split.creatorShare,
       eventType,
       paymentStatus,
+      paymentMethod: paymentMethod || undefined,
+      currency: currency || undefined,
+      paidOn,
+      ...sourceDetails,
       destinationAccountNumber: destinationAccountNumber || undefined,
       destinationBankName: destinationBankName || undefined,
+      destinationBankCode: destinationDetails.destinationBankCode || undefined,
       monnifyTransactionReference: transactionReference || undefined,
       monnifyPaymentReference: paymentReference || undefined,
+      providerPayload: data,
     })
 
     io.to(getCreatorRoom(creator._id)).emit("newDonation", donation)
@@ -3536,24 +3882,35 @@ app.post("/webhook/monnify", async (req, res) => {
     await createAuditLog({
       actorType: "system",
       eventType: "donation.sender_name_resolution",
-      message: `Donation sender display resolved as ${senderDisplay.source}.`,
+      message: `Donation sender display resolved as ${resolvedSenderDisplay.source}.`,
       metadata: senderNameResolutionMetadata,
     })
 
     await createAuditLog({
       actorType: "system",
       eventType: "donation.received",
-      message: `Donation received from ${senderDisplay.name}.`,
+      message: `Donation received from ${resolvedSenderDisplay.name}.`,
       metadata: {
-        sender: senderDisplay.name,
-        senderNameSource: senderDisplay.source,
-        checkedNarrations: senderDisplay.checkedNarrations || [],
-        checkedNarrationFields: senderDisplay.checkedNarrationFields || [],
+        sender: resolvedSenderDisplay.name,
+        senderNameSource: resolvedSenderDisplay.source,
+        checkedNarrations: resolvedSenderDisplay.checkedNarrations || [],
+        checkedNarrationFields: resolvedSenderDisplay.checkedNarrationFields || [],
         amount: split.gross,
         platformFee: split.platformFee,
         creatorShare: split.creatorShare,
         creatorId: creator._id.toString(),
         paymentStatus,
+        paymentMethod,
+        currency,
+        paidOn,
+        sourceAccountName: sourceDetails.sourceAccountName,
+        sourceAccountNumber: sourceDetails.sourceAccountNumber,
+        sourceBankName: sourceDetails.sourceBankName,
+        sourceBankCode: sourceDetails.sourceBankCode,
+        sourceSessionId: sourceDetails.sourceSessionId,
+        destinationAccountNumber: destinationDetails.destinationAccountNumber,
+        destinationBankName: destinationDetails.destinationBankName,
+        destinationBankCode: destinationDetails.destinationBankCode,
         transactionReference,
         paymentReference,
       },
@@ -4115,6 +4472,133 @@ app.get("/admin/logs", requireAdminSession, async (req, res) => {
   }
 })
 
+app.get("/portal/donations", requireAdminSession, async (req, res) => {
+  try {
+    const page = parsePositiveInteger(req.query.page, 1)
+    const limit = Math.min(parsePositiveInteger(req.query.limit, 25), 100)
+    const skip = (page - 1) * limit
+    const filter = await buildPortalDonationFilter(req.query)
+
+    const [donations, total] = await Promise.all([
+      Donation.find(filter)
+        .populate("creatorId")
+        .sort({ date: -1 })
+        .skip(skip)
+        .limit(limit),
+      Donation.countDocuments(filter),
+    ])
+
+    res.json({
+      donations: donations.map((donation) => sanitizePortalDonation(donation)),
+      pagination: getPaginationMeta({ page, limit, total }),
+      search: String(req.query.search || "").trim(),
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load donation transactions." })
+  }
+})
+
+app.get("/portal/donations/report", requireAdminSession, async (req, res) => {
+  try {
+    const filter = await buildPortalDonationFilter(req.query)
+    const headers = [
+      "Donation ID",
+      "Received At",
+      "Provider Paid At",
+      "Creator Name",
+      "Creator Email",
+      "Amount",
+      "Platform Fee",
+      "Creator Share",
+      "Payment Status",
+      "Payment Method",
+      "Currency",
+      "Source Account Name",
+      "Source Account Number",
+      "Source Bank",
+      "Source Bank Code",
+      "Source Session ID",
+      "Destination Account Number",
+      "Destination Bank",
+      "Destination Bank Code",
+      "Monnify Transaction Reference",
+      "Monnify Payment Reference",
+      "Sender Display",
+      "Sender Name Source",
+      "Event Type",
+    ]
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8")
+    res.setHeader("Content-Disposition", `attachment; filename="${donationReportFilename()}"`)
+    res.write(`${headers.map(csvCell).join(",")}\n`)
+
+    const cursor = Donation.find(filter).populate("creatorId").sort({ date: -1 }).cursor()
+
+    for await (const donation of cursor) {
+      const item = sanitizePortalDonation(donation)
+      const row = [
+        item.id,
+        item.date ? new Date(item.date).toISOString() : "",
+        item.paidOn ? new Date(item.paidOn).toISOString() : "",
+        item.creator?.name || "",
+        item.creatorEmail || item.creator?.email || "",
+        item.amount || 0,
+        item.platformFee || 0,
+        item.creatorShare || 0,
+        item.paymentStatus || "",
+        item.paymentMethod || "",
+        item.currency || "",
+        item.sourceAccountName || "",
+        item.sourceAccountNumber || "",
+        item.sourceBankName || "",
+        item.sourceBankCode || "",
+        item.sourceSessionId || "",
+        item.destinationAccountNumber || "",
+        item.destinationBankName || "",
+        item.destinationBankCode || "",
+        item.monnifyTransactionReference || "",
+        item.monnifyPaymentReference || "",
+        item.sender || "",
+        item.senderNameSource || "",
+        item.eventType || "",
+      ]
+
+      res.write(`${row.map(csvCell).join(",")}\n`)
+    }
+
+    res.end()
+  } catch (error) {
+    console.error(error)
+    if (res.headersSent) {
+      res.end()
+      return
+    }
+    res.status(500).json({ error: "Failed to export donation report." })
+  }
+})
+
+app.get("/portal/donations/:id", requireAdminSession, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid donation ID." })
+    }
+
+    const donation = await Donation.findById(req.params.id).populate("creatorId")
+
+    if (!donation) {
+      return res.status(404).json({ error: "Donation not found." })
+    }
+
+    res.json({
+      donation: sanitizePortalDonation(donation, { includeProviderPayload: true }),
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load donation transaction." })
+  }
+})
+
 app.get("/portal/settlements", requireAdminSession, async (req, res) => {
   try {
     const page = parsePositiveInteger(req.query.page, 1)
@@ -4453,15 +4937,17 @@ app.get("/portal/users/:id", requireAdminSession, async (req, res) => {
       return res.status(404).json({ error: "User not found." })
     }
 
-    const [payouts, changeRequests] = await Promise.all([
+    const [payouts, changeRequests, donations] = await Promise.all([
       Payout.find({ creatorId: user._id }).sort({ createdAt: -1 }).limit(25),
       PayoutProfileChangeRequest.find({ creatorId: user._id }).sort({ createdAt: -1 }).limit(10),
+      Donation.find({ creatorId: user._id }).sort({ date: -1 }).limit(50),
     ])
 
     res.json({
       user: sanitizeUser(user),
       payouts: payouts.map(sanitizePortalPayout),
       changeRequests: changeRequests.map(sanitizePayoutProfileChangeRequest),
+      donations: donations.map(sanitizePortalDonation),
     })
   } catch (error) {
     console.error(error)
