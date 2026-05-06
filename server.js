@@ -3059,14 +3059,28 @@ async function createPaystackDedicatedAccountForUser(user) {
 
   try {
     response = await paystack.createDedicatedVirtualAccount(dedicatedAccountPayload)
-  } catch (error) {
+  } catch (createError) {
+    const createErrorMessage = getAxiosErrorMessage(createError, "Dedicated account creation failed.")
+    console.error("[Paystack] createDedicatedVirtualAccount failed, attempting assign fallback:", createErrorMessage)
+
     const customerPayload = buildPaystackCustomerPayload(user)
+    const phone = customerPayload.phone || ""
+
+    if (!phone) {
+      throw new Error(
+        "Virtual account provisioning failed: " + createErrorMessage +
+        " Please add a phone number to your account profile and try again."
+      )
+    }
+
     response = await paystack.assignDedicatedVirtualAccount({
       email: customerPayload.email,
       first_name: customerPayload.first_name,
       last_name: customerPayload.last_name,
-      phone: customerPayload.phone || undefined,
+      phone,
       preferred_bank: PAYSTACK_PREFERRED_DVA_BANK || undefined,
+      subaccount: PAYSTACK_DVA_SUBACCOUNT || undefined,
+      split_code: PAYSTACK_DVA_SPLIT_CODE || undefined,
       country: "NG",
     })
   }
