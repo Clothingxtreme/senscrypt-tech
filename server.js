@@ -3093,7 +3093,7 @@ async function createPaystackDedicatedAccountForUser(user) {
       )
     }
 
-    response = await paystack.assignDedicatedVirtualAccount({
+    await paystack.assignDedicatedVirtualAccount({
       email: customerPayload.email,
       first_name: customerPayload.first_name,
       last_name: customerPayload.last_name,
@@ -3102,6 +3102,12 @@ async function createPaystackDedicatedAccountForUser(user) {
       ...dvaSplitField,
       country: "NG",
     })
+
+    // /dedicated_account/assign is async — Paystack will send a
+    // dedicatedaccount.assign.success webhook when the account is ready.
+    // Save a pending state now so the user sees progress.
+    await markPaystackVirtualAccountPending(user, createErrorMessage)
+    return user.virtualAccount
   }
 
   const virtualAccount = normalizePaystackDedicatedAccount(response, user, customerCode)
@@ -5331,13 +5337,54 @@ app.post("/api/webhooks/paystack", async (req, res) => {
     const eventType = String(payload.event || payload.eventType || "paystack.webhook")
     const eventData = getPaystackEventData(payload)
 
-    if (eventType !== "charge.success") {
+    if (eventType !== "charge.success" && eventType !== "dedicatedaccount.assign.success") {
       await createAuditLog({
         actorType: "system",
         eventType: "webhook.paystack.ignored",
         message: `Ignored Paystack webhook event ${eventType}.`,
         metadata: { eventType },
       })
+      return res.sendStatus(200)
+    }
+
+    // Handle dedicated account assignment completion
+    if (eventType === "dedicatedaccount.assign.success") {
+      const accountData = eventData.dedicated_account || eventData
+      const customerCode = getPaystackCustomerCode(eventData)
+      const accountNumber = String(accountData.account_number || "").trim()
+      const bankName = String(accountData.bank?.name || accountData.bank_name || "Paystack DVA").trim()
+      const bankCode = String(accountData.bank?.slug || accountData.bank?.code || "").trim()
+
+      const creator = await findCreatorForPaystackEvent(eventData)
+      if (creator && accountNumber) {
+        creator.virtualAccount = {
+          accountReference: customerCode || `PAYSTACK-${creator._id}`,
+          accountName: buildPaystackAccountName(creator),
+          accountNumber,
+          bankName,
+          bankCode,
+          reservationReference: String(accountData.account_reference || "").trim(),
+          status: "active",
+          provider: "paystack",
+          environment: getPaystackEnvironment(),
+          paystackCustomerCode: customerCode,
+          dedicatedAccountId: String(accountData.id || "").trim(),
+          assignmentStatus: "assigned",
+          createdAt: accountData.created_at ? new Date(accountData.created_at) : new Date(),
+          updatedAt: new Date(),
+        }
+        await creator.save()
+        console.log(`[Paystack] dedicatedaccount.assign.success — activated account ${accountNumber} for ${creator.email}`)
+        await createAuditLog({
+          actorType: "system",
+          actorId: creator._id.toString(),
+          eventType: "paystack.virtual_account.activated",
+          message: `Paystack virtual account ${accountNumber} activated for ${creator.email}.`,
+          metadata: { accountNumber, bankName, customerCode },
+        })
+      } else {
+        console.warn("[Paystack] dedicatedaccount.assign.success — could not find creator or missing account number", { customerCode, accountNumber })
+      }
       return res.sendStatus(200)
     }
 
