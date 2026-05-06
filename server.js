@@ -3070,6 +3070,35 @@ async function createPaystackDedicatedAccountForUser(user) {
     ? { subaccount: PAYSTACK_DVA_SUBACCOUNT }
     : {}
 
+  // If BVN validation was skipped (not available on this integration), skip POST /dedicated_account
+  // entirely — it requires a validated customer and will always fail. Go straight to /assign.
+  if (validationResult?.skipped) {
+    const customerPayload = buildPaystackCustomerPayload(user)
+    const phone = customerPayload.phone || ""
+
+    if (!phone) {
+      throw new Error(
+        "Virtual account provisioning failed: BVN validation is not available on this integration, and the user has no phone number saved. Please add a phone number to your account profile and try again."
+      )
+    }
+
+    console.log("[Paystack] BVN validation skipped — going directly to /dedicated_account/assign")
+    await paystack.assignDedicatedVirtualAccount({
+      email: customerPayload.email,
+      first_name: customerPayload.first_name,
+      last_name: customerPayload.last_name,
+      phone,
+      preferred_bank: PAYSTACK_PREFERRED_DVA_BANK || undefined,
+      ...dvaSplitField,
+      country: "NG",
+    })
+
+    // /dedicated_account/assign is async — Paystack will send a
+    // dedicatedaccount.assign.success webhook when the account is ready.
+    await markPaystackVirtualAccountPending(user, "BVN validation not available; assign queued.", customerCode)
+    return user.virtualAccount
+  }
+
   const dedicatedAccountPayload = {
     customer: customerCode,
     preferred_bank: PAYSTACK_PREFERRED_DVA_BANK || undefined,
