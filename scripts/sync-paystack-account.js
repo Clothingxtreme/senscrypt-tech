@@ -60,11 +60,15 @@ async function paystackGet(path, params = {}) {
     process.exit(1)
   }
 
-  console.log(`\nFetching dedicated accounts for customer ${customerCode}...`)
-  const listRes = await paystackGet("/dedicated_account", { customer: customerCode, active: true })
-  console.log("Paystack response:", JSON.stringify(listRes, null, 2))
+  console.log(`\nFetching customer details for ${customerCode}...`)
+  const customerRes = await paystackGet(`/customer/${encodeURIComponent(customerCode)}`)
+  console.log("Customer response:", JSON.stringify(customerRes, null, 2))
 
-  const accounts = listRes?.data || []
+  // Paystack returns dedicated_accounts array inside the customer object
+  const customerData = customerRes?.data || {}
+  const dedicatedAccounts = customerData.dedicated_accounts || customerData.dedicatedAccounts || []
+  const accounts = dedicatedAccounts.filter(a => a.active || a.status === "active" || !a.status)
+
   if (accounts.length === 0) {
     console.log("\nNo active account found on Paystack yet. Trying assign again...")
 
