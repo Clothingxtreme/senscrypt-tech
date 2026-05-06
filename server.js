@@ -50,7 +50,7 @@ const ADMIN_PASSWORD = readEnv("ADMIN_PASSWORD")
 const TELEGRAM_BOT_TOKEN = readEnv("TELEGRAM_BOT_TOKEN")
 const TELEGRAM_WITHDRAWAL_CHAT_ID =
   readEnv("TELEGRAM_WITHDRAWAL_CHAT_ID") || readEnv("TELEGRAM_CHAT_ID")
-const PORTAL_URL = readEnv("PORTAL_URL") || "http://localhost:5001"
+const PORTAL_URL = readEnv("PORTAL_URL") || "https://api.streamtips.live"
 const MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER = readEnv(
   "MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER",
 )
@@ -285,7 +285,14 @@ const server = http.createServer(app)
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins === "*" ? true : allowedOrigins,
+    methods: ["GET", "POST"],
+    credentials: true,
   },
+  // Force WebSocket transport to avoid long-polling 400s behind Render's reverse proxy.
+  // Long-polling requires sticky sessions which Render does not guarantee.
+  transports: ["websocket"],
+  pingTimeout: 60000,
+  pingInterval: 25000,
 })
 
 const PLATFORM_FEE_RATE = 0.2
