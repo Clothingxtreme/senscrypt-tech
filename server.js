@@ -3106,7 +3106,8 @@ async function createPaystackDedicatedAccountForUser(user) {
     // /dedicated_account/assign is async — Paystack will send a
     // dedicatedaccount.assign.success webhook when the account is ready.
     // Save a pending state now so the user sees progress.
-    await markPaystackVirtualAccountPending(user, createErrorMessage)
+    // Pass customerCode so the webhook handler can match this user.
+    await markPaystackVirtualAccountPending(user, createErrorMessage, customerCode)
     return user.virtualAccount
   }
 
@@ -3138,7 +3139,7 @@ async function createPaystackDedicatedAccountForUser(user) {
   return virtualAccount
 }
 
-async function markPaystackVirtualAccountPending(user, reason = "") {
+async function markPaystackVirtualAccountPending(user, reason = "", customerCode = "") {
   const customerName = buildPaystackAccountName(user)
   const previousVirtualAccount = user.virtualAccount?.accountNumber ? user.virtualAccount.toObject?.() || user.virtualAccount : null
 
@@ -3153,6 +3154,8 @@ async function markPaystackVirtualAccountPending(user, reason = "") {
     ].slice(-10)
   }
 
+  const resolvedCustomerCode = customerCode || String(user.virtualAccount?.paystackCustomerCode || "").trim()
+
   user.virtualAccount = {
     accountReference: `PAYSTACK-PENDING-${user._id}`,
     accountName: customerName,
@@ -3164,6 +3167,7 @@ async function markPaystackVirtualAccountPending(user, reason = "") {
     provider: "paystack",
     environment: getPaystackEnvironment(),
     assignmentStatus: "pending",
+    paystackCustomerCode: resolvedCustomerCode || undefined,
     createdAt: new Date(),
     updatedAt: new Date(),
   }
