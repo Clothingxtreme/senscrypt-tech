@@ -2990,8 +2990,16 @@ function normalizePaystackDedicatedAccount(response, user, customerCode) {
   const data = getPaystackResponseData(response)
   const bank = data.bank && typeof data.bank === "object" ? data.bank : {}
   const assignment = data.assignment && typeof data.assignment === "object" ? data.assignment : {}
+
+  // /dedicated_account/assign wraps the account inside a "dedicated_account" key
+  const accountData = data.dedicated_account && typeof data.dedicated_account === "object"
+    ? data.dedicated_account
+    : data
+
+  console.log("[Paystack] normalizePaystackDedicatedAccount data keys:", Object.keys(data))
+
   const accountNumber = String(
-    data.account_number || data.accountNumber || data.account?.account_number || "",
+    accountData.account_number || accountData.accountNumber || data.account_number || data.accountNumber || data.account?.account_number || "",
   ).trim()
 
   if (!accountNumber) {
@@ -3002,16 +3010,22 @@ function normalizePaystackDedicatedAccount(response, user, customerCode) {
     accountReference: customerCode,
     accountName: buildPaystackAccountName(user),
     accountNumber,
-    bankName: String(bank.name || data.bank_name || data.bankName || "Paystack DVA").trim(),
-    bankCode: String(bank.slug || bank.code || data.bank_code || data.bankCode || "").trim(),
+    bankName: String(
+      (accountData.bank?.name) || bank.name || data.bank_name || data.bankName || "Paystack DVA"
+    ).trim(),
+    bankCode: String(
+      (accountData.bank?.slug) || (accountData.bank?.code) || bank.slug || bank.code || data.bank_code || data.bankCode || ""
+    ).trim(),
     reservationReference: String(data.account_reference || data.reference || "").trim(),
     status: "active",
     provider: "paystack",
     environment: getPaystackEnvironment(),
     paystackCustomerCode: customerCode,
-    dedicatedAccountId: String(data.id || data.dedicated_account_id || "").trim(),
-    assignmentStatus: String(assignment.status || data.assignment_status || "assigned").trim(),
-    createdAt: data.created_at ? new Date(data.created_at) : new Date(),
+    dedicatedAccountId: String(accountData.id || data.id || data.dedicated_account_id || "").trim(),
+    assignmentStatus: String(
+      (accountData.assignment?.status) || assignment.status || data.assignment_status || "assigned"
+    ).trim(),
+    createdAt: (accountData.created_at || data.created_at) ? new Date(accountData.created_at || data.created_at) : new Date(),
     updatedAt: new Date(),
   }
 }
