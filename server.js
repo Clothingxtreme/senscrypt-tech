@@ -3030,7 +3030,16 @@ async function createPaystackDedicatedAccountForUser(user) {
     validationResult = await validatePaystackCustomerForUser(user, customerCode)
   } catch (error) {
     const message = getAxiosErrorMessage(error, "Paystack customer validation failed.")
-    throw new Error(message)
+    // BVN validation is a Paystack-gated feature. If it's not enabled on this integration,
+    // skip validation and continue with DVA creation instead of blocking the user.
+    if (
+      message.toLowerCase().includes("not available on this integration") ||
+      message.toLowerCase().includes("bvn") && message.toLowerCase().includes("not available")
+    ) {
+      validationResult = { skipped: true, reason: message }
+    } else {
+      throw new Error(message)
+    }
   }
 
   const dedicatedAccountPayload = {
