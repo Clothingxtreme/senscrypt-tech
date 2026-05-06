@@ -8045,6 +8045,63 @@ app.post("/admin/users/:id/virtual-account", requireAdminSession, async (req, re
   }
 })
 
+// Sync: fetch existing dedicated account from Paystack for a user and activate it in DB
+app.post("/admin/users/:id/virtual-account/sync", requireAdminSession, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id)
+    if (!user) return res.status(404).json({ error: "User not found." })
+
+    const customerCode = String(user.virtualAccount?.paystackCustomerCode || "").trim()
+    if (!customerCode) {
+      return res.status(400).json({ error: "No paystackCustomerCode saved for this user. Run provision first." })
+    }
+
+    const listResponse = await paystack.listDedicatedVirtualAccounts({ customer: customerCode, active: true })
+    const accounts = listResponse?.data || []
+    const account = accounts[0]
+
+    if (!account) {
+      return res.status(404).json({ error: `No active dedicated account found on Paystack for customer ${customerCode}.` })
+    }
+
+    const accountNumber = String(account.account_number || "").trim()
+    const bankName = String(account.bank?.name || "Paystack DVA").trim()
+    const bankCode = String(account.bank?.slug || account.bank?.code || "").trim()
+
+    user.virtualAccount = {
+      accountReference: String(account.id || account.account_number || ""),
+      accountName: String(account.account_name || buildPaystackAccountName(user)).trim(),
+      accountNumber,
+      bankName,
+      bankCode,
+      reservationReference: String(account.id || ""),
+      status: "active",
+      provider: "paystack",
+      environment: getPaystackEnvironment(),
+      assignmentStatus: "assigned",
+      paystackCustomerCode: customerCode,
+      dedicatedAccountId: String(account.id || ""),
+      createdAt: account.created_at ? new Date(account.created_at) : new Date(),
+      updatedAt: new Date(),
+    }
+
+    await user.save()
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "admin.user.virtual_account.synced",
+      message: `Admin synced Paystack dedicated account ${accountNumber} for ${user.email}.`,
+      metadata: { userId: user._id.toString(), email: user.email, accountNumber, bankName },
+    })
+
+    res.json({ user: sanitizeUser(user), virtualAccount: user.virtualAccount })
+  } catch (error) {
+    console.error(error)
+    res.status(502).json({ error: error instanceof Error ? error.message : "Sync failed." })
+  }
+})
+
 app.get("/admin/paystack/migration-candidates", requireAdminSession, async (req, res) => {
   try {
     const limit = Math.min(parsePositiveInteger(req.query.limit, 100), 500)
