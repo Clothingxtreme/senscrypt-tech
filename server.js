@@ -3049,11 +3049,17 @@ async function createPaystackDedicatedAccountForUser(user) {
     }
   }
 
+  // Paystack only accepts one of subaccount or split_code. Prefer split_code.
+  const dvaSplitField = PAYSTACK_DVA_SPLIT_CODE
+    ? { split_code: PAYSTACK_DVA_SPLIT_CODE }
+    : PAYSTACK_DVA_SUBACCOUNT
+    ? { subaccount: PAYSTACK_DVA_SUBACCOUNT }
+    : {}
+
   const dedicatedAccountPayload = {
     customer: customerCode,
     preferred_bank: PAYSTACK_PREFERRED_DVA_BANK || undefined,
-    subaccount: PAYSTACK_DVA_SUBACCOUNT || undefined,
-    split_code: PAYSTACK_DVA_SPLIT_CODE || undefined,
+    ...dvaSplitField,
   }
   let response
 
@@ -3079,8 +3085,7 @@ async function createPaystackDedicatedAccountForUser(user) {
       last_name: customerPayload.last_name,
       phone,
       preferred_bank: PAYSTACK_PREFERRED_DVA_BANK || undefined,
-      subaccount: PAYSTACK_DVA_SUBACCOUNT || undefined,
-      split_code: PAYSTACK_DVA_SPLIT_CODE || undefined,
+      ...dvaSplitField,
       country: "NG",
     })
   }
