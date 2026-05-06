@@ -19,19 +19,31 @@ function createPaystackService({ secretKey, baseUrl } = {}) {
   async function request(method, path, { data, params } = {}) {
     ensureConfigured()
 
-    const response = await axios({
-      method,
-      url: `${normalizedBaseUrl}${path}`,
-      data,
-      params,
-      headers: {
-        Authorization: `Bearer ${normalizedSecretKey}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      timeout: 20_000,
-    })
+    const url = `${normalizedBaseUrl}${path}`
+    console.log(`[Paystack] → ${method.toUpperCase()} ${url}`)
 
+    let response
+    try {
+      response = await axios({
+        method,
+        url,
+        data,
+        params,
+        headers: {
+          Authorization: `Bearer ${normalizedSecretKey}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        timeout: 20_000,
+      })
+    } catch (err) {
+      const status = err?.response?.status
+      const message = err?.response?.data?.message || err?.message || "Unknown error"
+      console.error(`[Paystack] ✗ ${method.toUpperCase()} ${url} → ${status} ${message}`)
+      throw err
+    }
+
+    console.log(`[Paystack] ✓ ${method.toUpperCase()} ${url} → ${response.status}`)
     return response.data
   }
 

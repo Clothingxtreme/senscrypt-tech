@@ -8377,6 +8377,13 @@ const PORT = Number(process.env.PORT || 5000)
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on http://0.0.0.0:${PORT}`)
+  // Log outbound IP so we can confirm what external APIs (e.g. Paystack) see
+  const https = require("https")
+  https.get("https://ifconfig.me", (res) => {
+    let ip = ""
+    res.on("data", (chunk) => { ip += chunk })
+    res.on("end", () => { console.log(`[Server] Outbound public IP: ${ip.trim()}`) })
+  }).on("error", () => {})
 })
 
 setInterval(() => {
