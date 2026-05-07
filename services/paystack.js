@@ -95,6 +95,53 @@ function createPaystackService({ secretKey, baseUrl } = {}) {
         },
       })
     },
+
+    async listBanks(params = {}) {
+      return request("get", "/bank", { params })
+    },
+
+    async resolveBankAccount({ accountNumber, bankCode }) {
+      return request("get", "/bank/resolve", {
+        params: {
+          account_number: accountNumber,
+          bank_code: bankCode,
+        },
+      })
+    },
+
+    async createTransferRecipient(payload) {
+      return request("post", "/transferrecipient", { data: payload })
+    },
+
+    async initiateTransfer(payload) {
+      return request("post", "/transfer", { data: payload })
+    },
+
+    async finalizeTransfer({ transferCode, otp }) {
+      return request("post", "/transfer/finalize_transfer", {
+        data: {
+          transfer_code: transferCode,
+          otp,
+        },
+      })
+    },
+
+    async resendTransferOtp({ transferCode, reason = "resend_otp" }) {
+      return request("post", "/transfer/resend_otp", {
+        data: {
+          transfer_code: transferCode,
+          reason,
+        },
+      })
+    },
+
+    async fetchTransfer(idOrCode) {
+      return request("get", `/transfer/${encodeURIComponent(idOrCode)}`)
+    },
+
+    async verifyTransfer(reference) {
+      return request("get", `/transfer/verify/${encodeURIComponent(reference)}`)
+    },
   }
 }
 

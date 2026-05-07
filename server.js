@@ -43,6 +43,7 @@ const PAYSTACK_PREFERRED_DVA_BANK = readEnv("PAYSTACK_PREFERRED_DVA_BANK")
 const PAYSTACK_DVA_SUBACCOUNT = readEnv("PAYSTACK_DVA_SUBACCOUNT")
 const PAYSTACK_DVA_SPLIT_CODE = readEnv("PAYSTACK_DVA_SPLIT_CODE")
 const PAYSTACK_WEBHOOK_IP_ALLOWLIST = readEnv("PAYSTACK_WEBHOOK_IP_ALLOWLIST")
+const PAYOUT_TRANSFER_PROVIDER = (readEnv("PAYOUT_TRANSFER_PROVIDER") || "paystack").toLowerCase()
 const GOOGLE_CLIENT_ID = readEnv("GOOGLE_CLIENT_ID")
 const APPLE_CLIENT_ID = readEnv("APPLE_CLIENT_ID")
 const ADMIN_EMAIL = readEnv("ADMIN_EMAIL")
@@ -558,9 +559,13 @@ const payoutSchema = new mongoose.Schema({
   bankCode: String,
   accountNumber: String,
   accountName: String,
+  provider: String,
   transferReference: String,
   providerReference: String,
   providerMessage: String,
+  transferRecipientCode: String,
+  paystackTransferCode: String,
+  providerPayload: { type: mongoose.Schema.Types.Mixed, default: undefined },
   previousTransferReferences: { type: [String], default: undefined },
   retryCount: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now },
@@ -1911,7 +1916,7 @@ function getPaginationMeta({ page, limit, total }) {
 }
 
 const MONNIFY_AUTHORIZATION_MESSAGE_REGEX = /authorization|otp|expired|expire/i
-const MONNIFY_RETRYABLE_MESSAGE_REGEX = /authorization|otp|expired|expire|provider|monnify/i
+const MONNIFY_RETRYABLE_MESSAGE_REGEX = /authorization|otp|expired|expire|provider|monnify|paystack|transfer|abandoned|blocked/i
 
 function hasPendingMonnifyAuthorizationMessage(value) {
   return MONNIFY_AUTHORIZATION_MESSAGE_REGEX.test(String(value || ""))
@@ -1921,13 +1926,25 @@ function hasRetryableMonnifyMessage(value) {
   return MONNIFY_RETRYABLE_MESSAGE_REGEX.test(String(value || ""))
 }
 
+function getPayoutProvider(payout) {
+  const provider = String(payout?.provider || "").toLowerCase().trim()
+
+  if (provider) {
+    return provider
+  }
+
+  return ["awaiting_review", "pending_admin_approval", "approved"].includes(payout?.status)
+    ? PAYOUT_TRANSFER_PROVIDER
+    : "monnify"
+}
+
 function isExpiredMonnifyTransferStatus(status) {
   return /EXPIRED|EXPIRY|OTP_EXPIRED|AUTHORIZATION_EXPIRED|TIMED_OUT|TIMEOUT/i.test(
     String(status || ""),
   )
 }
 
-function payoutRequiresMonnifyAuthorization(payout) {
+function payoutRequiresTransferAuthorization(payout) {
   return (
     ["pending", "otp_required", "otp_resent"].includes(payout?.status) &&
     hasPendingMonnifyAuthorizationMessage(payout.providerMessage)
@@ -1940,7 +1957,7 @@ function canRetryMonnifyPayout(payout) {
   }
 
   if (["pending", "otp_required", "otp_resent"].includes(payout.status)) {
-    return payoutRequiresMonnifyAuthorization(payout)
+    return payoutRequiresTransferAuthorization(payout)
   }
 
   if (payout.status === "failed") {
@@ -1990,7 +2007,10 @@ function sanitizePortalPayout(payout) {
     transferReference: payout.transferReference,
     providerReference: payout.providerReference || "",
     providerMessage: payout.providerMessage || "",
-    requiresAuthorization: payoutRequiresMonnifyAuthorization(payout),
+    provider: getPayoutProvider(payout),
+    paystackTransferCode: payout.paystackTransferCode || "",
+    transferRecipientCode: payout.transferRecipientCode || "",
+    requiresAuthorization: payoutRequiresTransferAuthorization(payout),
     canRetryTransfer: canRetryMonnifyPayout(payout),
     canCancelAndReturn: canCancelPayoutAndReturnBalance(payout),
     previousTransferReferences: payout.previousTransferReferences || [],
@@ -3481,7 +3501,44 @@ async function syncDonationFromMonnifyTransaction(donation) {
   return donation
 }
 
-async function getSupportedBanks() {
+function getPayoutBankProvider() {
+  return PAYOUT_TRANSFER_PROVIDER === "paystack" ? "paystack" : "monnify"
+}
+
+async function getPaystackSupportedBanks() {
+  if (!isPaystackConfigured()) {
+    return fallbackBanks
+  }
+
+  const allBanks = []
+  let nextCursor = ""
+
+  do {
+    const response = await paystack.listBanks({
+      country: "nigeria",
+      currency: "NGN",
+      type: "nuban",
+      use_cursor: true,
+      perPage: 100,
+      ...(nextCursor ? { next: nextCursor } : {}),
+    })
+    const banks = Array.isArray(response?.data) ? response.data : []
+    allBanks.push(
+      ...banks
+        .map((bank) => ({
+          name: String(bank?.name || "").trim(),
+          code: String(bank?.code || "").trim(),
+          provider: "paystack",
+        }))
+        .filter((bank) => bank.name && bank.code),
+    )
+    nextCursor = String(response?.meta?.next || "").trim()
+  } while (nextCursor)
+
+  return allBanks.length ? allBanks : fallbackBanks
+}
+
+async function getMonnifySupportedBanks() {
   if (!isMonnifyConfigured()) {
     return fallbackBanks
   }
@@ -3500,6 +3557,7 @@ async function getSupportedBanks() {
       .map((bank) => ({
         name: String(bank?.name || "").trim(),
         code: String(bank?.code || "").trim(),
+        provider: "monnify",
       }))
       .filter((bank) => bank.name && bank.code)
 
@@ -3510,7 +3568,42 @@ async function getSupportedBanks() {
   }
 }
 
-async function resolveBankAccountName({ bankCode, accountNumber }) {
+async function getSupportedBanks() {
+  if (getPayoutBankProvider() === "paystack") {
+    try {
+      return await getPaystackSupportedBanks()
+    } catch (error) {
+      console.error("Failed to load Paystack banks, using fallback bank list.", error)
+      return fallbackBanks
+    }
+  }
+
+  return getMonnifySupportedBanks()
+}
+
+async function resolvePaystackBankAccountName({ bankCode, accountNumber }) {
+  if (!isPaystackConfigured()) {
+    throw new Error("Paystack account validation is not configured yet.")
+  }
+
+  const response = await paystack.resolveBankAccount({ bankCode, accountNumber })
+  const data = response?.data || {}
+  const accountName = String(data.account_name || data.accountName || "").trim()
+
+  if (!accountName) {
+    throw new Error("Paystack did not return an account name for that bank account.")
+  }
+
+  return {
+    accountName,
+    accountNumber: String(data.account_number || data.accountNumber || accountNumber).trim(),
+    bankCode: String(data.bank_code || data.bankCode || bankCode).trim(),
+    bankId: data.bank_id || data.bankId || "",
+    verificationProvider: "paystack",
+  }
+}
+
+async function resolveMonnifyBankAccountName({ bankCode, accountNumber }) {
   if (!isMonnifyConfigured()) {
     throw new Error("Monnify account validation is not configured yet.")
   }
@@ -3538,6 +3631,56 @@ async function resolveBankAccountName({ bankCode, accountNumber }) {
     accountName,
     accountNumber: String(responseBody.accountNumber || accountNumber).trim(),
     bankCode: String(responseBody.bankCode || bankCode).trim(),
+    verificationProvider: "monnify",
+  }
+}
+
+async function resolveBankAccountName({ bankCode, accountNumber }) {
+  return getPayoutBankProvider() === "paystack"
+    ? resolvePaystackBankAccountName({ bankCode, accountNumber })
+    : resolveMonnifyBankAccountName({ bankCode, accountNumber })
+}
+
+function normalizeBankNameForMatch(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\b(bank|plc|limited|ltd|microfinance|mfb|nigeria|ng)\b/g, "")
+    .replace(/[^a-z0-9]+/g, "")
+    .trim()
+}
+
+async function resolvePaystackBankCodeForPayout(payout) {
+  const accountNumber = String(payout?.accountNumber || "").trim()
+  const currentBankCode = String(payout?.bankCode || "").trim()
+
+  if (!accountNumber || !currentBankCode) {
+    throw new Error("Payout bank code and account number are required before sending with Paystack.")
+  }
+
+  try {
+    await resolvePaystackBankAccountName({ bankCode: currentBankCode, accountNumber })
+    return currentBankCode
+  } catch (originalError) {
+    const bankNameKey = normalizeBankNameForMatch(payout?.bankName)
+    if (!bankNameKey) {
+      throw originalError
+    }
+
+    const paystackBanks = await getPaystackSupportedBanks()
+    const matchedBank = paystackBanks.find((bank) => normalizeBankNameForMatch(bank.name) === bankNameKey)
+    const matchedBankCode = String(matchedBank?.code || "").trim()
+
+    if (!matchedBankCode || matchedBankCode === currentBankCode) {
+      throw originalError
+    }
+
+    await resolvePaystackBankAccountName({ bankCode: matchedBankCode, accountNumber })
+    payout.bankCode = matchedBankCode
+    payout.bankName = payout.bankName || matchedBank.name
+    payout.providerMessage = `Updated bank code to Paystack code ${matchedBankCode} for ${matchedBank.name}.`
+    await payout.save()
+
+    return matchedBankCode
   }
 }
 
@@ -3779,6 +3922,15 @@ function createTransferReference(prefix = "STIP-PAYOUT") {
   return `${prefix}-${Date.now()}-${Math.round(Math.random() * 1_000_000)}`
 }
 
+function createPaystackTransferReference() {
+  return `stip_payout_${Date.now()}_${Math.round(Math.random() * 1_000_000)}`
+}
+
+function isValidPaystackTransferReference(value) {
+  const reference = String(value || "")
+  return /^[a-z0-9_-]{16,50}$/.test(reference)
+}
+
 function formatNotificationCurrency(value) {
   return `NGN ${Number(value || 0).toLocaleString("en-NG")}`
 }
@@ -3947,6 +4099,43 @@ function normalizeMonnifyTransferStatus(status) {
   return "processing"
 }
 
+function normalizePaystackTransferStatus(status) {
+  const normalized = String(status || "").toLowerCase()
+
+  if (["success", "successful", "completed"].includes(normalized)) {
+    return "success"
+  }
+
+  if (["otp"].includes(normalized)) {
+    return "otp_required"
+  }
+
+  if (["failed", "reversed", "rejected", "blocked", "abandoned"].includes(normalized)) {
+    return "failed"
+  }
+
+  return "processing"
+}
+
+function getPaystackTransferData(response = {}) {
+  return response?.data && typeof response.data === "object" ? response.data : response
+}
+
+function getPaystackTransferStatus(payload = {}) {
+  const data = getPaystackTransferData(payload)
+  return String(data.status || payload.status || "").trim()
+}
+
+function getPaystackTransferCode(payload = {}) {
+  const data = getPaystackTransferData(payload)
+  return String(data.transfer_code || payload.transfer_code || "").trim()
+}
+
+function getPaystackTransferReference(payload = {}) {
+  const data = getPaystackTransferData(payload)
+  return String(data.reference || payload.reference || "").trim()
+}
+
 function extractMonnifyDisbursementReference(eventData = {}, data = {}) {
   return String(
     eventData.reference ||
@@ -3994,29 +4183,54 @@ async function getMonnifyDisbursementSummary(reference) {
 }
 
 async function updatePayoutFromProviderStatus(payout, providerPayload = {}, actorType = "system") {
-  const providerStatus = extractMonnifyDisbursementStatus(providerPayload, providerPayload)
-  const normalizedStatus = normalizeMonnifyTransferStatus(providerStatus)
-  const providerStatusExpired = isExpiredMonnifyTransferStatus(providerStatus)
+  const provider = getPayoutProvider(payout)
+  const providerStatus =
+    provider === "paystack"
+      ? getPaystackTransferStatus(providerPayload)
+      : extractMonnifyDisbursementStatus(providerPayload, providerPayload)
+  const normalizedStatus =
+    provider === "paystack"
+      ? normalizePaystackTransferStatus(providerStatus)
+      : normalizeMonnifyTransferStatus(providerStatus)
+  const providerStatusExpired = provider === "monnify" && isExpiredMonnifyTransferStatus(providerStatus)
+  const paystackTransferCode = provider === "paystack" ? getPaystackTransferCode(providerPayload) : ""
+  const paystackReference = provider === "paystack" ? getPaystackTransferReference(providerPayload) : ""
 
   payout.status = normalizedStatus
-  payout.providerReference =
-    String(
-      providerPayload.transactionReference ||
-        providerPayload.paymentReference ||
-        providerPayload.reference ||
-        payout.providerReference ||
-        payout.transferReference,
-    ).trim() || payout.transferReference
-  payout.providerMessage = providerStatusExpired
-    ? `Monnify status: ${providerStatus}. Transfer authorization expired; retry transfer or cancel and return balance.`
-    : String(
-        providerPayload.message ||
-          providerPayload.responseMessage ||
-          providerPayload.narration ||
-          providerStatus ||
-          payout.providerMessage ||
-          "",
-      ).trim()
+  payout.provider = provider
+
+  if (provider === "paystack") {
+    payout.transferReference = paystackReference || payout.transferReference
+    payout.paystackTransferCode = paystackTransferCode || payout.paystackTransferCode
+    payout.providerReference = paystackTransferCode || payout.providerReference || payout.transferReference
+    payout.providerMessage = String(
+      providerPayload.message ||
+        getPaystackTransferData(providerPayload).reason ||
+        providerStatus ||
+        payout.providerMessage ||
+        "",
+    ).trim()
+  } else {
+    payout.providerReference =
+      String(
+        providerPayload.transactionReference ||
+          providerPayload.paymentReference ||
+          providerPayload.reference ||
+          payout.providerReference ||
+          payout.transferReference,
+      ).trim() || payout.transferReference
+    payout.providerMessage = providerStatusExpired
+      ? `Monnify status: ${providerStatus}. Transfer authorization expired; retry transfer or cancel and return balance.`
+      : String(
+          providerPayload.message ||
+            providerPayload.responseMessage ||
+            providerPayload.narration ||
+            providerStatus ||
+            payout.providerMessage ||
+            "",
+        ).trim()
+  }
+  payout.providerPayload = providerPayload
 
   if (normalizedStatus === "processing" && hasPendingMonnifyAuthorizationMessage(payout.providerMessage)) {
     payout.status = "otp_required"
@@ -4030,14 +4244,19 @@ async function updatePayoutFromProviderStatus(payout, providerPayload = {}, acto
 
   await payout.save()
 
+  if (["failed", "rejected", "cancelled"].includes(payout.status)) {
+    await syncCreatorWalletFromLedger(payout.creatorId)
+  }
+
   io.to(getCreatorRoom(payout.creatorId)).emit("newPayout", payout)
 
   await createAuditLog({
     actorType,
     eventType: "payout.status_synced",
-    message: `Payout ${payout.transferReference} synced as ${normalizedStatus}.`,
+    message: `Payout ${payout.transferReference} synced from ${provider} as ${normalizedStatus}.`,
     metadata: {
       payoutId: payout._id.toString(),
+      provider,
       transferReference: payout.transferReference,
       providerStatus,
       providerReference: payout.providerReference || "",
@@ -4048,7 +4267,7 @@ async function updatePayoutFromProviderStatus(payout, providerPayload = {}, acto
 }
 
 async function reconcilePendingPayouts() {
-  if (!isDatabaseConnected() || !isMonnifyConfigured()) {
+  if (!isDatabaseConnected() || (!isMonnifyConfigured() && !isPaystackConfigured())) {
     return { checked: 0, updated: 0 }
   }
 
@@ -4069,7 +4288,18 @@ async function reconcilePendingPayouts() {
 
   for (const payout of pendingPayouts) {
     try {
-      const summary = await getMonnifyDisbursementSummary(payout.transferReference)
+      const provider = getPayoutProvider(payout)
+      if (provider === "paystack" && !isPaystackConfigured()) {
+        continue
+      }
+      if (provider === "monnify" && !isMonnifyConfigured()) {
+        continue
+      }
+
+      const summary =
+        provider === "paystack"
+          ? await paystack.verifyTransfer(payout.transferReference)
+          : await getMonnifyDisbursementSummary(payout.transferReference)
       const beforeStatus = payout.status
       await updatePayoutFromProviderStatus(payout, summary, "system")
       if (payout.status !== beforeStatus) {
@@ -4163,8 +4393,9 @@ async function cancelPayoutAndReturnBalance({
 
 async function retryPayoutWithNewTransferReference({ payout, creator, actorId }) {
   if (!canRetryMonnifyPayout(payout)) {
-    throw new Error("This payout is not eligible for a Monnify retry.")
+    throw new Error("This payout is not eligible for a transfer retry.")
   }
+  const provider = getPayoutProvider(payout)
 
   if (payout.status === "failed") {
     const totals = await getRevenueTotals({ creatorId: payout.creatorId })
@@ -4179,17 +4410,20 @@ async function retryPayoutWithNewTransferReference({ payout, creator, actorId })
 
   const previousTransferReference = String(payout.transferReference || "").trim()
   const previousProviderReference = String(payout.providerReference || "").trim()
-  const nextTransferReference = createTransferReference()
+  const nextTransferReference = provider === "paystack" ? createPaystackTransferReference() : createTransferReference()
   const previousReferences = Array.isArray(payout.previousTransferReferences)
     ? payout.previousTransferReferences
     : []
 
   payout.status = "pending"
+  payout.provider = provider
   payout.transferReference = nextTransferReference
   payout.providerReference = nextTransferReference
+  payout.paystackTransferCode = ""
+  payout.transferRecipientCode = ""
   payout.providerMessage = previousTransferReference
-    ? `Retrying Monnify transfer after expired authorization. Previous transfer ref: ${previousTransferReference}.`
-    : "Retrying Monnify transfer after expired authorization."
+    ? `Retrying ${provider} transfer. Previous transfer ref: ${previousTransferReference}.`
+    : `Retrying ${provider} transfer.`
   payout.rejectionReason = ""
   payout.completedAt = undefined
   payout.previousTransferReferences = Array.from(
@@ -4198,15 +4432,16 @@ async function retryPayoutWithNewTransferReference({ payout, creator, actorId })
   payout.retryCount = (Number(payout.retryCount) || 0) + 1
   await payout.save()
 
-  const sentPayout = await sendPayoutToMonnify(payout, creator, "admin", actorId)
+  const sentPayout = await sendPayoutToProvider(payout, creator, "admin", actorId)
 
   await createAuditLog({
     actorType: "admin",
     actorId,
     eventType: "portal.settlement.retried",
-    message: `Admin retried payout ${previousTransferReference || payout._id} with a new Monnify reference.`,
+    message: `Admin retried payout ${previousTransferReference || payout._id} with a new ${provider} reference.`,
     metadata: {
       payoutId: payout._id.toString(),
+      provider,
       creatorId: creator._id.toString(),
       amount: payout.amount,
       previousTransferReference,
@@ -4552,7 +4787,7 @@ async function buildVerifiedPayoutProfile({
     verifiedAt: new Date(),
     lockedAt: new Date(),
     changeRequiresSupport: true,
-    verificationProvider: "monnify",
+    verificationProvider: resolvedAccount.verificationProvider || getPayoutBankProvider(),
   }
 }
 
@@ -4571,9 +4806,11 @@ async function sendPayoutToMonnify(payout, creator, actorType = "system", actorI
   } catch (error) {
     const message = getAxiosErrorMessage(error, "Failed to initiate payout with Monnify.")
     payout.status = "failed"
+    payout.provider = "monnify"
     payout.providerMessage = message
     payout.completedAt = new Date()
     await payout.save()
+    await syncCreatorWalletFromLedger(payout.creatorId)
 
     await createAuditLog({
       actorType,
@@ -4601,6 +4838,7 @@ async function sendPayoutToMonnify(payout, creator, actorType = "system", actorI
     ""
   const payoutStatus = normalizeMonnifyTransferStatus(providerStatus)
 
+  payout.provider = "monnify"
   payout.status = payoutStatus
   payout.providerReference =
     String(
@@ -4641,6 +4879,132 @@ async function sendPayoutToMonnify(payout, creator, actorType = "system", actorI
   })
 
   return payout
+}
+
+async function sendPayoutToPaystack(payout, creator, actorType = "system", actorId = "") {
+  if (!isPaystackConfigured()) {
+    throw new Error("Paystack transfers are not configured yet. Add PAYSTACK_SECRET_KEY to Backend/.env.")
+  }
+
+  const previousTransferReference = String(payout.transferReference || "").trim()
+  if (!isValidPaystackTransferReference(previousTransferReference)) {
+    const previousReferences = Array.isArray(payout.previousTransferReferences)
+      ? payout.previousTransferReferences
+      : []
+    payout.previousTransferReferences = Array.from(
+      new Set([...previousReferences, previousTransferReference].filter(Boolean)),
+    ).slice(-10)
+    payout.transferReference = createPaystackTransferReference()
+  }
+
+  payout.provider = "paystack"
+  payout.providerReference = payout.transferReference
+  payout.providerMessage = "Creating Paystack transfer recipient."
+  await payout.save()
+
+  let recipientResponse
+  let transferResponse
+
+  try {
+    const bankCode = await resolvePaystackBankCodeForPayout(payout)
+
+    recipientResponse = await paystack.createTransferRecipient({
+      type: "nuban",
+      name: payout.accountName || creator.name || creator.email,
+      account_number: String(payout.accountNumber || "").trim(),
+      bank_code: bankCode,
+      currency: "NGN",
+      metadata: {
+        creatorId: creator._id.toString(),
+        creatorEmail: creator.email,
+        payoutId: payout._id.toString(),
+      },
+    })
+
+    const recipient = recipientResponse?.data || {}
+    const recipientCode = String(recipient.recipient_code || "").trim()
+    if (!recipientCode) {
+      throw new Error("Paystack did not return a transfer recipient code.")
+    }
+
+    payout.transferRecipientCode = recipientCode
+    payout.providerMessage = "Paystack transfer recipient created. Initiating transfer."
+    payout.providerPayload = { recipient: recipientResponse }
+    await payout.save()
+
+    transferResponse = await paystack.initiateTransfer({
+      source: "balance",
+      amount: Math.round((Number(payout.amount) || 0) * 100),
+      recipient: recipientCode,
+      reference: payout.transferReference,
+      reason: `StreamTip creator payout for ${creator.name || creator.email}`,
+      currency: "NGN",
+    })
+  } catch (error) {
+    const message = getAxiosErrorMessage(error, "Failed to initiate payout with Paystack.")
+    payout.status = "failed"
+    payout.provider = "paystack"
+    payout.providerMessage = message
+    payout.providerPayload = {
+      recipient: recipientResponse,
+      transfer: transferResponse,
+      error: getAxiosErrorDetails(error),
+    }
+    payout.completedAt = new Date()
+    await payout.save()
+    await syncCreatorWalletFromLedger(payout.creatorId)
+
+    await createAuditLog({
+      actorType,
+      actorId,
+      eventType: "payout.failed",
+      message: `Paystack payout failed for ${payout.bankName}.`,
+      metadata: {
+        ...getAxiosErrorDetails(error),
+        payoutId: payout._id.toString(),
+        amount: payout.amount,
+        creatorId: creator._id.toString(),
+        transferReference: payout.transferReference,
+        error: message,
+      },
+    })
+
+    io.to(getCreatorRoom(creator._id)).emit("newPayout", payout)
+    throw new Error(message)
+  }
+
+  await updatePayoutFromProviderStatus(
+    payout,
+    {
+      ...(transferResponse || {}),
+      message: transferResponse?.message || "",
+    },
+    actorType,
+  )
+
+  await createAuditLog({
+    actorType,
+    actorId,
+    eventType: "payout.sent_to_paystack",
+    message: `Payout sent to Paystack for ${payout.bankName}.`,
+    metadata: {
+      payoutId: payout._id.toString(),
+      amount: payout.amount,
+      creatorId: creator._id.toString(),
+      transferReference: payout.transferReference,
+      providerReference: payout.providerReference || "",
+      paystackTransferCode: payout.paystackTransferCode || "",
+      providerStatus: payout.status,
+    },
+  })
+
+  return payout
+}
+
+async function sendPayoutToProvider(payout, creator, actorType = "system", actorId = "") {
+  return getPayoutProvider(payout) === "paystack"
+    ? sendPayoutToPaystack(payout, creator, actorType, actorId)
+    : sendPayoutToMonnify(payout, creator, actorType, actorId)
 }
 
 function groupTransactionsByPeriod(withdrawals) {
@@ -5677,6 +6041,54 @@ app.post("/api/webhooks/paystack", async (req, res) => {
     const eventType = String(payload.event || payload.eventType || "paystack.webhook")
     const eventData = getPaystackEventData(payload)
 
+    if (eventType.startsWith("transfer.")) {
+      const transferCode = getPaystackTransferCode(eventData)
+      const transferReference = getPaystackTransferReference(eventData)
+      const transferId = String(eventData.id || "").trim()
+      const transferStatus = String(eventData.status || eventType.replace(/^transfer\./, "")).trim()
+      const searchTerms = [transferReference, transferCode, transferId].filter(Boolean)
+
+      const payout = searchTerms.length
+        ? await Payout.findOne({
+            provider: "paystack",
+            $or: [
+              { transferReference: { $in: searchTerms } },
+              { providerReference: { $in: searchTerms } },
+              { paystackTransferCode: { $in: searchTerms } },
+            ],
+          })
+        : null
+
+      if (!payout) {
+        await createAuditLog({
+          actorType: "system",
+          eventType: "webhook.paystack.transfer_unmatched",
+          message: `Paystack transfer webhook ${eventType} could not be matched to a payout.`,
+          metadata: {
+            eventType,
+            transferReference,
+            transferCode,
+            transferId,
+          },
+        })
+        return res.sendStatus(200)
+      }
+
+      await updatePayoutFromProviderStatus(
+        payout,
+        {
+          data: {
+            ...eventData,
+            status: transferStatus,
+          },
+          message: payload.message || eventType,
+        },
+        "system",
+      )
+
+      return res.sendStatus(200)
+    }
+
     if (eventType !== "charge.success" && eventType !== "dedicatedaccount.assign.success") {
       await createAuditLog({
         actorType: "system",
@@ -6560,7 +6972,8 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
       })
     }
 
-    const transferReference = createTransferReference()
+    const transferReference =
+      PAYOUT_TRANSFER_PROVIDER === "paystack" ? createPaystackTransferReference() : createTransferReference()
     const requiresReviewReasons = ["portal_review_required"]
     const recentWithdrawalWindow = new Date(Date.now() - 24 * 60 * 60 * 1000)
     const recentWithdrawals = await Payout.find({
@@ -6589,6 +7002,7 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
       bankCode: payoutProfile.bankCode,
       accountNumber: payoutProfile.accountNumber,
       accountName: payoutProfile.accountName,
+      provider: PAYOUT_TRANSFER_PROVIDER,
       status: "pending_admin_approval",
       reviewStatus: "awaiting_review",
       reviewReason: requiresReviewReasons.join(","),
@@ -7404,6 +7818,7 @@ app.get("/portal/settlements/report", requireAdminSession, async (req, res) => {
       "Creator Last Name",
       "Creator Email",
       "Amount",
+      "Provider",
       "Status",
       "Review Status",
       "Review Reason",
@@ -7434,6 +7849,7 @@ app.get("/portal/settlements/report", requireAdminSession, async (req, res) => {
         creator.lastName || "",
         creator.email || "",
         item.amount || 0,
+        item.provider || "",
         item.status || "",
         item.reviewStatus || "",
         item.reviewReason || "",
@@ -7483,12 +7899,13 @@ app.post("/portal/settlements/:id/approve", requireAdminSession, async (req, res
 
     payout.reviewStatus = "approved"
     payout.status = "approved"
+    payout.provider = getPayoutProvider(payout)
     payout.reviewedBy = req.adminSession._id.toString()
     payout.reviewedAt = new Date()
     payout.providerMessage = "Approved in StreamTip portal. Sending for transfer processing."
     await payout.save()
 
-    const sentPayout = await sendPayoutToMonnify(
+    const sentPayout = await sendPayoutToProvider(
       payout,
       creator,
       "admin",
@@ -7524,29 +7941,37 @@ app.post("/portal/settlements/:id/authorize", requireAdminSession, async (req, r
       return res.status(404).json({ error: "Payout not found." })
     }
 
-    if (!payoutRequiresMonnifyAuthorization(payout)) {
-      return res.status(409).json({ error: "This payout is not pending Monnify authorization." })
+    if (!payoutRequiresTransferAuthorization(payout)) {
+      return res.status(409).json({ error: "This payout is not pending transfer authorization." })
     }
 
     const authorizationCode = String(req.body?.authorizationCode || "").trim()
 
     if (!authorizationCode) {
-      return res.status(400).json({ error: "Enter the Monnify OTP for this transfer." })
+      return res.status(400).json({ error: "Enter the transfer OTP." })
     }
 
-    const authorization = await authorizeMonnifySingleDisbursement({
-      reference: payout.transferReference,
-      authorizationCode,
-    })
+    const provider = getPayoutProvider(payout)
+    const authorization =
+      provider === "paystack"
+        ? await paystack.finalizeTransfer({
+            transferCode: payout.paystackTransferCode || payout.providerReference,
+            otp: authorizationCode,
+          })
+        : await authorizeMonnifySingleDisbursement({
+            reference: payout.transferReference,
+            authorizationCode,
+          })
     const updatedPayout = await updatePayoutFromProviderStatus(payout, authorization, "admin")
 
     await createAuditLog({
       actorType: "admin",
       actorId: req.adminSession._id.toString(),
       eventType: "portal.settlement.authorized",
-      message: `Admin authorized payout ${payout.transferReference} with Monnify OTP.`,
+      message: `Admin authorized payout ${payout.transferReference} with ${provider} OTP.`,
       metadata: {
         payoutId: payout._id.toString(),
+        provider,
         transferReference: payout.transferReference,
         providerStatus: authorization.status || authorization.paymentStatus || "",
       },
@@ -7556,7 +7981,7 @@ app.post("/portal/settlements/:id/authorize", requireAdminSession, async (req, r
   } catch (error) {
     console.error(error)
     res.status(502).json({
-      error: error instanceof Error ? error.message : "Could not authorize Monnify payout.",
+      error: error instanceof Error ? error.message : "Could not authorize payout.",
     })
   }
 })
@@ -7569,22 +7994,29 @@ app.post("/portal/settlements/:id/resend-otp", requireAdminSession, async (req, 
       return res.status(404).json({ error: "Payout not found." })
     }
 
-    if (!payoutRequiresMonnifyAuthorization(payout)) {
-      return res.status(409).json({ error: "This payout is not pending Monnify authorization." })
+    if (!payoutRequiresTransferAuthorization(payout)) {
+      return res.status(409).json({ error: "This payout is not pending transfer authorization." })
     }
 
-    const result = await resendMonnifySingleDisbursementOtp(payout.transferReference)
+    const provider = getPayoutProvider(payout)
+    const result =
+      provider === "paystack"
+        ? await paystack.resendTransferOtp({
+            transferCode: payout.paystackTransferCode || payout.providerReference,
+          })
+        : await resendMonnifySingleDisbursementOtp(payout.transferReference)
     payout.status = "otp_resent"
-    payout.providerMessage = result.responseMessage || "Monnify OTP resent."
+    payout.providerMessage = result.responseMessage || result.message || `${provider} OTP resent.`
     await payout.save()
 
     await createAuditLog({
       actorType: "admin",
       actorId: req.adminSession._id.toString(),
       eventType: "portal.settlement.otp_resent",
-      message: `Admin requested a new Monnify OTP for payout ${payout.transferReference}.`,
+      message: `Admin requested a new ${provider} OTP for payout ${payout.transferReference}.`,
       metadata: {
         payoutId: payout._id.toString(),
+        provider,
         transferReference: payout.transferReference,
       },
     })
@@ -7593,7 +8025,7 @@ app.post("/portal/settlements/:id/resend-otp", requireAdminSession, async (req, 
   } catch (error) {
     console.error(error)
     res.status(502).json({
-      error: error instanceof Error ? error.message : "Could not resend Monnify OTP.",
+      error: error instanceof Error ? error.message : "Could not resend transfer OTP.",
     })
   }
 })
@@ -7608,7 +8040,7 @@ app.post("/portal/settlements/:id/retry", requireAdminSession, async (req, res) 
 
     if (!canRetryMonnifyPayout(payout)) {
       return res.status(409).json({
-        error: "This payout cannot be retried. Only approved Monnify authorization failures can be retried.",
+        error: "This payout cannot be retried. Only approved transfer authorization failures can be retried.",
       })
     }
 
@@ -7628,7 +8060,7 @@ app.post("/portal/settlements/:id/retry", requireAdminSession, async (req, res) 
   } catch (error) {
     console.error(error)
     res.status(502).json({
-      error: error instanceof Error ? error.message : "Could not retry Monnify payout.",
+      error: error instanceof Error ? error.message : "Could not retry payout.",
     })
   }
 })
@@ -8067,9 +8499,9 @@ app.post("/portal/payouts/:id/fail", requireAdminSession, async (req, res) => {
       return res.status(409).json({ error: "Only pending, review, or failed payouts can be marked failed." })
     }
 
-    if (payoutRequiresMonnifyAuthorization(payout) && req.body?.confirmRelease !== true) {
+    if (payoutRequiresTransferAuthorization(payout) && req.body?.confirmRelease !== true) {
       return res.status(400).json({
-        error: "This payout is waiting for Monnify OTP. Retry the transfer, or explicitly confirm balance release.",
+        error: "This payout is waiting for transfer OTP. Retry the transfer, or explicitly confirm balance release.",
       })
     }
 
@@ -8101,9 +8533,9 @@ app.post("/portal/payouts/:id/cancel", requireAdminSession, async (req, res) => 
       return res.status(409).json({ error: "Only pending, review, or failed payouts can be cancelled." })
     }
 
-    if (payoutRequiresMonnifyAuthorization(payout) && req.body?.confirmCancel !== true) {
+    if (payoutRequiresTransferAuthorization(payout) && req.body?.confirmCancel !== true) {
       return res.status(400).json({
-        error: "This payout is waiting for Monnify OTP. Retry the transfer, or explicitly confirm cancellation.",
+        error: "This payout is waiting for transfer OTP. Retry the transfer, or explicitly confirm cancellation.",
       })
     }
 
