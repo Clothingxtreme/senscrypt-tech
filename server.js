@@ -1943,7 +1943,7 @@ function canRetryMonnifyPayout(payout) {
     return payoutRequiresMonnifyAuthorization(payout)
   }
 
-  if (["failed", "cancelled"].includes(payout.status)) {
+  if (payout.status === "failed") {
     return payout.reviewStatus === "approved" && hasRetryableMonnifyMessage(payout.providerMessage)
   }
 
@@ -2267,7 +2267,7 @@ async function buildPortalSettlementQueueFilter(query = {}) {
         providerMessage: MONNIFY_AUTHORIZATION_MESSAGE_REGEX,
       },
       {
-        status: { $in: ["failed", "cancelled"] },
+        status: "failed",
         reviewStatus: "approved",
         providerMessage: MONNIFY_RETRYABLE_MESSAGE_REGEX,
       },
@@ -4106,6 +4106,7 @@ async function failPayoutAndReleaseBalance({
   payout.providerMessage = reason
   payout.completedAt = new Date()
   await payout.save()
+  await syncCreatorWalletFromLedger(payout.creatorId)
 
   io.to(getCreatorRoom(payout.creatorId)).emit("newPayout", payout)
 
@@ -4129,21 +4130,17 @@ async function failPayoutAndReleaseBalance({
 async function cancelPayoutAndReturnBalance({
   payout,
   actorId,
-  reason = "Cancelled after provider expiry. Creator balance returned to dashboard.",
+  reason = "Cancelled and returned to creator dashboard balance. Original transfer will not be retried.",
 }) {
   payout.status = "cancelled"
-  payout.reviewStatus = payout.reviewStatus === "awaiting_review" ? "rejected" : payout.reviewStatus
+  payout.reviewStatus = "cancelled"
   payout.reviewedBy = actorId
   payout.reviewedAt = new Date()
   payout.rejectionReason = reason
   payout.providerMessage = reason
   payout.completedAt = new Date()
   await payout.save()
-
-  await User.updateOne(
-    { _id: payout.creatorId },
-    { $set: { "wallet.updatedAt": new Date() } },
-  )
+  await syncCreatorWalletFromLedger(payout.creatorId)
 
   io.to(getCreatorRoom(payout.creatorId)).emit("newPayout", payout)
 
@@ -4169,7 +4166,7 @@ async function retryPayoutWithNewTransferReference({ payout, creator, actorId })
     throw new Error("This payout is not eligible for a Monnify retry.")
   }
 
-  if (["failed", "cancelled"].includes(payout.status)) {
+  if (payout.status === "failed") {
     const totals = await getRevenueTotals({ creatorId: payout.creatorId })
     const availableBalance = Number(totals.creatorAvailableBalance) || 0
 
@@ -4388,6 +4385,17 @@ async function getRevenueTotals({ creatorId } = {}) {
 
     return sum + (Number(donation.amount) || 0)
   }, 0)
+  const pendingCreatorRevenue = donations.reduce((sum, donation) => {
+    if ((donation.walletStatus || "available") !== "pending_review") {
+      return sum
+    }
+
+    if (typeof donation.creatorShare === "number") {
+      return sum + donation.creatorShare
+    }
+
+    return sum + calculateRevenueSplit(donation.amount).creatorShare
+  }, 0)
   const platformRevenue = donations.reduce((sum, donation) => {
     if ((donation.walletStatus || "available") !== "available") {
       return sum
@@ -4420,11 +4428,39 @@ async function getRevenueTotals({ creatorId } = {}) {
     grossRevenue,
     platformRevenue,
     creatorRevenue,
+    pendingCreatorRevenue,
     totalPaidOut,
     totalPlatformWithdrawn,
     creatorAvailableBalance: Math.max(0, creatorRevenue - totalPaidOut),
     pendingPlatformRevenue: Math.max(0, platformRevenue - totalPlatformWithdrawn),
   }
+}
+
+function roundWalletAmount(value) {
+  return Math.round((Number(value) || 0) * 100) / 100
+}
+
+async function syncCreatorWalletFromLedger(userOrId) {
+  const user =
+    userOrId && typeof userOrId === "object" && userOrId._id
+      ? userOrId
+      : await User.findById(userOrId)
+
+  if (!user) {
+    return null
+  }
+
+  const totals = await getRevenueTotals({ creatorId: user._id })
+  user.wallet = {
+    ...(user.wallet?.toObject?.() || user.wallet || {}),
+    availableBalance: roundWalletAmount(totals.creatorRevenue),
+    pendingBalance: roundWalletAmount(totals.pendingCreatorRevenue),
+    totalReceived: roundWalletAmount(totals.grossRevenue),
+    updatedAt: new Date(),
+  }
+  await user.save()
+
+  return { user, totals }
 }
 
 async function hasSuccessfulWithdrawal(creatorId) {
@@ -8054,7 +8090,7 @@ app.post("/portal/payouts/:id/cancel", requireAdminSession, async (req, res) => 
 
     const reason =
       String(req.body?.reason || "").trim() ||
-      "Monnify transfer expired or was abandoned. Cancelled and returned to creator dashboard balance."
+      "Cancelled and returned to creator dashboard balance. Original transfer will not be retried."
     const updatedPayout = await cancelPayoutAndReturnBalance({
       payout,
       actorId: req.adminSession._id.toString(),
