@@ -307,6 +307,20 @@ const defaultOverlaySettings = {
   preview: false,
 }
 
+const legacyDefaultOverlayGradients = {
+  goalGradient: { start: "#22d3ee", middle: "#8b5cf6", end: "#ec4899" },
+  leaderboardGradient: { start: "#818cf8", middle: "#22d3ee", end: "#f472b6" },
+  accountGradient: { start: "#1d4ed8", middle: "#0f766e", end: "#22c55e" },
+  alertGradient: { start: "#f472b6", middle: "#8b5cf6", end: "#38bdf8" },
+}
+
+const paystackOverlayGradients = {
+  goalGradient: { start: "#011B33", middle: "#00C3F7", end: "#3BB75E" },
+  leaderboardGradient: { start: "#011B33", middle: "#00AEEF", end: "#F5A623" },
+  accountGradient: { start: "#011B33", middle: "#00C3F7", end: "#0B3558" },
+  alertGradient: { start: "#00C3F7", middle: "#011B33", end: "#3BB75E" },
+}
+
 const defaultOverlayCustomization = {
   giftPack: "tiktok",
   goalAmount: 250000,
@@ -324,10 +338,10 @@ const defaultOverlayCustomization = {
   goalPosition: { anchor: "top-center", offsetX: 0, offsetY: 0 },
   leaderboardPosition: { anchor: "top-right", offsetX: 0, offsetY: 0 },
   accountPosition: { anchor: "bottom-left", offsetX: 0, offsetY: 0 },
-  goalGradient: { start: "#22d3ee", middle: "#8b5cf6", end: "#ec4899" },
-  leaderboardGradient: { start: "#818cf8", middle: "#22d3ee", end: "#f472b6" },
-  accountGradient: { start: "#1d4ed8", middle: "#0f766e", end: "#22c55e" },
-  alertGradient: { start: "#f472b6", middle: "#8b5cf6", end: "#38bdf8" },
+  goalGradient: paystackOverlayGradients.goalGradient,
+  leaderboardGradient: paystackOverlayGradients.leaderboardGradient,
+  accountGradient: paystackOverlayGradients.accountGradient,
+  alertGradient: paystackOverlayGradients.alertGradient,
 }
 
 const defaultCustomGifts = [
@@ -1040,6 +1054,21 @@ function tokenizeName(value) {
     .filter(Boolean)
 }
 
+function getNameTokenMatches(tokens) {
+  const matches = new Set(tokens)
+
+  for (let start = 0; start < tokens.length; start += 1) {
+    let combined = ""
+
+    for (let index = start; index < Math.min(tokens.length, start + 4); index += 1) {
+      combined += tokens[index]
+      matches.add(combined)
+    }
+  }
+
+  return matches
+}
+
 function validateLegalNameParts({ firstName, middleName, lastName }) {
   const first = String(firstName || "").trim()
   const middle = String(middleName || "").trim()
@@ -1072,9 +1101,10 @@ function validatePayoutAccountNameMatch({
     lastName: resolvePayoutNamePart(lastName, last),
   })
   const accountTokens = tokenizeName(accountName)
+  const accountTokenMatches = getNameTokenMatches(accountTokens)
   const missing = [legal.first, legal.middle, legal.last]
     .map((part) => ({ original: part, normalized: normalizeNameToken(part) }))
-    .filter((part) => part.normalized && !accountTokens.includes(part.normalized))
+    .filter((part) => part.normalized && !accountTokenMatches.has(part.normalized))
 
   if (missing.length > 0) {
     throw new Error(
@@ -1108,12 +1138,44 @@ function sanitizePlainObject(value, fallback) {
   }
 }
 
+function overlayGradientsMatch(left = {}, right = {}) {
+  return ["start", "middle", "end"].every(
+    (key) => String(left?.[key] || "").toLowerCase() === String(right?.[key] || "").toLowerCase(),
+  )
+}
+
+function migrateLegacyOverlayGradient(value, key) {
+  const fallback = defaultOverlayCustomization[key]
+  const legacyFallback = legacyDefaultOverlayGradients[key]
+
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return fallback
+  }
+
+  return overlayGradientsMatch(value, legacyFallback) ? fallback : value
+}
+
+function sanitizeOverlayCustomizationForServer(value) {
+  const customization = sanitizePlainObject(value, defaultOverlayCustomization)
+
+  return {
+    ...customization,
+    goalGradient: migrateLegacyOverlayGradient(customization.goalGradient, "goalGradient"),
+    leaderboardGradient: migrateLegacyOverlayGradient(
+      customization.leaderboardGradient,
+      "leaderboardGradient",
+    ),
+    accountGradient: migrateLegacyOverlayGradient(customization.accountGradient, "accountGradient"),
+    alertGradient: migrateLegacyOverlayGradient(customization.alertGradient, "alertGradient"),
+  }
+}
+
 function getOverlayStateForUser(user) {
   const overlayState = user?.overlayState || {}
 
   return {
     settings: sanitizePlainObject(overlayState.settings, defaultOverlaySettings),
-    customization: sanitizePlainObject(overlayState.customization, defaultOverlayCustomization),
+    customization: sanitizeOverlayCustomizationForServer(overlayState.customization),
     customGifts: Array.isArray(overlayState.customGifts) && overlayState.customGifts.length
       ? overlayState.customGifts
       : defaultCustomGifts,
@@ -3216,6 +3278,89 @@ async function provisionVirtualAccountForUser(user) {
   return createPaystackDedicatedAccountForUser(user)
 }
 
+function normalizeDateOnly(value) {
+  const date = String(value || "").trim()
+  return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : ""
+}
+
+function slugifyPaystackProviderName(value) {
+  return String(value || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+}
+
+function getPaystackProviderSlugForVirtualAccount(virtualAccount = {}) {
+  const savedBankCode = String(virtualAccount.bankCode || "").trim()
+  const preferredBank = String(PAYSTACK_PREFERRED_DVA_BANK || "").trim()
+
+  if (savedBankCode && /^[a-z0-9-]+$/i.test(savedBankCode) && /[a-z]/i.test(savedBankCode)) {
+    return savedBankCode
+  }
+
+  if (preferredBank) {
+    return preferredBank
+  }
+
+  const bankName = String(virtualAccount.bankName || "").toLowerCase()
+  if (bankName.includes("paystack") || bankName.includes("titan")) {
+    return "titan-paystack"
+  }
+
+  return slugifyPaystackProviderName(virtualAccount.bankName)
+}
+
+async function requeryPaystackVirtualAccountForUser(user, date = "", actorType = "user", actorId = "") {
+  if (!isPaystackConfigured()) {
+    throw new Error("Paystack is not configured yet. Add PAYSTACK_SECRET_KEY to Backend/.env.")
+  }
+
+  const virtualAccount = user?.virtualAccount || {}
+  const accountNumber = String(virtualAccount.accountNumber || "").replace(/\D/g, "")
+  const providerSlug = getPaystackProviderSlugForVirtualAccount(virtualAccount)
+  const requeryDate = normalizeDateOnly(date)
+
+  if (virtualAccount.provider !== "paystack") {
+    throw new Error("This creator does not have a Paystack virtual account.")
+  }
+
+  if (accountNumber.length !== 10) {
+    throw new Error("This creator does not have an active Paystack account number to requery.")
+  }
+
+  if (!providerSlug) {
+    throw new Error("Could not determine the Paystack provider slug for this virtual account.")
+  }
+
+  const response = await paystack.requeryDedicatedVirtualAccount({
+    accountNumber,
+    providerSlug,
+    date: requeryDate,
+  })
+
+  await createAuditLog({
+    actorType,
+    actorId,
+    eventType: "paystack.virtual_account.requery_requested",
+    message: `Paystack requery requested for ${user.email}.`,
+    metadata: {
+      creatorId: user._id.toString(),
+      accountNumberLast4: accountNumber.slice(-4),
+      providerSlug,
+      date: requeryDate,
+      responseMessage: response?.message || "",
+    },
+  })
+
+  return {
+    accountNumber,
+    providerSlug,
+    date: requeryDate,
+    response,
+  }
+}
+
 async function getMonnifyAccessToken() {
   const credentials = Buffer.from(`${MONNIFY_API_KEY}:${MONNIFY_SECRET_KEY}`).toString("base64")
 
@@ -5007,18 +5152,30 @@ app.post("/auth/register", async (req, res) => {
       return res.status(409).json({ error: "An account with that email already exists." })
     }
 
-    const payoutProfile = await buildVerifiedPayoutProfile({
-      user: {
-        identity: {
-          firstName: legal.first,
-          middleName: legal.middle,
-          lastName: legal.last,
+    let payoutProfile
+
+    try {
+      payoutProfile = await buildVerifiedPayoutProfile({
+        user: {
+          identity: {
+            firstName: legal.first,
+            middleName: legal.middle,
+            lastName: legal.last,
+          },
         },
-      },
-      bankCode,
-      bankName,
-      accountNumber,
-    })
+        bankCode,
+        bankName,
+        accountNumber,
+      })
+    } catch (error) {
+      console.error("register.payout_profile_verification_failed", error)
+      return res.status(400).json({
+        error:
+          error instanceof Error
+            ? error.message
+            : "Could not verify the payout bank account for this registration.",
+      })
+    }
 
     user = await User.create({
       name: trimmedName,
@@ -5088,7 +5245,12 @@ app.post("/auth/register", async (req, res) => {
     })
   } catch (error) {
     console.error(error)
-    return res.status(500).json({ error: "Failed to register user." })
+    const statusCode = Number(error?.statusCode || 0)
+    const isClientError = statusCode >= 400 && statusCode < 500
+
+    return res.status(isClientError ? statusCode : 500).json({
+      error: isClientError && error instanceof Error ? error.message : "Failed to register user.",
+    })
   }
 })
 
@@ -5338,6 +5500,38 @@ app.post("/users/:id/virtual-account", requireSessionUser, async (req, res) => {
         error instanceof Error
           ? error.message
           : "Could not provision a Paystack dedicated virtual account.",
+    })
+  }
+})
+
+app.post("/users/:id/virtual-account/requery", requireSessionUser, async (req, res) => {
+  try {
+    if (String(req.user._id) !== String(req.params.id)) {
+      return res.status(403).json({ error: "You can only requery your own virtual account." })
+    }
+
+    const result = await requeryPaystackVirtualAccountForUser(
+      req.user,
+      req.body?.date,
+      "user",
+      req.user._id.toString(),
+    )
+
+    return res.json({
+      message:
+        result.response?.message ||
+        "Paystack is checking this virtual account for delayed transfers.",
+      accountNumberLast4: result.accountNumber.slice(-4),
+      providerSlug: result.providerSlug,
+      date: result.date,
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(400).json({
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not requery this Paystack virtual account.",
     })
   }
 })
@@ -6083,7 +6277,9 @@ app.put("/overlay-state", requireSessionUser, async (req, res) => {
       : currentState.customGifts
     const nextState = {
       settings: req.body?.settings ? req.body.settings : currentState.settings,
-      customization: req.body?.customization ? req.body.customization : currentState.customization,
+      customization: req.body?.customization
+        ? sanitizeOverlayCustomizationForServer(req.body.customization)
+        : currentState.customization,
       customGifts: nextCustomGifts,
       leaderboardResetAt:
         typeof req.body?.leaderboardResetAt === "string" && req.body.leaderboardResetAt
@@ -7424,6 +7620,44 @@ app.get("/portal/users/:id", requireAdminSession, async (req, res) => {
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to load portal user details." })
+  }
+})
+
+app.post("/portal/users/:id/paystack-requery", requireAdminSession, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid user ID." })
+    }
+
+    const user = await User.findById(req.params.id)
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found." })
+    }
+
+    const result = await requeryPaystackVirtualAccountForUser(
+      user,
+      req.body?.date,
+      "admin",
+      req.adminSession?._id?.toString?.() || "",
+    )
+
+    res.json({
+      message:
+        result.response?.message ||
+        "Paystack is checking this virtual account for delayed transfers.",
+      accountNumberLast4: result.accountNumber.slice(-4),
+      providerSlug: result.providerSlug,
+      date: result.date,
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(400).json({
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not request a Paystack virtual-account requery.",
+    })
   }
 })
 

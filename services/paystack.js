@@ -85,6 +85,16 @@ function createPaystackService({ secretKey, baseUrl } = {}) {
     async listDedicatedVirtualAccounts(params = {}) {
       return request("get", "/dedicated_account", { params })
     },
+
+    async requeryDedicatedVirtualAccount({ accountNumber, providerSlug, date } = {}) {
+      return request("get", "/dedicated_account/requery", {
+        params: {
+          account_number: accountNumber,
+          provider_slug: providerSlug,
+          ...(date ? { date } : {}),
+        },
+      })
+    },
   }
 }
 
