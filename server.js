@@ -1950,6 +1950,22 @@ function canRetryMonnifyPayout(payout) {
   return false
 }
 
+function canCancelPayoutAndReturnBalance(payout) {
+  if (!payout) {
+    return false
+  }
+
+  return [
+    "pending",
+    "processing",
+    "otp_required",
+    "otp_resent",
+    "pending_admin_approval",
+    "awaiting_review",
+    "failed",
+  ].includes(payout.status)
+}
+
 function sanitizePortalPayout(payout) {
   if (!payout) return null
 
@@ -1976,6 +1992,7 @@ function sanitizePortalPayout(payout) {
     providerMessage: payout.providerMessage || "",
     requiresAuthorization: payoutRequiresMonnifyAuthorization(payout),
     canRetryTransfer: canRetryMonnifyPayout(payout),
+    canCancelAndReturn: canCancelPayoutAndReturnBalance(payout),
     previousTransferReferences: payout.previousTransferReferences || [],
     retryCount: payout.retryCount || 0,
     createdAt: payout.createdAt,
@@ -3979,6 +3996,7 @@ async function getMonnifyDisbursementSummary(reference) {
 async function updatePayoutFromProviderStatus(payout, providerPayload = {}, actorType = "system") {
   const providerStatus = extractMonnifyDisbursementStatus(providerPayload, providerPayload)
   const normalizedStatus = normalizeMonnifyTransferStatus(providerStatus)
+  const providerStatusExpired = isExpiredMonnifyTransferStatus(providerStatus)
 
   payout.status = normalizedStatus
   payout.providerReference =
@@ -3989,14 +4007,16 @@ async function updatePayoutFromProviderStatus(payout, providerPayload = {}, acto
         payout.providerReference ||
         payout.transferReference,
     ).trim() || payout.transferReference
-  payout.providerMessage = String(
-    providerPayload.message ||
-      providerPayload.responseMessage ||
-      providerPayload.narration ||
-      providerStatus ||
-      payout.providerMessage ||
-      "",
-  ).trim()
+  payout.providerMessage = providerStatusExpired
+    ? `Monnify status: ${providerStatus}. Transfer authorization expired; retry transfer or cancel and return balance.`
+    : String(
+        providerPayload.message ||
+          providerPayload.responseMessage ||
+          providerPayload.narration ||
+          providerStatus ||
+          payout.providerMessage ||
+          "",
+      ).trim()
 
   if (normalizedStatus === "processing" && hasPendingMonnifyAuthorizationMessage(payout.providerMessage)) {
     payout.status = "otp_required"
@@ -4094,6 +4114,44 @@ async function failPayoutAndReleaseBalance({
     actorId,
     eventType,
     message: `Admin marked payout ${payout.transferReference} as failed and released the creator balance.`,
+    metadata: {
+      payoutId: payout._id.toString(),
+      creatorId: payout.creatorId.toString(),
+      amount: payout.amount,
+      transferReference: payout.transferReference,
+      reason,
+    },
+  })
+
+  return payout
+}
+
+async function cancelPayoutAndReturnBalance({
+  payout,
+  actorId,
+  reason = "Cancelled after provider expiry. Creator balance returned to dashboard.",
+}) {
+  payout.status = "cancelled"
+  payout.reviewStatus = payout.reviewStatus === "awaiting_review" ? "rejected" : payout.reviewStatus
+  payout.reviewedBy = actorId
+  payout.reviewedAt = new Date()
+  payout.rejectionReason = reason
+  payout.providerMessage = reason
+  payout.completedAt = new Date()
+  await payout.save()
+
+  await User.updateOne(
+    { _id: payout.creatorId },
+    { $set: { "wallet.updatedAt": new Date() } },
+  )
+
+  io.to(getCreatorRoom(payout.creatorId)).emit("newPayout", payout)
+
+  await createAuditLog({
+    actorType: "admin",
+    actorId,
+    eventType: "portal.payout.cancelled_returned",
+    message: `Admin cancelled payout ${payout.transferReference} and returned it to the creator dashboard balance.`,
     metadata: {
       payoutId: payout._id.toString(),
       creatorId: payout.creatorId.toString(),
@@ -7984,7 +8042,7 @@ app.post("/portal/payouts/:id/cancel", requireAdminSession, async (req, res) => 
       return res.status(404).json({ error: "Payout not found." })
     }
 
-    if (!["pending", "processing", "otp_required", "otp_resent", "pending_admin_approval", "awaiting_review", "failed"].includes(payout.status)) {
+    if (!canCancelPayoutAndReturnBalance(payout)) {
       return res.status(409).json({ error: "Only pending, review, or failed payouts can be cancelled." })
     }
 
@@ -7994,33 +8052,16 @@ app.post("/portal/payouts/:id/cancel", requireAdminSession, async (req, res) => 
       })
     }
 
-    const reason = String(req.body?.reason || "").trim()
-
-    payout.status = "cancelled"
-    payout.reviewStatus = payout.reviewStatus === "awaiting_review" ? "rejected" : payout.reviewStatus
-    payout.reviewedBy = req.adminSession._id.toString()
-    payout.reviewedAt = new Date()
-    payout.rejectionReason = reason || "Cancelled after provider expiry."
-    payout.providerMessage = payout.rejectionReason
-    payout.completedAt = new Date()
-    await payout.save()
-
-    io.to(getCreatorRoom(payout.creatorId)).emit("newPayout", payout)
-
-    await createAuditLog({
-      actorType: "admin",
+    const reason =
+      String(req.body?.reason || "").trim() ||
+      "Monnify transfer expired or was abandoned. Cancelled and returned to creator dashboard balance."
+    const updatedPayout = await cancelPayoutAndReturnBalance({
+      payout,
       actorId: req.adminSession._id.toString(),
-      eventType: "portal.payout.cancelled",
-      message: `Admin cancelled payout ${payout.transferReference}.`,
-      metadata: {
-        payoutId: payout._id.toString(),
-        creatorId: payout.creatorId.toString(),
-        amount: payout.amount,
-        reason: payout.rejectionReason,
-      },
+      reason,
     })
 
-    res.json({ payout })
+    res.json({ payout: sanitizePortalPayout(updatedPayout) })
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to cancel payout." })
