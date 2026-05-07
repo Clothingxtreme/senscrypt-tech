@@ -4451,16 +4451,34 @@ async function syncCreatorWalletFromLedger(userOrId) {
   }
 
   const totals = await getRevenueTotals({ creatorId: user._id })
-  user.wallet = {
-    ...(user.wallet?.toObject?.() || user.wallet || {}),
+  const currentWallet = user.wallet?.toObject?.() || user.wallet || {}
+  const nextWallet = {
+    ...currentWallet,
     availableBalance: roundWalletAmount(totals.creatorRevenue),
     pendingBalance: roundWalletAmount(totals.pendingCreatorRevenue),
     totalReceived: roundWalletAmount(totals.grossRevenue),
+  }
+  const hasWalletDifference =
+    roundWalletAmount(currentWallet.availableBalance) !== nextWallet.availableBalance ||
+    roundWalletAmount(currentWallet.pendingBalance) !== nextWallet.pendingBalance ||
+    roundWalletAmount(currentWallet.totalReceived) !== nextWallet.totalReceived
+
+  if (!hasWalletDifference) {
+    return { user, totals, changed: false }
+  }
+
+  user.wallet = {
+    ...nextWallet,
     updatedAt: new Date(),
   }
   await user.save()
 
-  return { user, totals }
+  return { user, totals, changed: true }
+}
+
+async function getLedgerSyncedUser(userOrId) {
+  const synced = await syncCreatorWalletFromLedger(userOrId)
+  return synced?.user || userOrId
 }
 
 async function hasSuccessfulWithdrawal(creatorId) {
@@ -5463,7 +5481,8 @@ app.get("/auth/me", async (req, res) => {
       return res.status(403).json({ error: "This account is not active anymore." })
     }
 
-    return res.json({ user: sanitizeUser(user) })
+    const syncedUser = await getLedgerSyncedUser(user)
+    return res.json({ user: sanitizeUser(syncedUser) })
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: "Failed to load current user." })
