@@ -2717,6 +2717,17 @@ function getAxiosErrorDetails(error) {
   }
 }
 
+function createStatusCodeError(message, statusCode) {
+  const error = new Error(message)
+  const normalizedStatusCode = Number(statusCode || 0)
+
+  if (normalizedStatusCode >= 400 && normalizedStatusCode < 600) {
+    error.statusCode = normalizedStatusCode
+  }
+
+  return error
+}
+
 function buildMonnifyCustomerEmail(email, suffix) {
   const normalizedEmail = String(email || "").toLowerCase().trim()
   const [localPart, domain = "streamtip.local"] = normalizedEmail.split("@")
@@ -4676,10 +4687,14 @@ function roundWalletAmount(value) {
 }
 
 async function syncCreatorWalletFromLedger(userOrId) {
-  const user =
+  const userId =
     userOrId && typeof userOrId === "object" && userOrId._id
+      ? userOrId._id
+      : userOrId
+  const user =
+    userOrId && typeof userOrId.save === "function"
       ? userOrId
-      : await User.findById(userOrId)
+      : await User.findById(userId)
 
   if (!user) {
     return null
@@ -4805,6 +4820,7 @@ async function sendPayoutToMonnify(payout, creator, actorType = "system", actorI
     })
   } catch (error) {
     const message = getAxiosErrorMessage(error, "Failed to initiate payout with Monnify.")
+    const errorDetails = getAxiosErrorDetails(error)
     payout.status = "failed"
     payout.provider = "monnify"
     payout.providerMessage = message
@@ -4828,7 +4844,7 @@ async function sendPayoutToMonnify(payout, creator, actorType = "system", actorI
     })
 
     io.to(getCreatorRoom(creator._id)).emit("newPayout", payout)
-    throw new Error(message)
+    throw createStatusCodeError(message, errorDetails.httpStatus)
   }
 
   const providerStatus =
@@ -4942,13 +4958,14 @@ async function sendPayoutToPaystack(payout, creator, actorType = "system", actor
     })
   } catch (error) {
     const message = getAxiosErrorMessage(error, "Failed to initiate payout with Paystack.")
+    const errorDetails = getAxiosErrorDetails(error)
     payout.status = "failed"
     payout.provider = "paystack"
     payout.providerMessage = message
     payout.providerPayload = {
       recipient: recipientResponse,
       transfer: transferResponse,
-      error: getAxiosErrorDetails(error),
+      error: errorDetails,
     }
     payout.completedAt = new Date()
     await payout.save()
@@ -4970,7 +4987,7 @@ async function sendPayoutToPaystack(payout, creator, actorType = "system", actor
     })
 
     io.to(getCreatorRoom(creator._id)).emit("newPayout", payout)
-    throw new Error(message)
+    throw createStatusCodeError(message, errorDetails.httpStatus)
   }
 
   await updatePayoutFromProviderStatus(
@@ -7927,7 +7944,9 @@ app.post("/portal/settlements/:id/approve", requireAdminSession, async (req, res
     res.json({ payout: sentPayout, creator: sanitizeUser(creator) })
   } catch (error) {
     console.error(error)
-    res.status(502).json({
+    const statusCode = Number(error?.statusCode || 0)
+    const isClientError = statusCode >= 400 && statusCode < 500
+    res.status(isClientError ? statusCode : 502).json({
       error: error instanceof Error ? error.message : "Could not approve and send payout.",
     })
   }
