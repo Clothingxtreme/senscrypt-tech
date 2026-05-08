@@ -1599,13 +1599,18 @@ async function upsertComplianceInflowFromMonnify({
   return record
 }
 
-function sanitizeDonorDisplayName(value) {
-  return String(value || "")
+function sanitizeDonationText(value, maxLength = 500) {
+  const sanitized = String(value || "")
     .replace(/[\r\n\t]+/g, " ")
     .replace(/[<>]/g, "")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 32)
+
+  return maxLength && sanitized.length > maxLength ? sanitized.slice(0, maxLength).trim() : sanitized
+}
+
+function sanitizeDonorDisplayName(value) {
+  return sanitizeDonationText(value, 32)
 }
 
 function getFirstNameOnly(value) {
@@ -1622,7 +1627,7 @@ function getFirstNameOnly(value) {
 }
 
 function isSystemNarration(value, creatorNames = []) {
-  const sanitized = sanitizeDonorDisplayName(value)
+  const sanitized = sanitizeDonationText(value)
   const normalized = normalizeName(sanitized)
   const compact = sanitized.replace(/[^a-z0-9]/gi, "").toLowerCase()
 
@@ -1656,6 +1661,128 @@ function isSystemNarration(value, creatorNames = []) {
   }
 
   return false
+}
+
+function getBankTransferNarrationDisplay(value) {
+  const narration = sanitizeDonationText(value)
+
+  if (!narration || !/\b(?:nip|nibss|transfer|trf)\b/i.test(narration)) {
+    return null
+  }
+
+  const firstDelimiter = /\s+-\s+/.exec(narration)
+  const senderSearchArea = firstDelimiter ? narration.slice(0, firstDelimiter.index) : narration
+  const fromPattern = /\bfrom\b/gi
+  let fromMatch
+  let fromIndex = -1
+  let fromLength = 0
+
+  while ((fromMatch = fromPattern.exec(senderSearchArea)) !== null) {
+    fromIndex = fromMatch.index
+    fromLength = fromMatch[0].length
+  }
+
+  if (fromIndex < 0) {
+    return null
+  }
+
+  const fromText = narration.slice(fromIndex + fromLength).trim()
+  const delimiterPattern = /\s+-\s+/g
+  let delimiterMatch
+  let delimiterIndex = -1
+  let delimiterLength = 0
+
+  while ((delimiterMatch = delimiterPattern.exec(fromText)) !== null) {
+    delimiterIndex = delimiterMatch.index
+    delimiterLength = delimiterMatch[0].length
+  }
+
+  let senderName = fromText
+  let typedNarration = ""
+
+  if (delimiterIndex >= 0) {
+    senderName = fromText.slice(0, delimiterIndex).trim()
+    typedNarration = fromText.slice(delimiterIndex + delimiterLength).trim()
+  }
+
+  senderName = sanitizeDonationText(
+    senderName.replace(/\b(?:session|session id|reference|ref|rrn)\b.*$/i, ""),
+  )
+
+  const displayNarration = sanitizeDonorDisplayName(typedNarration)
+  const normalizedNarration = normalizeName(displayNarration)
+  const normalizedSender = normalizeName(senderName)
+
+  if (
+    displayNarration &&
+    normalizedNarration &&
+    normalizedNarration !== normalizedSender &&
+    !isSystemNarration(displayNarration, [])
+  ) {
+    return {
+      name: displayNarration,
+      message: displayNarration,
+      source: "narration",
+    }
+  }
+
+  const senderFirstName = getFirstNameOnly(senderName)
+
+  if (senderFirstName !== "Anonymous") {
+    return {
+      name: senderFirstName,
+      message: senderFirstName,
+      source: "narration_sender_first_name",
+    }
+  }
+
+  return null
+}
+
+function getNarrationAlertDisplay(narration, { creatorNames = [], senderCandidates = [] } = {}) {
+  const narrationText = sanitizeDonationText(narration)
+
+  if (!narrationText) {
+    return null
+  }
+
+  const bankTransferDisplay = getBankTransferNarrationDisplay(narrationText)
+
+  if (bankTransferDisplay) {
+    return bankTransferDisplay
+  }
+
+  if (isSystemNarration(narrationText, creatorNames)) {
+    return null
+  }
+
+  const normalizedNarration = normalizeName(narrationText)
+  const senderNameMatch = senderCandidates.some((candidate) => {
+    const normalizedSender = normalizeName(candidate)
+    return normalizedSender && normalizedSender === normalizedNarration
+  })
+
+  if (senderNameMatch) {
+    const senderFirstName = getFirstNameOnly(narrationText)
+
+    if (senderFirstName !== "Anonymous") {
+      return {
+        name: senderFirstName,
+        message: senderFirstName,
+        source: "narration_sender_first_name",
+      }
+    }
+  }
+
+  const displayName = sanitizeDonorDisplayName(narrationText)
+
+  return displayName
+    ? {
+        name: displayName,
+        message: displayName,
+        source: "narration",
+      }
+    : null
 }
 
 function collectNestedValuesByKey(source, keyPattern, maxDepth = 5) {
@@ -1792,26 +1919,6 @@ function getDonationSenderName(eventData, data, creator) {
     ).map((entry) => ({ ...entry, root: "data" })),
   ].slice(0, 20)
   const checkedNarrations = []
-
-  for (const candidate of narrationCandidates) {
-    const nickname = sanitizeDonorDisplayName(candidate)
-
-    if (nickname) {
-      checkedNarrations.push(nickname)
-    }
-
-    if (!nickname || isSystemNarration(nickname, creatorNames)) {
-      continue
-    }
-
-    return {
-      name: nickname,
-      source: "narration",
-      checkedNarrations: Array.from(new Set(checkedNarrations)).slice(0, 12),
-      checkedNarrationFields,
-    }
-  }
-
   const senderNamePaths = [
     "paymentSourceInformation.accountName",
     "paymentSourceInformation.accountHolderName",
@@ -1834,6 +1941,31 @@ function getDonationSenderName(eventData, data, creator) {
     data?.sender,
     data?.payerName,
   ]
+
+  for (const candidate of narrationCandidates) {
+    const narrationText = sanitizeDonationText(candidate)
+    const displayNarration = sanitizeDonorDisplayName(narrationText)
+
+    if (displayNarration) {
+      checkedNarrations.push(displayNarration)
+    }
+
+    const narrationDisplay = getNarrationAlertDisplay(narrationText, {
+      creatorNames,
+      senderCandidates: candidates,
+    })
+
+    if (!narrationDisplay) {
+      continue
+    }
+
+    return {
+      name: narrationDisplay.name,
+      source: narrationDisplay.source,
+      checkedNarrations: Array.from(new Set(checkedNarrations)).slice(0, 12),
+      checkedNarrationFields,
+    }
+  }
 
   for (const candidate of candidates) {
     const sender = String(candidate || "").trim()
@@ -2527,6 +2659,40 @@ function complianceInflowReportFilename() {
   return `streamtip-compliance-inflows-${stamp}.csv`
 }
 
+function cleanPublicAccountNameSource(value) {
+  return String(value || "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[<>]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^streamtip\s*\/\s*/i, "")
+    .replace(/^senscrypt\s+technologies\s+ltd\s*\/\s*/i, "")
+    .replace(/^senscrypttech\s*\/\s*/i, "")
+    .trim()
+}
+
+function getInitialsFromAccountNameParts(parts = []) {
+  return parts
+    .map(cleanPublicAccountNameSource)
+    .flatMap((part) => part.split(/[\s-]+/))
+    .map((part) => part.replace(/[^a-z0-9]/gi, ""))
+    .filter(Boolean)
+    .map((part) => part[0].toUpperCase())
+    .join("")
+}
+
+function buildPublicStreamerAccountName(user) {
+  const nameParts = getUserNameParts(user)
+  const orderedNameParts = [nameParts.firstName, nameParts.middleName, nameParts.lastName].filter(Boolean)
+  const initials =
+    getInitialsFromAccountNameParts(orderedNameParts) ||
+    getInitialsFromAccountNameParts([user?.name]) ||
+    getInitialsFromAccountNameParts([user?.virtualAccount?.accountName]) ||
+    "ST"
+
+  return `Senscrypttech/${initials}`
+}
+
 function sanitizePublicOverlayUser(user) {
   const sanitized = sanitizeUser(user)
 
@@ -2534,10 +2700,18 @@ function sanitizePublicOverlayUser(user) {
     return null
   }
 
+  const virtualAccount = sanitized.virtualAccount?.toObject?.() || sanitized.virtualAccount
+
   return {
     ...sanitized,
     email: "",
     identity: undefined,
+    virtualAccount: virtualAccount
+      ? {
+          ...virtualAccount,
+          accountName: buildPublicStreamerAccountName(user),
+        }
+      : null,
   }
 }
 
@@ -2726,6 +2900,52 @@ function createStatusCodeError(message, statusCode) {
   }
 
   return error
+}
+
+function canFallbackPaystackPayoutToMonnify(error, message) {
+  if (!isMonnifyConfigured()) {
+    return false
+  }
+
+  const httpStatus = Number(error?.response?.status || error?.statusCode || 0)
+  const normalizedMessage = String(message || error?.message || "").toLowerCase()
+
+  return (
+    httpStatus === 400 &&
+    normalizedMessage.includes("third party") &&
+    (normalizedMessage.includes("payout") || normalizedMessage.includes("payment"))
+  )
+}
+
+async function switchPayoutToProvider(payout, provider, reason = "") {
+  const previousTransferReference = String(payout.transferReference || "").trim()
+  const previousProviderReference = String(payout.providerReference || "").trim()
+  const nextTransferReference = provider === "paystack" ? createPaystackTransferReference() : createTransferReference()
+  const previousReferences = Array.isArray(payout.previousTransferReferences)
+    ? payout.previousTransferReferences
+    : []
+
+  payout.provider = provider
+  payout.transferReference = nextTransferReference
+  payout.providerReference = nextTransferReference
+  payout.paystackTransferCode = ""
+  payout.transferRecipientCode = ""
+  payout.completedAt = undefined
+  payout.previousTransferReferences = Array.from(
+    new Set([
+      ...previousReferences,
+      previousTransferReference,
+      previousProviderReference,
+    ].filter(Boolean)),
+  ).slice(-10)
+  payout.providerMessage = reason || `Switching payout to ${provider}.`
+  await payout.save()
+
+  return {
+    previousTransferReference,
+    previousProviderReference,
+    transferReference: nextTransferReference,
+  }
 }
 
 function buildMonnifyCustomerEmail(email, suffix) {
@@ -4959,6 +5179,38 @@ async function sendPayoutToPaystack(payout, creator, actorType = "system", actor
   } catch (error) {
     const message = getAxiosErrorMessage(error, "Failed to initiate payout with Paystack.")
     const errorDetails = getAxiosErrorDetails(error)
+
+    if (canFallbackPaystackPayoutToMonnify(error, message)) {
+      const fallbackState = await switchPayoutToProvider(
+        payout,
+        "monnify",
+        previousTransferReference
+          ? `Paystack transfers are unavailable on this account. Falling back to Monnify. Previous Paystack ref: ${previousTransferReference}.`
+          : "Paystack transfers are unavailable on this account. Falling back to Monnify.",
+      )
+
+      await createAuditLog({
+        actorType,
+        actorId,
+        eventType: "payout.provider_fallback",
+        message: `Paystack payout fallback triggered for ${payout.bankName}.`,
+        metadata: {
+          payoutId: payout._id.toString(),
+          amount: payout.amount,
+          creatorId: creator._id.toString(),
+          fromProvider: "paystack",
+          toProvider: "monnify",
+          previousTransferReference: fallbackState.previousTransferReference,
+          previousProviderReference: fallbackState.previousProviderReference,
+          transferReference: fallbackState.transferReference,
+          error: message,
+          ...errorDetails,
+        },
+      })
+
+      return sendPayoutToMonnify(payout, creator, actorType, actorId)
+    }
+
     payout.status = "failed"
     payout.provider = "paystack"
     payout.providerMessage = message
@@ -5259,7 +5511,7 @@ function getPaystackSourceDetails(eventData = {}) {
 }
 
 function getPaystackNarration(eventData = {}) {
-  return sanitizeDonorDisplayName(
+  return sanitizeDonationText(
     firstStringFromPaths([eventData, eventData.authorization || {}, eventData.metadata || {}], [
       "authorization.narration",
       "authorization.sender_narration",
@@ -5274,12 +5526,12 @@ function getPaystackNarration(eventData = {}) {
 }
 
 function getPaystackAlertDisplay({ narration, sourceDetails }) {
-  if (narration && !isSystemNarration(narration, [])) {
-    return {
-      name: narration,
-      message: narration,
-      source: "narration",
-    }
+  const narrationDisplay = getNarrationAlertDisplay(narration, {
+    senderCandidates: [sourceDetails.sourceAccountName],
+  })
+
+  if (narrationDisplay) {
+    return narrationDisplay
   }
 
   if (sourceDetails.sourceAccountName) {
