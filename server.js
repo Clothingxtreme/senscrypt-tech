@@ -7115,7 +7115,11 @@ app.get("/public/overlay/:creatorId", async (req, res) => {
       : null
     const donationQuery = {
       creatorId: user._id,
-      walletStatus: { $ne: "rejected" },
+      $or: [
+        { walletStatus: "available" },
+        { walletStatus: { $exists: false } },
+        { walletStatus: null },
+      ],
       ...(leaderboardResetAt && !Number.isNaN(leaderboardResetAt.getTime())
         ? { date: { $gte: leaderboardResetAt } }
         : {}),
