@@ -7085,6 +7085,7 @@ app.put("/overlay-state", requireSessionUser, async (req, res) => {
     }
 
     req.user.overlayState = nextState
+    req.user.markModified('overlayState')
     await req.user.save()
 
     return res.json(getOverlayStateForUser(req.user))
