@@ -1477,6 +1477,17 @@ function sanitizeIdentity(identity, fallbackParts = {}) {
   }
 }
 
+function isDraftRegistrationUser(user) {
+  return !(
+    String(user?.identity?.bvn || "").trim() &&
+    String(user?.identity?.nin || "").trim() &&
+    String(user?.identity?.dateOfBirth || "").trim() &&
+    String(user?.identity?.firstName || user?.firstName || "").trim() &&
+    String(user?.identity?.lastName || user?.lastName || "").trim() &&
+    user?.identity?.policyAcceptedAt
+  )
+}
+
 function sanitizeIdentityVerification(verification) {
   const source = verification?.toObject?.() || verification || {}
 
