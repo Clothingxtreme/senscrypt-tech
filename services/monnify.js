@@ -2,6 +2,7 @@ const axios = require("axios")
 
 const MONNIFY_DEFAULT_BASE_URL = "https://api.monnify.com"
 const DEFAULT_NIN_VERIFICATION_PATH = "/api/v1/vas/nin-verification"
+const LEGACY_NIN_VERIFICATION_PATH = "/api/v1/vas/nin-details"
 
 function normalizeBaseUrl(value) {
   return String(value || MONNIFY_DEFAULT_BASE_URL).replace(/\/+$/, "")
@@ -121,8 +122,21 @@ function createMonnifyService({
     },
 
     async verifyNin(payload) {
-      const response = await request("post", normalizedNinVerificationPath, { data: payload })
-      return response.data
+      try {
+        const response = await request("post", normalizedNinVerificationPath, { data: payload })
+        return response.data
+      } catch (error) {
+        const shouldRetryLegacyPath =
+          error?.response?.status === 404 &&
+          normalizedNinVerificationPath !== LEGACY_NIN_VERIFICATION_PATH
+
+        if (!shouldRetryLegacyPath) {
+          throw error
+        }
+
+        const response = await request("post", LEGACY_NIN_VERIFICATION_PATH, { data: payload })
+        return response.data
+      }
     },
 
     async updateReservedAccountKyc({ accountReference, bvn, nin }) {
@@ -144,5 +158,6 @@ function createMonnifyService({
 module.exports = {
   MONNIFY_DEFAULT_BASE_URL,
   DEFAULT_NIN_VERIFICATION_PATH,
+  LEGACY_NIN_VERIFICATION_PATH,
   createMonnifyService,
 }

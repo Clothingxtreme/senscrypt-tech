@@ -1154,7 +1154,9 @@ function normalizeMonnifyBvnSnapshot(response, subject, requestHash) {
     matchStatus: nameMatchStatus || (verified ? "FULL_MATCH" : "NO_MATCH"),
     matchPercentage: Number.isFinite(nameMatchPercentage) ? nameMatchPercentage : 0,
     responseCode: String(response?.responseCode ?? ""),
-    responseMessage: getMonnifyResponseMessage(response, verified ? "BVN verification passed." : "BVN verification failed."),
+    responseMessage: verified
+      ? getMonnifyResponseMessage(response, "BVN verification passed.")
+      : "BVN information did not match Monnify records.",
     requestHash,
     checkedAt: now,
     verifiedAt: verified ? now : undefined,
@@ -1197,7 +1199,9 @@ function normalizeMonnifyNinSnapshot(response, subject, requestHash) {
     matchStatus: verified ? "FULL_MATCH" : "NO_MATCH",
     matchPercentage: verified ? 100 : 0,
     responseCode: String(response?.responseCode ?? ""),
-    responseMessage: getMonnifyResponseMessage(response, verified ? "NIN verification passed." : "NIN verification failed."),
+    responseMessage: verified
+      ? getMonnifyResponseMessage(response, "NIN verification passed.")
+      : "NIN information did not match Monnify records.",
     requestHash,
     checkedAt: now,
     verifiedAt: verified ? now : undefined,
@@ -1243,11 +1247,6 @@ async function runMonnifyBvnVerification(subject, existingSnapshot, { force = fa
   })
 
   const snapshot = normalizeMonnifyBvnSnapshot(response, subject, requestHash)
-
-  if (snapshot.status !== "verified") {
-    throw createStatusCodeError(`BVN verification failed: ${snapshot.responseMessage}`, 400)
-  }
-
   return snapshot
 }
 
@@ -1283,11 +1282,6 @@ async function runMonnifyNinVerification(subject, existingSnapshot, { force = fa
   })
 
   const snapshot = normalizeMonnifyNinSnapshot(response, subject, requestHash)
-
-  if (snapshot.status !== "verified") {
-    throw createStatusCodeError(`NIN verification failed: ${snapshot.responseMessage}`, 400)
-  }
-
   return snapshot
 }
 
@@ -1357,6 +1351,26 @@ function markIdentityVerificationStale(user, types = []) {
   }
 }
 
+function getStaleIdentityVerificationTypes(previousSubject, nextSubject, user) {
+  const legalNameChanged =
+    previousSubject.firstName !== nextSubject.firstName ||
+    previousSubject.middleName !== nextSubject.middleName ||
+    previousSubject.lastName !== nextSubject.lastName
+  const dateOfBirthChanged = previousSubject.dateOfBirth !== nextSubject.dateOfBirth
+  const phoneChanged = previousSubject.phoneNumber !== nextSubject.phoneNumber
+  const staleTypes = []
+
+  if ((legalNameChanged || dateOfBirthChanged || phoneChanged) && user?.identity?.bvn) {
+    staleTypes.push("bvn")
+  }
+
+  if ((legalNameChanged || dateOfBirthChanged) && user?.identity?.nin) {
+    staleTypes.push("nin")
+  }
+
+  return staleTypes
+}
+
 async function verifyIdentityWithMonnify(subject, options = {}) {
   const types = Array.isArray(options.types) && options.types.length ? options.types : ["bvn", "nin"]
   const existing = getIdentityVerificationObject(options.existingVerification)
@@ -1364,10 +1378,16 @@ async function verifyIdentityWithMonnify(subject, options = {}) {
 
   if (types.includes("bvn")) {
     snapshots.bvn = await runMonnifyBvnVerification(subject, existing.bvn, options)
+    if (snapshots.bvn.status !== "verified" && options.throwOnFailed !== false) {
+      throw createStatusCodeError(`BVN verification failed: ${snapshots.bvn.responseMessage}`, 400)
+    }
   }
 
   if (types.includes("nin")) {
     snapshots.nin = await runMonnifyNinVerification(subject, existing.nin, options)
+    if (snapshots.nin.status !== "verified" && options.throwOnFailed !== false) {
+      throw createStatusCodeError(`NIN verification failed: ${snapshots.nin.responseMessage}`, 400)
+    }
   }
 
   return snapshots
@@ -1398,6 +1418,7 @@ async function verifySavedUserIdentityWithMonnify(user, { type = "both", force =
     types,
     force,
     existingVerification: user.identityVerification,
+    throwOnFailed: false,
   })
 
   applyIdentityVerificationSnapshots(user, snapshots)
@@ -9138,6 +9159,7 @@ app.patch("/portal/users/:id", requireAdminSession, async (req, res) => {
       user.status = String(req.body.status)
     }
 
+    const previousIdentitySubject = getIdentitySubjectFromUser(user)
     const currentNameParts = getUserNameParts(user)
     const identityBody = req.body?.identity && typeof req.body.identity === "object" ? req.body.identity : {}
     const legal = validateLegalNameParts({
@@ -9167,8 +9189,14 @@ app.patch("/portal/users/:id", requireAdminSession, async (req, res) => {
     })
 
     if (typeof identityBody.dateOfBirth === "string") {
+      const nextDateOfBirth = identityBody.dateOfBirth.trim()
+
+      if (nextDateOfBirth && !normalizeDateOnly(nextDateOfBirth)) {
+        return res.status(400).json({ error: "Date of birth must use YYYY-MM-DD format." })
+      }
+
       user.identity = user.identity || {}
-      user.identity.dateOfBirth = identityBody.dateOfBirth.trim()
+      user.identity.dateOfBirth = nextDateOfBirth
     }
 
     if ([1, 2, 3].includes(Number(req.body?.kycTier))) {
@@ -9200,6 +9228,16 @@ app.patch("/portal/users/:id", requireAdminSession, async (req, res) => {
 
     if (Number(req.body?.dailyReceivingLimitOverride) >= 0) {
       user.dailyReceivingLimitOverride = Number(req.body.dailyReceivingLimitOverride) || 0
+    }
+
+    const staleVerificationTypes = getStaleIdentityVerificationTypes(
+      previousIdentitySubject,
+      getIdentitySubjectFromUser(user),
+      user,
+    )
+
+    if (staleVerificationTypes.length > 0) {
+      markIdentityVerificationStale(user, staleVerificationTypes)
     }
 
     await user.save()
@@ -9511,6 +9549,7 @@ app.post("/admin/users", requireAdminSession, async (req, res) => {
       firstName = "",
       middleName = "",
       lastName = "",
+      dateOfBirth = "",
       email,
       phoneNumber = "",
       password,
@@ -9533,6 +9572,7 @@ app.post("/admin/users", requireAdminSession, async (req, res) => {
       lastName: legal.last,
     })
     const rawPassword = String(password || "")
+    const trimmedDateOfBirth = String(dateOfBirth || "").trim()
     const nextRole = role === "admin" ? "admin" : "creator"
     const nextStatus = ["active", "suspended", "banned"].includes(String(status))
       ? String(status)
@@ -9542,6 +9582,10 @@ app.post("/admin/users", requireAdminSession, async (req, res) => {
       return res.status(400).json({
         error: "Name, email, and a password of at least 8 characters are required.",
       })
+    }
+
+    if (trimmedDateOfBirth && !normalizeDateOnly(trimmedDateOfBirth)) {
+      return res.status(400).json({ error: "Date of birth must use YYYY-MM-DD format." })
     }
 
     const existingUser = await User.findOne({ email: normalizedEmail })
@@ -9564,6 +9608,7 @@ app.post("/admin/users", requireAdminSession, async (req, res) => {
         firstName: legal.first,
         middleName: legal.middle,
         lastName: legal.last,
+        dateOfBirth: trimmedDateOfBirth,
       },
     })
 
@@ -9605,19 +9650,27 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
 
     const fallbackParts =
       typeof req.body?.name === "string" ? splitNamePartsFromFullName(req.body.name) : {}
+    const identityBody = req.body?.identity && typeof req.body.identity === "object" ? req.body.identity : {}
     const currentNameParts = getUserNameParts(user)
+    const previousIdentitySubject = getIdentitySubjectFromUser(user)
     const legal = validateLegalNameParts({
       firstName:
         typeof req.body?.firstName === "string"
           ? req.body.firstName
+          : typeof identityBody.firstName === "string"
+            ? identityBody.firstName
           : fallbackParts.firstName || currentNameParts.firstName,
       middleName:
         typeof req.body?.middleName === "string"
           ? req.body.middleName
+          : typeof identityBody.middleName === "string"
+            ? identityBody.middleName
           : fallbackParts.middleName || currentNameParts.middleName,
       lastName:
         typeof req.body?.lastName === "string"
           ? req.body.lastName
+          : typeof identityBody.lastName === "string"
+            ? identityBody.lastName
           : fallbackParts.lastName || currentNameParts.lastName,
     })
     const nextEmail =
@@ -9651,6 +9704,24 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
     user.phoneNumber = nextPhoneNumber || ""
     user.role = nextRole
     user.status = nextStatus
+
+    const dateOfBirthInput =
+      typeof req.body?.dateOfBirth === "string"
+        ? req.body.dateOfBirth
+        : typeof identityBody.dateOfBirth === "string"
+          ? identityBody.dateOfBirth
+          : undefined
+
+    if (dateOfBirthInput !== undefined) {
+      const nextDateOfBirth = dateOfBirthInput.trim()
+
+      if (nextDateOfBirth && !normalizeDateOnly(nextDateOfBirth)) {
+        return res.status(400).json({ error: "Date of birth must use YYYY-MM-DD format." })
+      }
+
+      user.identity = user.identity || {}
+      user.identity.dateOfBirth = nextDateOfBirth
+    }
 
     if ([1, 2, 3].includes(Number(req.body?.kycTier))) {
       user.kycTier = Number(req.body.kycTier)
@@ -9686,6 +9757,16 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
     if (typeof req.body?.password === "string" && req.body.password.trim().length >= 8) {
       user.passwordHash = hashPassword(req.body.password.trim())
       user.sessionToken = null
+    }
+
+    const staleVerificationTypes = getStaleIdentityVerificationTypes(
+      previousIdentitySubject,
+      getIdentitySubjectFromUser(user),
+      user,
+    )
+
+    if (staleVerificationTypes.length > 0) {
+      markIdentityVerificationStale(user, staleVerificationTypes)
     }
 
     await user.save()
