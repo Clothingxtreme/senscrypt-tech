@@ -1610,6 +1610,22 @@ function getNameTokenMatches(tokens) {
   return matches
 }
 
+function namePartMatchesAccountName(part, accountTokens, accountTokenMatches) {
+  const normalized = normalizeNameToken(part)
+
+  if (!normalized) {
+    return true
+  }
+
+  if (accountTokenMatches.has(normalized)) {
+    return true
+  }
+
+  return accountTokens.some(
+    (token) => token.length >= 3 && normalized.length > token.length && normalized.startsWith(token),
+  )
+}
+
 function validateLegalNameParts({ firstName, middleName, lastName }) {
   const first = String(firstName || "").trim()
   const middle = String(middleName || "").trim()
@@ -1645,7 +1661,7 @@ function validatePayoutAccountNameMatch({
   const accountTokenMatches = getNameTokenMatches(accountTokens)
   const missing = [legal.first, legal.middle, legal.last]
     .map((part) => ({ original: part, normalized: normalizeNameToken(part) }))
-    .filter((part) => part.normalized && !accountTokenMatches.has(part.normalized))
+    .filter((part) => !namePartMatchesAccountName(part.original, accountTokens, accountTokenMatches))
 
   if (missing.length > 0) {
     throw new Error(
@@ -6419,10 +6435,16 @@ app.post("/auth/register", async (req, res) => {
     let user = await User.findOne({ email: normalizedEmail })
 
     if (user) {
-      return res.status(409).json({ error: "An account with that email already exists." })
+      return res.status(409).json({
+        error: user.payoutProfile?.locked
+          ? "An account with that email already exists."
+          : "An account with that email already exists. Log in to continue setup.",
+      })
     }
 
     let payoutProfile
+    let registrationWarning = ""
+    let registrationNextStep = "dashboard"
 
     try {
       payoutProfile = await buildVerifiedPayoutProfile({
@@ -6438,13 +6460,14 @@ app.post("/auth/register", async (req, res) => {
         accountNumber,
       })
     } catch (error) {
-      console.error("register.payout_profile_verification_failed", error)
-      return res.status(400).json({
-        error:
-          error instanceof Error
-            ? error.message
-            : "Could not verify the payout bank account for this registration.",
-      })
+      console.warn("register.payout_profile_verification_failed", error)
+      const reason =
+        error instanceof Error
+          ? error.message
+          : "Could not verify the payout bank account for this registration."
+
+      registrationWarning = `${reason} Your account was created, but add a verified payout account from Settings to finish signup.`
+      registrationNextStep = "payout"
     }
 
     let identityVerification
@@ -6474,6 +6497,8 @@ app.post("/auth/register", async (req, res) => {
       })
     }
 
+    const signupCompletedAt = payoutProfile ? new Date() : undefined
+
     user = await User.create({
       name: trimmedName,
       firstName: legal.first,
@@ -6490,7 +6515,7 @@ app.post("/auth/register", async (req, res) => {
       kycStatus: "pending",
       bvnVerified: identityVerification.bvn?.status === "verified",
       ninVerified: identityVerification.nin?.status === "verified",
-      bankAccountMatched: true,
+      bankAccountMatched: Boolean(payoutProfile),
       manualReviewStatus: "not_required",
       wallet: {
         availableBalance: 0,
@@ -6506,7 +6531,7 @@ app.post("/auth/register", async (req, res) => {
         middleName: legal.middle,
         lastName: legal.last,
         policyAcceptedAt: new Date(),
-        signupCompletedAt: new Date(),
+        ...(signupCompletedAt ? { signupCompletedAt } : {}),
       },
       identityVerification: {
         provider: "monnify",
@@ -6524,26 +6549,30 @@ app.post("/auth/register", async (req, res) => {
       metadata: {
         name: trimmedName,
         email: normalizedEmail,
+        registrationComplete: Boolean(payoutProfile),
       },
     })
 
-    let warning = ""
+    let warning = registrationWarning
 
-    try {
-      await provisionVirtualAccountForUser(user)
-    } catch (error) {
-      const reason =
-        error instanceof Error ? error.message : "Could not provision a Paystack dedicated virtual account."
+    if (payoutProfile) {
+      try {
+        await provisionVirtualAccountForUser(user)
+      } catch (error) {
+        const reason =
+          error instanceof Error ? error.message : "Could not provision a dedicated virtual account."
 
-      await markPaystackVirtualAccountPending(user, reason)
-      warning =
-        "Your account was created, but the Paystack virtual account could not be provisioned yet. It has been marked as pending so you can continue into the dashboard."
+        await markPaystackVirtualAccountPending(user, reason)
+        warning =
+          "Your account was created, but the virtual account could not be provisioned yet. It has been marked as pending so you can continue into the dashboard."
+      }
     }
 
     return res.json({
       user: sanitizeUser(user),
       sessionToken: user.sessionToken,
       warning,
+      nextStep: registrationNextStep,
     })
   } catch (error) {
     console.error(error)
@@ -10052,7 +10081,25 @@ app.post("/payout-profile", requireSessionUser, async (req, res) => {
       lastName: payoutProfile.lastName,
     })
     req.user.payoutProfile = payoutProfile
+    req.user.bankAccountMatched = true
+    req.user.identity = {
+      ...(req.user.identity?.toObject?.() || req.user.identity || {}),
+      signupCompletedAt: req.user.identity?.signupCompletedAt || new Date(),
+    }
     await req.user.save()
+
+    let warning = ""
+
+    try {
+      await provisionVirtualAccountForUser(req.user)
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "Could not provision a dedicated virtual account."
+
+      await markPaystackVirtualAccountPending(req.user, reason)
+      warning =
+        "Your payout account was locked, but the virtual account could not be provisioned yet. It has been marked as pending."
+    }
 
     await createAuditLog({
       actorType: "user",
@@ -10067,7 +10114,11 @@ app.post("/payout-profile", requireSessionUser, async (req, res) => {
       },
     })
 
-    res.json({ user: sanitizeUser(req.user), payoutProfile: sanitizePayoutProfile(req.user.payoutProfile) })
+    res.json({
+      user: sanitizeUser(req.user),
+      payoutProfile: sanitizePayoutProfile(req.user.payoutProfile),
+      warning,
+    })
   } catch (error) {
     console.error(error)
     res.status(400).json({
