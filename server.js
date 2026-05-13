@@ -9,6 +9,7 @@ const path = require("path")
 const { Server } = require("socket.io")
 const { AxiosError } = require("axios")
 const { createPaystackService } = require("./services/paystack")
+const { createMonnifyService } = require("./services/monnify")
 
 require("dotenv").config({ path: path.join(__dirname, ".env") })
 
@@ -35,6 +36,10 @@ const MONNIFY_API_KEY = readEnv("MONNIFY_API_KEY")
 const MONNIFY_SECRET_KEY = readEnv("MONNIFY_SECRET_KEY")
 const MONNIFY_CONTRACT_CODE = readEnv("MONNIFY_CONTRACT_CODE")
 const MONNIFY_BASE_URL = readEnv("MONNIFY_BASE_URL")
+const MONNIFY_NIN_VERIFICATION_PATH =
+  readEnv("MONNIFY_NIN_VERIFICATION_PATH") || "/api/v1/vas/nin-verification"
+const MONNIFY_ACCEPT_PARTIAL_BVN_NAME_MATCH =
+  /^(1|true|yes)$/i.test(readEnv("MONNIFY_ACCEPT_PARTIAL_BVN_NAME_MATCH"))
 const FRONTEND_ORIGIN = readEnv("FRONTEND_ORIGIN")
 const MONNIFY_WEBHOOK_IP_ALLOWLIST = readEnv("MONNIFY_WEBHOOK_IP_ALLOWLIST")
 const PAYSTACK_SECRET_KEY = readEnv("PAYSTACK_SECRET_KEY")
@@ -95,6 +100,13 @@ const paystackWebhookIpAllowlist = parseCsvList(PAYSTACK_WEBHOOK_IP_ALLOWLIST)
 const paystack = createPaystackService({
   secretKey: PAYSTACK_SECRET_KEY,
   baseUrl: PAYSTACK_BASE_URL,
+})
+const monnify = createMonnifyService({
+  apiKey: MONNIFY_API_KEY,
+  secretKey: MONNIFY_SECRET_KEY,
+  contractCode: MONNIFY_CONTRACT_CODE,
+  baseUrl: MONNIFY_BASE_URL,
+  ninVerificationPath: MONNIFY_NIN_VERIFICATION_PATH,
 })
 
 function isOriginAllowed(origin) {
@@ -702,6 +714,38 @@ const userSchema = new mongoose.Schema(
       policyAcceptedAt: Date,
       signupCompletedAt: Date,
     },
+    identityVerification: {
+      provider: { type: String, default: "monnify" },
+      bvn: {
+        status: {
+          type: String,
+          enum: ["unverified", "verified", "failed", "skipped"],
+          default: "unverified",
+        },
+        matchStatus: { type: String, default: "" },
+        matchPercentage: { type: Number, default: 0 },
+        responseCode: { type: String, default: "" },
+        responseMessage: { type: String, default: "" },
+        requestHash: { type: String, default: "" },
+        checkedAt: Date,
+        verifiedAt: Date,
+      },
+      nin: {
+        status: {
+          type: String,
+          enum: ["unverified", "verified", "failed", "skipped"],
+          default: "unverified",
+        },
+        matchStatus: { type: String, default: "" },
+        matchPercentage: { type: Number, default: 0 },
+        responseCode: { type: String, default: "" },
+        responseMessage: { type: String, default: "" },
+        requestHash: { type: String, default: "" },
+        checkedAt: Date,
+        verifiedAt: Date,
+      },
+      updatedAt: Date,
+    },
     payoutProfile: {
       bankName: String,
       bankCode: String,
@@ -916,6 +960,452 @@ function normalizePhoneNumber(value) {
   return String(value || "").replace(/[^\d+]/g, "").trim().slice(0, 20)
 }
 
+function formatBvnMobileNo(value) {
+  const digits = String(value || "").replace(/\D/g, "")
+
+  if (digits.startsWith("234") && digits.length === 13) {
+    return `0${digits.slice(3)}`
+  }
+
+  return digits
+}
+
+function getMonnifyVerificationEnvironment() {
+  return monnify.getEnvironment()
+}
+
+function isMonnifyIdentityVerificationConfigured() {
+  return monnify.isConfigured()
+}
+
+function assertMonnifyIdentityVerificationReady(kind = "identity") {
+  if (!isMonnifyIdentityVerificationConfigured()) {
+    throw createStatusCodeError(
+      `Monnify ${kind} verification is not configured yet. Add MONNIFY_API_KEY, MONNIFY_SECRET_KEY, and MONNIFY_BASE_URL to Backend/.env.`,
+      503,
+    )
+  }
+
+  if (getMonnifyVerificationEnvironment() !== "live") {
+    throw createStatusCodeError(
+      `Monnify ${kind} verification is only available in live mode. Set MONNIFY_BASE_URL=https://api.monnify.com.`,
+      503,
+    )
+  }
+}
+
+function formatDateForMonnify(value) {
+  const normalized = normalizeDateOnly(value)
+
+  if (!normalized) {
+    return ""
+  }
+
+  const [, month, day] = normalized.match(/^\d{4}-(\d{2})-(\d{2})$/) || []
+  const year = normalized.slice(0, 4)
+  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  const monthIndex = Number(month) - 1
+
+  if (monthIndex < 0 || monthIndex > 11) {
+    return ""
+  }
+
+  return `${day}-${monthNames[monthIndex]}-${year}`
+}
+
+function normalizeDateForCompare(value) {
+  const raw = String(value || "").trim()
+  const iso = normalizeDateOnly(raw)
+
+  if (iso) {
+    return iso
+  }
+
+  const monthLookup = {
+    jan: "01",
+    feb: "02",
+    mar: "03",
+    apr: "04",
+    may: "05",
+    jun: "06",
+    jul: "07",
+    aug: "08",
+    sep: "09",
+    oct: "10",
+    nov: "11",
+    dec: "12",
+  }
+  const match = raw.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
+
+  if (match) {
+    const day = match[1].padStart(2, "0")
+    const month = monthLookup[match[2].toLowerCase()]
+    const year = match[3]
+
+    return month ? `${year}-${month}-${day}` : ""
+  }
+
+  return ""
+}
+
+function getIdentitySubject(input = {}) {
+  const nameParts = {
+    firstName: String(input.firstName || "").trim(),
+    middleName: String(input.middleName || "").trim(),
+    lastName: String(input.lastName || "").trim(),
+  }
+
+  return {
+    bvn: String(input.bvn || "").replace(/\D/g, "").slice(0, 11),
+    nin: String(input.nin || "").replace(/\D/g, "").slice(0, 11),
+    dateOfBirth: normalizeDateOnly(input.dateOfBirth),
+    phoneNumber: normalizePhoneNumber(input.phoneNumber),
+    firstName: nameParts.firstName,
+    middleName: nameParts.middleName,
+    lastName: nameParts.lastName,
+    name: buildFullNameFromParts(nameParts),
+  }
+}
+
+function getIdentitySubjectFromUser(user, overrides = {}) {
+  const parts = getUserNameParts(user)
+
+  return getIdentitySubject({
+    bvn: overrides.bvn ?? user?.identity?.bvn,
+    nin: overrides.nin ?? user?.identity?.nin,
+    dateOfBirth: overrides.dateOfBirth ?? user?.identity?.dateOfBirth,
+    phoneNumber: overrides.phoneNumber ?? user?.phoneNumber,
+    firstName: overrides.firstName ?? parts.firstName,
+    middleName: overrides.middleName ?? parts.middleName,
+    lastName: overrides.lastName ?? parts.lastName,
+  })
+}
+
+function buildIdentityVerificationHash(type, subject) {
+  const normalizedType = String(type || "").toLowerCase()
+  const identityValue = normalizedType === "bvn" ? subject.bvn : subject.nin
+  const parts = [
+    normalizedType,
+    identityValue,
+    subject.dateOfBirth,
+    normalizedType === "bvn" ? formatBvnMobileNo(subject.phoneNumber) : "",
+    normalizeNameToken(subject.firstName),
+    normalizeNameToken(subject.middleName),
+    normalizeNameToken(subject.lastName),
+  ]
+
+  return crypto.createHash("sha256").update(parts.join("|")).digest("hex")
+}
+
+function hasVerifiedIdentitySnapshot(snapshot, requestHash) {
+  return Boolean(
+    snapshot &&
+      snapshot.status === "verified" &&
+      snapshot.requestHash &&
+      snapshot.requestHash === requestHash,
+  )
+}
+
+function getMonnifySuccess(response) {
+  return response?.requestSuccessful === true && String(response?.responseCode ?? "") === "0"
+}
+
+function getMonnifyResponseMessage(response, fallback) {
+  return String(response?.responseMessage || response?.message || fallback || "").trim()
+}
+
+function normalizeMonnifyBvnSnapshot(response, subject, requestHash) {
+  const responseBody = response?.responseBody && typeof response.responseBody === "object"
+    ? response.responseBody
+    : {}
+  const nameResult = responseBody.name && typeof responseBody.name === "object"
+    ? responseBody.name
+    : {}
+  const nameMatchStatus = String(
+    nameResult.matchStatus ||
+      responseBody.matchStatus ||
+      responseBody.nameMatchStatus ||
+      "",
+  ).toUpperCase()
+  const nameMatchPercentage = Number(
+    nameResult.matchPercentage ||
+      responseBody.matchPercentage ||
+      responseBody.nameMatchPercentage ||
+      0,
+  )
+  const dateMatchStatus = String(responseBody.dateOfBirth || "").toUpperCase()
+  const mobileMatchStatus = String(responseBody.mobileNo || responseBody.mobileNumber || "").toUpperCase()
+  const providerMatched =
+    typeof responseBody.bvnInformationMatch === "boolean"
+      ? responseBody.bvnInformationMatch
+      : undefined
+  const acceptedNameMatch =
+    nameMatchStatus === "FULL_MATCH" ||
+    (MONNIFY_ACCEPT_PARTIAL_BVN_NAME_MATCH && nameMatchStatus === "PARTIAL_MATCH")
+  const matchedByStatuses =
+    acceptedNameMatch &&
+    (!dateMatchStatus || dateMatchStatus === "FULL_MATCH") &&
+    (!mobileMatchStatus || mobileMatchStatus === "FULL_MATCH")
+  const verified = getMonnifySuccess(response) && (providerMatched === true || (providerMatched === undefined && matchedByStatuses))
+  const now = new Date()
+
+  return {
+    status: verified ? "verified" : "failed",
+    matchStatus: nameMatchStatus || (verified ? "FULL_MATCH" : "NO_MATCH"),
+    matchPercentage: Number.isFinite(nameMatchPercentage) ? nameMatchPercentage : 0,
+    responseCode: String(response?.responseCode ?? ""),
+    responseMessage: getMonnifyResponseMessage(response, verified ? "BVN verification passed." : "BVN verification failed."),
+    requestHash,
+    checkedAt: now,
+    verifiedAt: verified ? now : undefined,
+  }
+}
+
+function namesMatchMonnifyNinResponse(responseBody, subject) {
+  const returnedFirstName = normalizeNameToken(responseBody.firstName)
+  const returnedLastName = normalizeNameToken(responseBody.lastName)
+  const expectedFirstName = normalizeNameToken(subject.firstName)
+  const expectedLastName = normalizeNameToken(subject.lastName)
+
+  return Boolean(
+    returnedFirstName &&
+      returnedLastName &&
+      expectedFirstName &&
+      expectedLastName &&
+      returnedFirstName === expectedFirstName &&
+      returnedLastName === expectedLastName,
+  )
+}
+
+function normalizeMonnifyNinSnapshot(response, subject, requestHash) {
+  const responseBody = response?.responseBody && typeof response.responseBody === "object"
+    ? response.responseBody
+    : {}
+  const providerMatched =
+    typeof responseBody.ninInformationMatch === "boolean"
+      ? responseBody.ninInformationMatch
+      : undefined
+  const dateMatched =
+    !responseBody.dateOfBirth ||
+    normalizeDateForCompare(responseBody.dateOfBirth) === normalizeDateForCompare(subject.dateOfBirth)
+  const localMatched = namesMatchMonnifyNinResponse(responseBody, subject) && dateMatched
+  const verified = getMonnifySuccess(response) && (providerMatched === true || (providerMatched === undefined && localMatched))
+  const now = new Date()
+
+  return {
+    status: verified ? "verified" : "failed",
+    matchStatus: verified ? "FULL_MATCH" : "NO_MATCH",
+    matchPercentage: verified ? 100 : 0,
+    responseCode: String(response?.responseCode ?? ""),
+    responseMessage: getMonnifyResponseMessage(response, verified ? "NIN verification passed." : "NIN verification failed."),
+    requestHash,
+    checkedAt: now,
+    verifiedAt: verified ? now : undefined,
+  }
+}
+
+async function runMonnifyBvnVerification(subject, existingSnapshot, { force = false } = {}) {
+  if (!/^\d{11}$/.test(subject.bvn)) {
+    throw createStatusCodeError("BVN must be 11 digits.", 400)
+  }
+
+  if (!subject.name) {
+    throw createStatusCodeError("Legal name is required for BVN verification.", 400)
+  }
+
+  if (!subject.dateOfBirth || !formatDateForMonnify(subject.dateOfBirth)) {
+    throw createStatusCodeError("Date of birth is required for BVN verification.", 400)
+  }
+
+  const mobileNo = formatBvnMobileNo(subject.phoneNumber)
+
+  if (!/^\d{11,13}$/.test(mobileNo)) {
+    throw createStatusCodeError("A valid phone number is required for BVN verification.", 400)
+  }
+
+  const requestHash = buildIdentityVerificationHash("bvn", subject)
+
+  if (!force && hasVerifiedIdentitySnapshot(existingSnapshot, requestHash)) {
+    return {
+      ...(existingSnapshot.toObject?.() || existingSnapshot),
+      status: "verified",
+      requestHash,
+    }
+  }
+
+  assertMonnifyIdentityVerificationReady("BVN")
+
+  const response = await monnify.verifyBvnDetails({
+    bvn: subject.bvn,
+    name: subject.name,
+    dateOfBirth: formatDateForMonnify(subject.dateOfBirth),
+    mobileNo,
+  })
+
+  const snapshot = normalizeMonnifyBvnSnapshot(response, subject, requestHash)
+
+  if (snapshot.status !== "verified") {
+    throw createStatusCodeError(`BVN verification failed: ${snapshot.responseMessage}`, 400)
+  }
+
+  return snapshot
+}
+
+async function runMonnifyNinVerification(subject, existingSnapshot, { force = false } = {}) {
+  if (!/^\d{11}$/.test(subject.nin)) {
+    throw createStatusCodeError("NIN must be 11 digits.", 400)
+  }
+
+  if (!subject.name) {
+    throw createStatusCodeError("Legal name is required for NIN verification.", 400)
+  }
+
+  if (!subject.dateOfBirth || !formatDateForMonnify(subject.dateOfBirth)) {
+    throw createStatusCodeError("Date of birth is required for NIN verification.", 400)
+  }
+
+  const requestHash = buildIdentityVerificationHash("nin", subject)
+
+  if (!force && hasVerifiedIdentitySnapshot(existingSnapshot, requestHash)) {
+    return {
+      ...(existingSnapshot.toObject?.() || existingSnapshot),
+      status: "verified",
+      requestHash,
+    }
+  }
+
+  assertMonnifyIdentityVerificationReady("NIN")
+
+  const response = await monnify.verifyNin({
+    nin: subject.nin,
+    name: subject.name,
+    dateOfBirth: formatDateForMonnify(subject.dateOfBirth),
+  })
+
+  const snapshot = normalizeMonnifyNinSnapshot(response, subject, requestHash)
+
+  if (snapshot.status !== "verified") {
+    throw createStatusCodeError(`NIN verification failed: ${snapshot.responseMessage}`, 400)
+  }
+
+  return snapshot
+}
+
+function getIdentityVerificationObject(value) {
+  return value?.toObject?.() || value || {}
+}
+
+function applyIdentityVerificationSnapshots(user, snapshots = {}) {
+  const current = getIdentityVerificationObject(user.identityVerification)
+  user.identityVerification = {
+    provider: "monnify",
+    bvn: snapshots.bvn || current.bvn || { status: "unverified" },
+    nin: snapshots.nin || current.nin || { status: "unverified" },
+    updatedAt: new Date(),
+  }
+
+  if (snapshots.bvn) {
+    user.bvnVerified = snapshots.bvn.status === "verified"
+  }
+
+  if (snapshots.nin) {
+    user.ninVerified = snapshots.nin.status === "verified"
+  }
+
+  if (user.bvnVerified && user.ninVerified && user.kycStatus === "incomplete") {
+    user.kycStatus = "pending"
+  }
+}
+
+function markIdentityVerificationStale(user, types = []) {
+  const current = getIdentityVerificationObject(user.identityVerification)
+  const next = {
+    provider: "monnify",
+    bvn: current.bvn || { status: "unverified" },
+    nin: current.nin || { status: "unverified" },
+    updatedAt: new Date(),
+  }
+
+  for (const type of types) {
+    if (type === "bvn") {
+      next.bvn = {
+        ...(next.bvn.toObject?.() || next.bvn),
+        status: "unverified",
+        responseMessage: "Identity details changed after the last BVN verification.",
+        checkedAt: new Date(),
+        verifiedAt: undefined,
+      }
+      user.bvnVerified = false
+    }
+
+    if (type === "nin") {
+      next.nin = {
+        ...(next.nin.toObject?.() || next.nin),
+        status: "unverified",
+        responseMessage: "Identity details changed after the last NIN verification.",
+        checkedAt: new Date(),
+        verifiedAt: undefined,
+      }
+      user.ninVerified = false
+    }
+  }
+
+  user.identityVerification = next
+
+  if (types.length && user.kycStatus === "verified") {
+    user.kycStatus = "pending"
+  }
+}
+
+async function verifyIdentityWithMonnify(subject, options = {}) {
+  const types = Array.isArray(options.types) && options.types.length ? options.types : ["bvn", "nin"]
+  const existing = getIdentityVerificationObject(options.existingVerification)
+  const snapshots = {}
+
+  if (types.includes("bvn")) {
+    snapshots.bvn = await runMonnifyBvnVerification(subject, existing.bvn, options)
+  }
+
+  if (types.includes("nin")) {
+    snapshots.nin = await runMonnifyNinVerification(subject, existing.nin, options)
+  }
+
+  return snapshots
+}
+
+function normalizeIdentityVerificationType(value) {
+  const type = String(value || "both").toLowerCase().trim()
+
+  if (type === "bvn" || type === "nin" || type === "both") {
+    return type
+  }
+
+  return "both"
+}
+
+function getIdentityVerificationTypes(type) {
+  const normalizedType = normalizeIdentityVerificationType(type)
+
+  if (normalizedType === "bvn") return ["bvn"]
+  if (normalizedType === "nin") return ["nin"]
+  return ["bvn", "nin"]
+}
+
+async function verifySavedUserIdentityWithMonnify(user, { type = "both", force = false } = {}) {
+  const types = getIdentityVerificationTypes(type)
+  const subject = getIdentitySubjectFromUser(user)
+  const snapshots = await verifyIdentityWithMonnify(subject, {
+    types,
+    force,
+    existingVerification: user.identityVerification,
+  })
+
+  applyIdentityVerificationSnapshots(user, snapshots)
+  await user.save()
+
+  return snapshots
+}
+
 function getKycDailyReceivingLimit(user) {
   const tier = Number(user?.kycTier) || 1
   const configuredLimit = KYC_DAILY_RECEIVING_LIMITS[tier] || KYC_DAILY_RECEIVING_LIMITS[1]
@@ -963,6 +1453,31 @@ function sanitizeIdentity(identity, fallbackParts = {}) {
         firstName &&
         lastName,
     ),
+  }
+}
+
+function sanitizeIdentityVerification(verification) {
+  const source = verification?.toObject?.() || verification || {}
+
+  const sanitizeSnapshot = (snapshot) => {
+    const item = snapshot?.toObject?.() || snapshot || {}
+
+    return {
+      status: item.status || "unverified",
+      matchStatus: item.matchStatus || "",
+      matchPercentage: Number(item.matchPercentage) || 0,
+      responseCode: item.responseCode || "",
+      responseMessage: item.responseMessage || "",
+      checkedAt: item.checkedAt || "",
+      verifiedAt: item.verifiedAt || "",
+    }
+  }
+
+  return {
+    provider: source.provider || "monnify",
+    bvn: sanitizeSnapshot(source.bvn),
+    nin: sanitizeSnapshot(source.nin),
+    updatedAt: source.updatedAt || "",
   }
 }
 
@@ -2019,6 +2534,7 @@ function sanitizeUser(user) {
     kyc: sanitizeKyc(user),
     wallet: sanitizeWallet(user.wallet),
     identity: sanitizeIdentity(user.identity, nameParts),
+    identityVerification: sanitizeIdentityVerification(user.identityVerification),
     payoutProfile: sanitizePayoutProfile(user.payoutProfile),
     virtualAccount: user.virtualAccount || null,
     createdAt: user.createdAt,
@@ -3486,8 +4002,8 @@ async function createPaystackDedicatedAccountForUser(user) {
 
   user.virtualAccount = virtualAccount
   user.kycStatus = user.kycStatus === "verified" ? user.kycStatus : "pending"
-  user.bvnVerified = Boolean(user.bvnVerified || validationResult)
-  user.ninVerified = Boolean(user.ninVerified || user.identity?.nin)
+  user.bvnVerified = Boolean(user.bvnVerified)
+  user.ninVerified = Boolean(user.ninVerified)
   user.wallet = {
     ...getDefaultWallet(),
     ...(user.wallet?.toObject?.() || user.wallet || {}),
@@ -3630,19 +4146,7 @@ async function requeryPaystackVirtualAccountForUser(user, date = "", actorType =
 }
 
 async function getMonnifyAccessToken() {
-  const credentials = Buffer.from(`${MONNIFY_API_KEY}:${MONNIFY_SECRET_KEY}`).toString("base64")
-
-  const response = await axios.post(
-    `${MONNIFY_BASE_URL}/api/v1/auth/login`,
-    {},
-    {
-      headers: {
-        Authorization: `Basic ${credentials}`,
-      },
-    },
-  )
-
-  return response.data?.responseBody?.accessToken
+  return monnify.getAccessToken()
 }
 
 async function getMonnifyTransactionStatus(transactionReference) {
@@ -5922,6 +6426,33 @@ app.post("/auth/register", async (req, res) => {
       })
     }
 
+    let identityVerification
+
+    try {
+      identityVerification = await verifyIdentityWithMonnify(
+        getIdentitySubject({
+          bvn: trimmedBvn,
+          nin: trimmedNin,
+          dateOfBirth: trimmedDateOfBirth,
+          phoneNumber: cleanPhoneNumber,
+          firstName: legal.first,
+          middleName: legal.middle,
+          lastName: legal.last,
+        }),
+      )
+    } catch (error) {
+      const message = getAxiosErrorMessage(
+        error,
+        error instanceof Error ? error.message : "Identity verification failed.",
+      )
+      console.error("register.identity_verification_failed", message)
+      const statusCode = Number(error?.statusCode || 0)
+
+      return res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
+        error: message || "Could not verify BVN/NIN details with Monnify.",
+      })
+    }
+
     user = await User.create({
       name: trimmedName,
       firstName: legal.first,
@@ -5936,8 +6467,8 @@ app.post("/auth/register", async (req, res) => {
       phoneVerified: false,
       kycTier: 1,
       kycStatus: "pending",
-      bvnVerified: true,
-      ninVerified: true,
+      bvnVerified: identityVerification.bvn?.status === "verified",
+      ninVerified: identityVerification.nin?.status === "verified",
       bankAccountMatched: true,
       manualReviewStatus: "not_required",
       wallet: {
@@ -5955,6 +6486,11 @@ app.post("/auth/register", async (req, res) => {
         lastName: legal.last,
         policyAcceptedAt: new Date(),
         signupCompletedAt: new Date(),
+      },
+      identityVerification: {
+        provider: "monnify",
+        ...identityVerification,
+        updatedAt: new Date(),
       },
       payoutProfile,
     })
@@ -7360,6 +7896,7 @@ app.put("/user", requireSessionUser, async (req, res) => {
       lastName:
         typeof req.body?.lastName === "string" ? req.body.lastName : currentNameParts.lastName,
     })
+    const previousIdentitySubject = getIdentitySubjectFromUser(user)
 
     if (!nextEmail) {
       return res.status(400).json({ error: "Email is required." })
@@ -7388,12 +7925,15 @@ app.put("/user", requireSessionUser, async (req, res) => {
     user.profileImage = nextProfileImage
     user.identity = user.identity || { bvn: "", nin: "" }
 
+    const verificationTypes = []
+
     if (nextBvn !== undefined && nextBvn !== "") {
       if (!/^\d{11}$/.test(nextBvn)) {
         return res.status(400).json({ error: "BVN must be 11 digits." })
       }
 
       user.identity.bvn = nextBvn
+      verificationTypes.push("bvn")
     }
 
     if (nextNin !== undefined && nextNin !== "") {
@@ -7402,6 +7942,48 @@ app.put("/user", requireSessionUser, async (req, res) => {
       }
 
       user.identity.nin = nextNin
+      verificationTypes.push("nin")
+    }
+
+    if (verificationTypes.length > 0) {
+      try {
+        const snapshots = await verifyIdentityWithMonnify(getIdentitySubjectFromUser(user), {
+          types: Array.from(new Set(verificationTypes)),
+          existingVerification: user.identityVerification,
+        })
+        applyIdentityVerificationSnapshots(user, snapshots)
+      } catch (error) {
+        const message = getAxiosErrorMessage(
+          error,
+          error instanceof Error ? error.message : "Identity verification failed.",
+        )
+        console.error("user.identity_verification_failed", message)
+        const statusCode = Number(error?.statusCode || 0)
+
+        return res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
+          error: message || "Could not verify BVN/NIN details with Monnify.",
+        })
+      }
+    } else {
+      const nextIdentitySubject = getIdentitySubjectFromUser(user)
+      const legalNameChanged =
+        previousIdentitySubject.firstName !== nextIdentitySubject.firstName ||
+        previousIdentitySubject.middleName !== nextIdentitySubject.middleName ||
+        previousIdentitySubject.lastName !== nextIdentitySubject.lastName
+      const phoneChanged = previousIdentitySubject.phoneNumber !== nextIdentitySubject.phoneNumber
+      const staleTypes = []
+
+      if ((legalNameChanged || phoneChanged) && user.identity.bvn) {
+        staleTypes.push("bvn")
+      }
+
+      if (legalNameChanged && user.identity.nin) {
+        staleTypes.push("nin")
+      }
+
+      if (staleTypes.length > 0) {
+        markIdentityVerificationStale(user, staleTypes)
+      }
     }
 
     if (user.virtualAccount) {
@@ -8482,6 +9064,54 @@ app.post("/portal/users/:id/paystack-requery", requireAdminSession, async (req, 
   }
 })
 
+app.post("/portal/users/:id/identity-verification", requireAdminSession, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid user ID." })
+    }
+
+    const user = await User.findById(req.params.id)
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found." })
+    }
+
+    const type = normalizeIdentityVerificationType(req.body?.type)
+    const verification = await verifySavedUserIdentityWithMonnify(user, {
+      type,
+      force: req.body?.force === true,
+    })
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.user.identity_verified",
+      message: `Admin ran Monnify ${type.toUpperCase()} verification for ${user.email}.`,
+      metadata: {
+        userId: user._id.toString(),
+        type,
+        bvnStatus: verification.bvn?.status || "",
+        ninStatus: verification.nin?.status || "",
+      },
+    })
+
+    res.json({
+      user: sanitizeUser(user),
+      verification: sanitizeIdentityVerification(user.identityVerification),
+    })
+  } catch (error) {
+    const message = getAxiosErrorMessage(
+      error,
+      error instanceof Error ? error.message : "Identity verification failed.",
+    )
+    console.error("portal.user.identity_verification_failed", message)
+    const statusCode = Number(error?.statusCode || 0)
+    res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
+      error: message || "Could not verify this user's identity with Monnify.",
+    })
+  }
+})
+
 app.patch("/portal/users/:id", requireAdminSession, async (req, res) => {
   try {
     const user = await User.findById(req.params.id)
@@ -9076,6 +9706,50 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to update user." })
+  }
+})
+
+app.post("/admin/users/:id/identity-verification", requireAdminSession, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id)
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found." })
+    }
+
+    const type = normalizeIdentityVerificationType(req.body?.type)
+    const verification = await verifySavedUserIdentityWithMonnify(user, {
+      type,
+      force: req.body?.force === true,
+    })
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "admin.user.identity_verified",
+      message: `Admin ran Monnify ${type.toUpperCase()} verification for ${user.email}.`,
+      metadata: {
+        userId: user._id.toString(),
+        type,
+        bvnStatus: verification.bvn?.status || "",
+        ninStatus: verification.nin?.status || "",
+      },
+    })
+
+    res.json({
+      user: sanitizeUser(user),
+      verification: sanitizeIdentityVerification(user.identityVerification),
+    })
+  } catch (error) {
+    const message = getAxiosErrorMessage(
+      error,
+      error instanceof Error ? error.message : "Identity verification failed.",
+    )
+    console.error("admin.user.identity_verification_failed", message)
+    const statusCode = Number(error?.statusCode || 0)
+    res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
+      error: message || "Could not verify this user's identity with Monnify.",
+    })
   }
 })
 
