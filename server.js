@@ -1448,12 +1448,20 @@ function getDefaultWallet() {
   }
 }
 
-function sanitizeIdentity(identity, fallbackParts = {}) {
+function sanitizeIdentity(identity, fallbackParts = {}, options = {}) {
   const bvn = String(identity?.bvn || "").trim()
   const nin = String(identity?.nin || "").trim()
   const firstName = String(identity?.firstName || fallbackParts.firstName || "").trim()
   const middleName = String(identity?.middleName || fallbackParts.middleName || "").trim()
   const lastName = String(identity?.lastName || fallbackParts.lastName || "").trim()
+  const hasRequiredIdentityFields = Boolean(
+    bvn &&
+      nin &&
+      String(identity?.dateOfBirth || "").trim() &&
+      firstName &&
+      lastName,
+  )
+  const hasCompletedSignupFallback = Boolean(options?.payoutProfileLocked || identity?.signupCompletedAt)
 
   return {
     hasBvn: Boolean(bvn),
@@ -1467,13 +1475,7 @@ function sanitizeIdentity(identity, fallbackParts = {}) {
     lastName,
     policyAcceptedAt: identity?.policyAcceptedAt || "",
     signupCompletedAt: identity?.signupCompletedAt || "",
-    isComplete: Boolean(
-      bvn &&
-        nin &&
-        String(identity?.dateOfBirth || "").trim() &&
-        firstName &&
-        lastName,
-    ),
+    isComplete: hasRequiredIdentityFields || hasCompletedSignupFallback,
   }
 }
 
@@ -2581,7 +2583,9 @@ function sanitizeUser(user) {
     kycStatus: user.kycStatus || "incomplete",
     kyc: sanitizeKyc(user),
     wallet: sanitizeWallet(user.wallet),
-    identity: sanitizeIdentity(user.identity, nameParts),
+    identity: sanitizeIdentity(user.identity, nameParts, {
+      payoutProfileLocked: Boolean(user.payoutProfile?.locked),
+    }),
     identityVerification: sanitizeIdentityVerification(user.identityVerification),
     payoutProfile: sanitizePayoutProfile(user.payoutProfile),
     virtualAccount: user.virtualAccount || null,
