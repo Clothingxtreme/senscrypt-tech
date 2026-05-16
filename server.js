@@ -9073,10 +9073,11 @@ app.get("/portal/users/:id", requireAdminSession, async (req, res) => {
       return res.status(404).json({ error: "User not found." })
     }
 
-    const [payouts, changeRequests, donations] = await Promise.all([
+    const [payouts, changeRequests, donations, balance] = await Promise.all([
       Payout.find({ creatorId: user._id }).sort({ createdAt: -1 }).limit(25),
       PayoutProfileChangeRequest.find({ creatorId: user._id }).sort({ createdAt: -1 }).limit(10),
       Donation.find({ creatorId: user._id }).sort({ date: -1 }).limit(50),
+      getRevenueTotals({ creatorId: user._id }),
     ])
 
     res.json({
@@ -9084,6 +9085,7 @@ app.get("/portal/users/:id", requireAdminSession, async (req, res) => {
       payouts: payouts.map(sanitizePortalPayout),
       changeRequests: changeRequests.map(sanitizePayoutProfileChangeRequest),
       donations: donations.map(sanitizePortalDonation),
+      balance,
     })
   } catch (error) {
     console.error(error)
