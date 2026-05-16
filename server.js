@@ -40,6 +40,8 @@ const MONNIFY_NIN_VERIFICATION_PATH =
   readEnv("MONNIFY_NIN_VERIFICATION_PATH") || "/api/v1/vas/nin-verification"
 const MONNIFY_ACCEPT_PARTIAL_BVN_NAME_MATCH =
   /^(1|true|yes)$/i.test(readEnv("MONNIFY_ACCEPT_PARTIAL_BVN_NAME_MATCH"))
+const MONNIFY_ACCEPT_BVN_MOBILE_MISMATCH =
+  /^(1|true|yes)$/i.test(readEnv("MONNIFY_ACCEPT_BVN_MOBILE_MISMATCH"))
 const FRONTEND_ORIGIN = readEnv("FRONTEND_ORIGIN")
 const MONNIFY_WEBHOOK_IP_ALLOWLIST = readEnv("MONNIFY_WEBHOOK_IP_ALLOWLIST")
 const PAYSTACK_SECRET_KEY = readEnv("PAYSTACK_SECRET_KEY")
@@ -1142,21 +1144,38 @@ function normalizeMonnifyBvnSnapshot(response, subject, requestHash) {
   const acceptedNameMatch =
     nameMatchStatus === "FULL_MATCH" ||
     (MONNIFY_ACCEPT_PARTIAL_BVN_NAME_MATCH && nameMatchStatus === "PARTIAL_MATCH")
+  const acceptedDateMatch = !dateMatchStatus || dateMatchStatus === "FULL_MATCH"
+  const hasMobileStatus = Boolean(mobileMatchStatus)
+  const acceptedMobileMatch = !mobileMatchStatus || mobileMatchStatus === "FULL_MATCH"
+  const acceptedMobileMismatchOverride =
+    MONNIFY_ACCEPT_BVN_MOBILE_MISMATCH &&
+    hasMobileStatus &&
+    mobileMatchStatus !== "FULL_MATCH" &&
+    nameMatchStatus === "FULL_MATCH" &&
+    acceptedDateMatch
   const matchedByStatuses =
     acceptedNameMatch &&
-    (!dateMatchStatus || dateMatchStatus === "FULL_MATCH") &&
-    (!mobileMatchStatus || mobileMatchStatus === "FULL_MATCH")
-  const verified = getMonnifySuccess(response) && (providerMatched === true || (providerMatched === undefined && matchedByStatuses))
+    acceptedDateMatch &&
+    (acceptedMobileMatch || acceptedMobileMismatchOverride)
+  const verified =
+    getMonnifySuccess(response) &&
+    (
+      providerMatched === true ||
+      ((providerMatched === undefined || acceptedMobileMismatchOverride) && matchedByStatuses)
+    )
   const now = new Date()
+  const verificationMessage = verified
+    ? acceptedMobileMismatchOverride
+      ? "BVN verification passed with a mobile-number mismatch override. Name and date of birth matched."
+      : getMonnifyResponseMessage(response, "BVN verification passed.")
+    : "BVN information did not match Monnify records."
 
   return {
     status: verified ? "verified" : "failed",
     matchStatus: nameMatchStatus || (verified ? "FULL_MATCH" : "NO_MATCH"),
     matchPercentage: Number.isFinite(nameMatchPercentage) ? nameMatchPercentage : 0,
     responseCode: String(response?.responseCode ?? ""),
-    responseMessage: verified
-      ? getMonnifyResponseMessage(response, "BVN verification passed.")
-      : "BVN information did not match Monnify records.",
+    responseMessage: verificationMessage,
     requestHash,
     checkedAt: now,
     verifiedAt: verified ? now : undefined,
