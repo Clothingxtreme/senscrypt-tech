@@ -926,6 +926,10 @@ const userSchema = new mongoose.Schema(
         matchPercentage: { type: Number, default: 0 },
         responseCode: { type: String, default: "" },
         responseMessage: { type: String, default: "" },
+        validationError: { type: String, default: "" },
+        failureReason: { type: String, default: "" },
+        mismatches: { type: [Object], default: [] },
+        lastValidationResponse: { type: Object, default: {} },
         requestHash: { type: String, default: "" },
         checkedAt: Date,
         verifiedAt: Date,
@@ -940,6 +944,10 @@ const userSchema = new mongoose.Schema(
         matchPercentage: { type: Number, default: 0 },
         responseCode: { type: String, default: "" },
         responseMessage: { type: String, default: "" },
+        validationError: { type: String, default: "" },
+        failureReason: { type: String, default: "" },
+        mismatches: { type: [Object], default: [] },
+        lastValidationResponse: { type: Object, default: {} },
         requestHash: { type: String, default: "" },
         checkedAt: Date,
         verifiedAt: Date,
@@ -1359,6 +1367,231 @@ function getMonnifyResponseMessage(response, fallback) {
   return String(response?.responseMessage || response?.message || fallback || "").trim()
 }
 
+function sanitizeMonnifyPayloadValue(value) {
+  if (value === null || value === undefined) return ""
+  if (typeof value === "number" || typeof value === "boolean") return value
+  return String(value).trim()
+}
+
+function sanitizeMonnifyProviderResponse(type, response) {
+  const responseBody =
+    response?.responseBody && typeof response.responseBody === "object" ? response.responseBody : {}
+  const lowerType = String(type || "").toLowerCase()
+  const base = {
+    type: lowerType === "nin" ? "NIN" : "BVN",
+    requestSuccessful: Boolean(response?.requestSuccessful),
+    responseCode: String(response?.responseCode ?? ""),
+    responseMessage: getMonnifyResponseMessage(response, ""),
+    providerMatched:
+      lowerType === "nin"
+        ? typeof responseBody.ninInformationMatch === "boolean"
+          ? responseBody.ninInformationMatch
+          : undefined
+        : typeof responseBody.bvnInformationMatch === "boolean"
+          ? responseBody.bvnInformationMatch
+          : undefined,
+  }
+
+  if (lowerType === "bvn") {
+    const namePayload = responseBody.name && typeof responseBody.name === "object" ? responseBody.name : {}
+    return {
+      ...base,
+      nameMatchStatus: sanitizeMonnifyPayloadValue(
+        namePayload.matchStatus || responseBody.matchStatus || responseBody.nameMatchStatus,
+      ),
+      nameMatchPercentage: Number(
+        namePayload.matchPercentage || responseBody.matchPercentage || responseBody.nameMatchPercentage || 0,
+      ),
+      dateOfBirthMatchStatus: sanitizeMonnifyPayloadValue(responseBody.dateOfBirth),
+      mobileMatchStatus: sanitizeMonnifyPayloadValue(responseBody.mobileNo || responseBody.mobileNumber),
+    }
+  }
+
+  return {
+    ...base,
+    firstName: sanitizeMonnifyPayloadValue(responseBody.firstName),
+    middleName: sanitizeMonnifyPayloadValue(responseBody.middleName),
+    lastName: sanitizeMonnifyPayloadValue(responseBody.lastName),
+    dateOfBirth: sanitizeMonnifyPayloadValue(responseBody.dateOfBirth),
+    phoneNumber: sanitizeMonnifyPayloadValue(responseBody.phoneNumber || responseBody.mobileNo || responseBody.mobileNumber),
+    gender: sanitizeMonnifyPayloadValue(responseBody.gender),
+  }
+}
+
+function createMismatch(field, expected, received, message) {
+  return {
+    field,
+    expected: expected ?? "",
+    received: received ?? "",
+    status: "NO_MATCH",
+    message: String(message || "").trim() || `${field} does not match.`,
+  }
+}
+
+function inferMonnifyFailureReason(type, providerMessage, mismatches = [], providerMatched) {
+  if (mismatches.some((item) => item.field === "firstName")) return "FIRST_NAME_MISMATCH"
+  if (mismatches.some((item) => item.field === "middleName")) return "MIDDLE_NAME_MISMATCH"
+  if (mismatches.some((item) => item.field === "lastName")) return "LAST_NAME_MISMATCH"
+  if (mismatches.some((item) => item.field === "name")) return "NAME_MISMATCH"
+  if (mismatches.some((item) => item.field === "dateOfBirth")) return "DATE_OF_BIRTH_MISMATCH"
+  if (mismatches.some((item) => item.field === "mobileNumber" || item.field === "phoneNumber")) {
+    return "PHONE_NUMBER_MISMATCH"
+  }
+
+  const message = String(providerMessage || "").toLowerCase()
+  if (message.includes("invalid bvn") || message.includes("invalid nin") || message.includes("invalid")) {
+    return "INVALID_FORMAT"
+  }
+  if (
+    message.includes("not found") ||
+    message.includes("does not exist") ||
+    message.includes("no record")
+  ) {
+    return String(type || "").toUpperCase() === "NIN" ? "NIN_NOT_FOUND" : "BVN_NOT_FOUND"
+  }
+  if (message.includes("service unavailable") || message.includes("temporarily unavailable")) {
+    return "PROVIDER_SERVER_ERROR"
+  }
+  if (providerMatched === false) {
+    return "PROVIDER_MISMATCH"
+  }
+  return "VERIFICATION_FAILED"
+}
+
+function buildFailureMessageFromReason(type, reason) {
+  const upperType = String(type || "").toUpperCase()
+  const map = {
+    FIRST_NAME_MISMATCH: `Submitted first name does not match ${upperType} record.`,
+    MIDDLE_NAME_MISMATCH: `Submitted middle name does not match ${upperType} record.`,
+    LAST_NAME_MISMATCH: `Submitted last name does not match ${upperType} record.`,
+    NAME_MISMATCH: `Submitted name does not match ${upperType} record.`,
+    DATE_OF_BIRTH_MISMATCH: `Submitted date of birth does not match ${upperType} record.`,
+    PHONE_NUMBER_MISMATCH: `Submitted phone number does not match ${upperType} record.`,
+    INVALID_FORMAT: `${upperType} format is invalid.`,
+    BVN_NOT_FOUND: "BVN record was not found.",
+    NIN_NOT_FOUND: "NIN record was not found.",
+    PROVIDER_SERVER_ERROR: "Provider service error while validating identity.",
+    PROVIDER_MISMATCH: `${upperType} information does not match provider record.`,
+    VERIFICATION_FAILED: `${upperType} verification failed.`,
+  }
+  return map[reason] || `${upperType} verification failed.`
+}
+
+function analyzeKycMismatch({ type, submittedUserData, providerResponse }) {
+  const normalizedType = String(type || "").toUpperCase() === "NIN" ? "NIN" : "BVN"
+  const subject = submittedUserData || {}
+  const response = providerResponse || {}
+  const responseBody = response?.responseBody && typeof response.responseBody === "object" ? response.responseBody : {}
+  const providerMessage = getMonnifyResponseMessage(response, `${normalizedType} verification failed.`)
+  const providerMatched =
+    normalizedType === "NIN"
+      ? typeof responseBody.ninInformationMatch === "boolean"
+        ? responseBody.ninInformationMatch
+        : undefined
+      : typeof responseBody.bvnInformationMatch === "boolean"
+        ? responseBody.bvnInformationMatch
+        : undefined
+  const mismatches = []
+
+  if (normalizedType === "BVN") {
+    const namePayload = responseBody.name && typeof responseBody.name === "object" ? responseBody.name : {}
+    const nameMatchStatus = String(
+      namePayload.matchStatus || responseBody.matchStatus || responseBody.nameMatchStatus || "",
+    ).toUpperCase()
+    const dateMatchStatus = String(responseBody.dateOfBirth || "").toUpperCase()
+    const mobileMatchStatus = String(responseBody.mobileNo || responseBody.mobileNumber || "").toUpperCase()
+
+    if (nameMatchStatus && nameMatchStatus !== "FULL_MATCH" && nameMatchStatus !== "PARTIAL_MATCH") {
+      mismatches.push(
+        createMismatch(
+          "name",
+          String(subject.name || "").trim(),
+          String(responseBody.name || "").trim(),
+          "Submitted full name does not match BVN record.",
+        ),
+      )
+    }
+    if (dateMatchStatus && dateMatchStatus !== "FULL_MATCH") {
+      mismatches.push(
+        createMismatch(
+          "dateOfBirth",
+          String(subject.dateOfBirth || "").trim(),
+          String(responseBody.dateOfBirth || "").trim(),
+          "Submitted date of birth does not match BVN record.",
+        ),
+      )
+    }
+    if (mobileMatchStatus && mobileMatchStatus !== "FULL_MATCH") {
+      mismatches.push(
+        createMismatch(
+          "mobileNumber",
+          formatBvnMobileNo(subject.phoneNumber),
+          sanitizeMonnifyPayloadValue(responseBody.mobileNo || responseBody.mobileNumber),
+          "Submitted phone number does not match BVN-linked phone number.",
+        ),
+      )
+    }
+  } else {
+    const compareRows = [
+      { field: "firstName", expected: subject.firstName, received: responseBody.firstName, label: "first name" },
+      { field: "middleName", expected: subject.middleName, received: responseBody.middleName, label: "middle name" },
+      { field: "lastName", expected: subject.lastName, received: responseBody.lastName, label: "last name" },
+      { field: "dateOfBirth", expected: subject.dateOfBirth, received: responseBody.dateOfBirth, label: "date of birth" },
+      { field: "phoneNumber", expected: subject.phoneNumber, received: responseBody.phoneNumber || responseBody.mobileNo, label: "phone number" },
+    ]
+
+    for (const row of compareRows) {
+      const expectedRaw = String(row.expected || "").trim()
+      const receivedRaw = String(row.received || "").trim()
+      if (!expectedRaw || !receivedRaw) continue
+
+      const expectedValue =
+        row.field === "dateOfBirth"
+          ? normalizeDateForCompare(expectedRaw)
+          : row.field === "phoneNumber"
+            ? formatBvnMobileNo(expectedRaw)
+            : normalizeNameToken(expectedRaw)
+      const receivedValue =
+        row.field === "dateOfBirth"
+          ? normalizeDateForCompare(receivedRaw)
+          : row.field === "phoneNumber"
+            ? formatBvnMobileNo(receivedRaw)
+            : normalizeNameToken(receivedRaw)
+
+      if (expectedValue && receivedValue && expectedValue !== receivedValue) {
+        mismatches.push(
+          createMismatch(
+            row.field,
+            expectedRaw,
+            receivedRaw,
+            `Submitted ${row.label} does not match NIN record.`,
+          ),
+        )
+      }
+    }
+  }
+
+  const passed =
+    getMonnifySuccess(response) &&
+    (providerMatched === true || (providerMatched === undefined && mismatches.length === 0))
+  const reason = passed
+    ? "VERIFIED"
+    : inferMonnifyFailureReason(normalizedType, providerMessage, mismatches, providerMatched)
+  const message = passed
+    ? `${normalizedType} verified successfully.`
+    : buildFailureMessageFromReason(normalizedType, reason)
+
+  return {
+    type: normalizedType,
+    passed,
+    reason,
+    message,
+    mismatches,
+    providerMessage,
+    providerMatched,
+  }
+}
+
 function normalizeMonnifyBvnSnapshot(response, subject, requestHash) {
   const responseBody = response?.responseBody && typeof response.responseBody === "object"
     ? response.responseBody
@@ -1407,6 +1640,11 @@ function normalizeMonnifyBvnSnapshot(response, subject, requestHash) {
       ((providerMatched === undefined || acceptedMobileMismatchOverride) && matchedByStatuses)
     )
   const now = new Date()
+  const mismatchAnalysis = analyzeKycMismatch({
+    type: "BVN",
+    submittedUserData: subject,
+    providerResponse: response,
+  })
   const verificationMessage = verified
     ? acceptedMobileMismatchOverride
       ? "BVN verification passed with a mobile-number mismatch override. Name and date of birth matched."
@@ -1419,6 +1657,10 @@ function normalizeMonnifyBvnSnapshot(response, subject, requestHash) {
     matchPercentage: Number.isFinite(nameMatchPercentage) ? nameMatchPercentage : 0,
     responseCode: String(response?.responseCode ?? ""),
     responseMessage: verificationMessage,
+    validationError: verified ? "" : mismatchAnalysis.message,
+    failureReason: verified ? "" : mismatchAnalysis.reason,
+    mismatches: mismatchAnalysis.mismatches,
+    lastValidationResponse: sanitizeMonnifyProviderResponse("bvn", response),
     requestHash,
     checkedAt: now,
     verifiedAt: verified ? now : undefined,
@@ -1455,6 +1697,11 @@ function normalizeMonnifyNinSnapshot(response, subject, requestHash) {
   const localMatched = namesMatchMonnifyNinResponse(responseBody, subject) && dateMatched
   const verified = getMonnifySuccess(response) && (providerMatched === true || (providerMatched === undefined && localMatched))
   const now = new Date()
+  const mismatchAnalysis = analyzeKycMismatch({
+    type: "NIN",
+    submittedUserData: subject,
+    providerResponse: response,
+  })
 
   return {
     status: verified ? "verified" : "failed",
@@ -1464,6 +1711,10 @@ function normalizeMonnifyNinSnapshot(response, subject, requestHash) {
     responseMessage: verified
       ? getMonnifyResponseMessage(response, "NIN verification passed.")
       : "NIN information did not match Monnify records.",
+    validationError: verified ? "" : mismatchAnalysis.message,
+    failureReason: verified ? "" : mismatchAnalysis.reason,
+    mismatches: mismatchAnalysis.mismatches,
+    lastValidationResponse: sanitizeMonnifyProviderResponse("nin", response),
     requestHash,
     checkedAt: now,
     verifiedAt: verified ? now : undefined,
@@ -1573,6 +1824,29 @@ function applyIdentityVerificationSnapshots(user, snapshots = {}) {
   }
 }
 
+function buildIdentityFailureSnapshot(type, message, requestHash = "") {
+  const upperType = String(type || "").toUpperCase()
+  const now = new Date()
+  return {
+    status: "failed",
+    matchStatus: "NO_MATCH",
+    matchPercentage: 0,
+    responseCode: "",
+    responseMessage: String(message || `${upperType} verification failed.`).trim(),
+    validationError: String(message || `${upperType} verification failed.`).trim(),
+    failureReason: "PROVIDER_SERVER_ERROR",
+    mismatches: [],
+    lastValidationResponse: {
+      type: upperType,
+      requestSuccessful: false,
+      responseMessage: String(message || `${upperType} verification failed.`).trim(),
+    },
+    requestHash,
+    checkedAt: now,
+    verifiedAt: undefined,
+  }
+}
+
 function markIdentityVerificationStale(user, types = []) {
   const current = getIdentityVerificationObject(user.identityVerification)
   const next = {
@@ -1588,6 +1862,10 @@ function markIdentityVerificationStale(user, types = []) {
         ...(next.bvn.toObject?.() || next.bvn),
         status: "unverified",
         responseMessage: "Identity details changed after the last BVN verification.",
+        validationError: "Identity details changed after the last BVN verification.",
+        failureReason: "IDENTITY_DETAILS_CHANGED",
+        mismatches: [],
+        lastValidationResponse: {},
         checkedAt: new Date(),
         verifiedAt: undefined,
       }
@@ -1599,6 +1877,10 @@ function markIdentityVerificationStale(user, types = []) {
         ...(next.nin.toObject?.() || next.nin),
         status: "unverified",
         responseMessage: "Identity details changed after the last NIN verification.",
+        validationError: "Identity details changed after the last NIN verification.",
+        failureReason: "IDENTITY_DETAILS_CHANGED",
+        mismatches: [],
+        lastValidationResponse: {},
         checkedAt: new Date(),
         verifiedAt: undefined,
       }
@@ -1687,6 +1969,73 @@ async function verifySavedUserIdentityWithMonnify(user, { type = "both", force =
   await user.save()
 
   return snapshots
+}
+
+function getUserFriendlyIdentityErrorMessage(type) {
+  const normalizedType = normalizeIdentityVerificationType(type)
+  if (normalizedType === "bvn") {
+    return "Your BVN could not be verified. Please confirm that your name, date of birth, and BVN-linked phone number are correct."
+  }
+  if (normalizedType === "nin") {
+    return "Your NIN could not be verified. Please confirm that your name and date of birth match your official NIN record."
+  }
+  return "Your BVN/NIN could not be fully verified. Please confirm your identity details and try again."
+}
+
+function buildIdentityVerificationAdminResponse({ user, type, snapshots, includeSubmittedIdentity = true }) {
+  const normalizedType = normalizeIdentityVerificationType(type)
+  const requestedTypes = getIdentityVerificationTypes(normalizedType)
+  const current = getIdentityVerificationObject(user.identityVerification)
+  const responsePerType = {}
+
+  for (const requestedType of requestedTypes) {
+    const snapshot = snapshots?.[requestedType] || current?.[requestedType] || {}
+    responsePerType[requestedType] = {
+      type: requestedType.toUpperCase(),
+      verified: snapshot?.status === "verified",
+      status: snapshot?.status || "unverified",
+      message:
+        snapshot?.status === "verified"
+          ? `${requestedType.toUpperCase()} verified successfully.`
+          : snapshot?.validationError || snapshot?.responseMessage || `${requestedType.toUpperCase()} verification failed.`,
+      mismatches: Array.isArray(snapshot?.mismatches) ? snapshot.mismatches : [],
+      providerMessage: snapshot?.responseMessage || "",
+      providerResponse: snapshot?.lastValidationResponse || {},
+      checkedAt: snapshot?.checkedAt || "",
+      reason: snapshot?.failureReason || "",
+    }
+  }
+
+  const results = Object.values(responsePerType)
+  const allVerified = results.length > 0 && results.every((item) => item.verified)
+  const combinedMismatches = results.flatMap((item) => item.mismatches || [])
+  const combinedProviderMessage = results.map((item) => item.providerMessage).filter(Boolean).join(" | ")
+  const combinedMessage = allVerified
+    ? normalizedType === "both"
+      ? "BVN and NIN verified successfully."
+      : `${normalizedType.toUpperCase()} verified successfully.`
+    : results.find((item) => !item.verified)?.message ||
+      `${normalizedType.toUpperCase()} verification failed.`
+
+  return {
+    success: allVerified,
+    type: normalizedType === "both" ? "BOTH" : normalizedType.toUpperCase(),
+    verified: allVerified,
+    status: allVerified ? "verified" : "failed",
+    message: combinedMessage,
+    mismatches: combinedMismatches,
+    providerMessage: combinedProviderMessage,
+    checkedAt: new Date().toISOString(),
+    ...(includeSubmittedIdentity
+      ? {
+          submittedIdentity: {
+            bvn: String(user?.identity?.bvn || "").trim(),
+            nin: String(user?.identity?.nin || "").trim(),
+          },
+        }
+      : {}),
+    results: responsePerType,
+  }
 }
 
 function getKycDailyReceivingLimit(user) {
@@ -1897,6 +2246,8 @@ function sanitizeIdentityVerification(verification) {
       matchPercentage: Number(item.matchPercentage) || 0,
       responseCode: item.responseCode || "",
       responseMessage: item.responseMessage || "",
+      validationError: item.validationError || "",
+      failureReason: item.failureReason || "",
       checkedAt: item.checkedAt || "",
       verifiedAt: item.verifiedAt || "",
     }
@@ -8725,18 +9076,42 @@ app.put("/user", requireSessionUser, async (req, res) => {
         const snapshots = await verifyIdentityWithMonnify(getIdentitySubjectFromUser(user), {
           types: Array.from(new Set(verificationTypes)),
           existingVerification: user.identityVerification,
+          throwOnFailed: false,
         })
         applyIdentityVerificationSnapshots(user, snapshots)
+        const failedTypes = Object.entries(snapshots)
+          .filter(([, snapshot]) => snapshot?.status !== "verified")
+          .map(([type]) => type)
+
+        if (failedTypes.length > 0) {
+          await user.save()
+          const preferredType =
+            failedTypes.length === 1 ? failedTypes[0] : normalizeIdentityVerificationType("both")
+          return res.status(400).json({
+            error: getUserFriendlyIdentityErrorMessage(preferredType),
+          })
+        }
       } catch (error) {
         const message = getAxiosErrorMessage(
           error,
           error instanceof Error ? error.message : "Identity verification failed.",
         )
         console.error("user.identity_verification_failed", message)
+        const failedSnapshots = {}
+        const identitySubject = getIdentitySubjectFromUser(user)
+        for (const verificationType of verificationTypes) {
+          failedSnapshots[verificationType] = buildIdentityFailureSnapshot(
+            verificationType,
+            message || `${verificationType.toUpperCase()} verification failed.`,
+            buildIdentityVerificationHash(verificationType, identitySubject),
+          )
+        }
+        applyIdentityVerificationSnapshots(user, failedSnapshots)
+        await user.save()
         const statusCode = Number(error?.statusCode || 0)
 
         return res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
-          error: message || "Could not verify BVN/NIN details with Monnify.",
+          error: getUserFriendlyIdentityErrorMessage(verificationTypes.length === 1 ? verificationTypes[0] : "both"),
         })
       }
     } else {
@@ -10081,6 +10456,7 @@ app.post("/portal/users/:id/paystack-requery", requireAdminSession, async (req, 
 })
 
 app.post("/portal/users/:id/identity-verification", requireAdminSession, async (req, res) => {
+  const requestedType = normalizeIdentityVerificationType(req.body?.type)
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ error: "Invalid user ID." })
@@ -10092,9 +10468,8 @@ app.post("/portal/users/:id/identity-verification", requireAdminSession, async (
       return res.status(404).json({ error: "User not found." })
     }
 
-    const type = normalizeIdentityVerificationType(req.body?.type)
     const verification = await verifySavedUserIdentityWithMonnify(user, {
-      type,
+      type: requestedType,
       force: req.body?.force === true,
     })
 
@@ -10102,16 +10477,24 @@ app.post("/portal/users/:id/identity-verification", requireAdminSession, async (
       actorType: "admin",
       actorId: req.adminSession._id.toString(),
       eventType: "portal.user.identity_verified",
-      message: `Admin ran Monnify ${type.toUpperCase()} verification for ${user.email}.`,
+      message: `Admin ran Monnify ${requestedType.toUpperCase()} verification for ${user.email}.`,
       metadata: {
         userId: user._id.toString(),
-        type,
+        type: requestedType,
         bvnStatus: verification.bvn?.status || "",
         ninStatus: verification.nin?.status || "",
       },
     })
 
+    const verificationResult = buildIdentityVerificationAdminResponse({
+      user,
+      type: requestedType,
+      snapshots: verification,
+      includeSubmittedIdentity: true,
+    })
+
     res.json({
+      ...verificationResult,
       user: sanitizeUser(user),
       verification: sanitizeIdentityVerification(user.identityVerification),
     })
@@ -10122,9 +10505,32 @@ app.post("/portal/users/:id/identity-verification", requireAdminSession, async (
     )
     console.error("portal.user.identity_verification_failed", message)
     const statusCode = Number(error?.statusCode || 0)
-    res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
-      error: message || "Could not verify this user's identity with Monnify.",
-    })
+    res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json(
+      requestedType === "both"
+        ? {
+            success: false,
+            type: "BOTH",
+            verified: false,
+            status: "failed",
+            message: "Identity verification could not be completed.",
+            mismatches: [],
+            providerMessage: message || "Could not verify this user's identity with Monnify.",
+            checkedAt: new Date().toISOString(),
+          }
+        : {
+            success: false,
+            type: requestedType.toUpperCase(),
+            verified: false,
+            status: "failed",
+            message:
+              requestedType === "bvn"
+                ? "BVN validation failed due to provider/server error."
+                : "NIN validation failed due to provider/server error.",
+            mismatches: [],
+            providerMessage: message || "Could not verify this user's identity with Monnify.",
+            checkedAt: new Date().toISOString(),
+          },
+    )
   }
 })
 
@@ -10958,6 +11364,7 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
 })
 
 app.post("/admin/users/:id/identity-verification", requireAdminSession, async (req, res) => {
+  const requestedType = normalizeIdentityVerificationType(req.body?.type)
   try {
     const user = await User.findById(req.params.id)
 
@@ -10965,9 +11372,8 @@ app.post("/admin/users/:id/identity-verification", requireAdminSession, async (r
       return res.status(404).json({ error: "User not found." })
     }
 
-    const type = normalizeIdentityVerificationType(req.body?.type)
     const verification = await verifySavedUserIdentityWithMonnify(user, {
-      type,
+      type: requestedType,
       force: req.body?.force === true,
     })
 
@@ -10975,16 +11381,24 @@ app.post("/admin/users/:id/identity-verification", requireAdminSession, async (r
       actorType: "admin",
       actorId: req.adminSession._id.toString(),
       eventType: "admin.user.identity_verified",
-      message: `Admin ran Monnify ${type.toUpperCase()} verification for ${user.email}.`,
+      message: `Admin ran Monnify ${requestedType.toUpperCase()} verification for ${user.email}.`,
       metadata: {
         userId: user._id.toString(),
-        type,
+        type: requestedType,
         bvnStatus: verification.bvn?.status || "",
         ninStatus: verification.nin?.status || "",
       },
     })
 
+    const verificationResult = buildIdentityVerificationAdminResponse({
+      user,
+      type: requestedType,
+      snapshots: verification,
+      includeSubmittedIdentity: true,
+    })
+
     res.json({
+      ...verificationResult,
       user: sanitizeUser(user),
       verification: sanitizeIdentityVerification(user.identityVerification),
     })
@@ -10995,9 +11409,32 @@ app.post("/admin/users/:id/identity-verification", requireAdminSession, async (r
     )
     console.error("admin.user.identity_verification_failed", message)
     const statusCode = Number(error?.statusCode || 0)
-    res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
-      error: message || "Could not verify this user's identity with Monnify.",
-    })
+    res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json(
+      requestedType === "both"
+        ? {
+            success: false,
+            type: "BOTH",
+            verified: false,
+            status: "failed",
+            message: "Identity verification could not be completed.",
+            mismatches: [],
+            providerMessage: message || "Could not verify this user's identity with Monnify.",
+            checkedAt: new Date().toISOString(),
+          }
+        : {
+            success: false,
+            type: requestedType.toUpperCase(),
+            verified: false,
+            status: "failed",
+            message:
+              requestedType === "bvn"
+                ? "BVN validation failed due to provider/server error."
+                : "NIN validation failed due to provider/server error.",
+            mismatches: [],
+            providerMessage: message || "Could not verify this user's identity with Monnify.",
+            checkedAt: new Date().toISOString(),
+          },
+    )
   }
 })
 
