@@ -6,6 +6,7 @@ const axios = require("axios")
 const crypto = require("crypto")
 const fs = require("fs")
 const path = require("path")
+const nodemailer = require("nodemailer")
 const { Server } = require("socket.io")
 const { AxiosError } = require("axios")
 const { createPaystackService } = require("./services/paystack")
@@ -59,6 +60,13 @@ const TELEGRAM_BOT_TOKEN = readEnv("TELEGRAM_BOT_TOKEN")
 const TELEGRAM_WITHDRAWAL_CHAT_ID =
   readEnv("TELEGRAM_WITHDRAWAL_CHAT_ID") || readEnv("TELEGRAM_CHAT_ID")
 const PORTAL_URL = readEnv("PORTAL_URL") || "https://api.streamtips.live"
+const SMTP_HOST = readEnv("SMTP_HOST")
+const SMTP_PORT = Number(readEnv("SMTP_PORT") || 587)
+const SMTP_SECURE = /^(1|true|yes)$/i.test(readEnv("SMTP_SECURE"))
+const SMTP_USER = readEnv("SMTP_USER")
+const SMTP_PASS = readEnv("SMTP_PASS")
+const SMTP_FROM = readEnv("SMTP_FROM") || SMTP_USER
+const SMTP_FROM_NAME = readEnv("SMTP_FROM_NAME") || "StreamTip"
 const MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER = readEnv(
   "MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER",
 )
@@ -94,6 +102,32 @@ function parseCsvList(value) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean)
+}
+
+let mailTransporter = null
+
+function isEmailTransportConfigured() {
+  return Boolean(SMTP_HOST && SMTP_PORT && SMTP_FROM && SMTP_USER && SMTP_PASS)
+}
+
+function getMailTransporter() {
+  if (!isEmailTransportConfigured()) {
+    return null
+  }
+
+  if (!mailTransporter) {
+    mailTransporter = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_SECURE,
+      auth: {
+        user: SMTP_USER,
+        pass: SMTP_PASS,
+      },
+    })
+  }
+
+  return mailTransporter
 }
 
 const allowedOrigins = parseAllowedOrigins(FRONTEND_ORIGIN)
@@ -253,11 +287,38 @@ function parseImageDataUrl(dataUrl = "") {
 
   if (!extension) return null
 
+  const base64Payload = String(match[2] || "").replace(/\s+/g, "")
+  if (!/^[A-Za-z0-9+/=]+$/.test(base64Payload)) return null
+
   return {
     mimeType,
     extension,
-    buffer: Buffer.from(match[2], "base64"),
+    buffer: Buffer.from(base64Payload, "base64"),
   }
+}
+
+function detectImageMimeByMagic(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return ""
+
+  const isPng =
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  if (isPng) return "image/png"
+
+  const isJpeg = buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff
+  if (isJpeg) return "image/jpeg"
+
+  const isWebp =
+    buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP"
+  if (isWebp) return "image/webp"
+
+  return ""
 }
 
 function saveKycImageUpload({ req, dataUrl, filePrefix }) {
@@ -269,6 +330,14 @@ function saveKycImageUpload({ req, dataUrl, filePrefix }) {
 
   if (parsed.buffer.length > 5 * 1024 * 1024) {
     throw createStatusCodeError("Each KYC image must be 5 MB or smaller.", 400)
+  }
+
+  const detectedMimeType = detectImageMimeByMagic(parsed.buffer)
+  if (!detectedMimeType || detectedMimeType !== parsed.mimeType) {
+    throw createStatusCodeError(
+      "Uploaded image content is invalid or does not match the file type. Use PNG, JPG, or WEBP.",
+      400,
+    )
   }
 
   const fileName = `${filePrefix}-${req.user._id}-${Date.now()}-${Math.round(Math.random() * 1_000_000)}${parsed.extension}`
@@ -807,6 +876,20 @@ const userSchema = new mongoose.Schema(
     },
     kycUpgradeTargetTier: { type: Number, enum: [0, 2, 3, 4], default: 0 },
     kycUpgradeSubmittedAt: Date,
+    accountNotifications: {
+      type: [
+        {
+          id: { type: String, default: "" },
+          type: { type: String, default: "system" },
+          title: { type: String, default: "" },
+          message: { type: String, default: "" },
+          metadata: { type: Object, default: {} },
+          createdAt: { type: Date, default: Date.now },
+          readAt: Date,
+        },
+      ],
+      default: [],
+    },
     manualReviewStatus: {
       type: String,
       enum: ["not_required", "pending", "approved", "rejected"],
@@ -2921,6 +3004,8 @@ function sanitizeUser(user) {
 
   const nameParts = getUserNameParts(user)
   const displayName = buildFullNameFromParts(nameParts, user.name || user.email || "Creator")
+  const accountNotifications = Array.isArray(user.accountNotifications) ? user.accountNotifications : []
+  const unreadNotifications = accountNotifications.filter((item) => !item?.readAt).length
 
   return {
     id: user._id,
@@ -2945,6 +3030,7 @@ function sanitizeUser(user) {
     identityVerification: sanitizeIdentityVerification(user.identityVerification),
     payoutProfile: sanitizePayoutProfile(user.payoutProfile),
     virtualAccount: user.virtualAccount || null,
+    notificationUnreadCount: unreadNotifications,
     createdAt: user.createdAt,
   }
 }
@@ -3763,6 +3849,74 @@ async function createAuditLog({ actorType, actorId = "", eventType, message, met
     })
   } catch (error) {
     console.error("Failed to create audit log", error)
+  }
+}
+
+function createAccountNotification({ type, title, message, metadata = {} }) {
+  return {
+    id: crypto.randomUUID(),
+    type: String(type || "system").trim() || "system",
+    title: String(title || "Update").trim() || "Update",
+    message: String(message || "").trim(),
+    metadata: metadata && typeof metadata === "object" ? metadata : {},
+    createdAt: new Date(),
+  }
+}
+
+function appendUserNotification(user, notification) {
+  if (!user) return
+  const next = createAccountNotification(notification)
+  const existing = Array.isArray(user.accountNotifications) ? user.accountNotifications : []
+  user.accountNotifications = [next, ...existing].slice(0, 150)
+}
+
+function sanitizeAccountNotification(notification) {
+  if (!notification) return null
+  return {
+    id: notification.id || "",
+    type: notification.type || "system",
+    title: notification.title || "Update",
+    message: notification.message || "",
+    metadata: notification.metadata || {},
+    createdAt: notification.createdAt || "",
+    readAt: notification.readAt || "",
+  }
+}
+
+async function sendTierStatusEmail({ user, fromTier, toTier, approved, rejectionReason = "" }) {
+  try {
+    const to = String(user?.email || "").trim().toLowerCase()
+    if (!to || !isEmailTransportConfigured()) {
+      return { skipped: true }
+    }
+
+    const transport = getMailTransporter()
+    if (!transport) {
+      return { skipped: true }
+    }
+
+    const safeFromTier = Number(fromTier) || 1
+    const safeToTier = Number(toTier) || safeFromTier
+    const subject = approved
+      ? `Your StreamTip tier was upgraded to Tier ${safeToTier}`
+      : `Your Tier ${safeToTier} upgrade was not approved`
+    const text = approved
+      ? `Hi ${user.name || "Creator"}, your KYC tier has been upgraded from Tier ${safeFromTier} to Tier ${safeToTier}.`
+      : `Hi ${user.name || "Creator"}, your Tier ${safeToTier} upgrade request was rejected.${
+          rejectionReason ? ` Reason: ${rejectionReason}` : ""
+        }`
+
+    await transport.sendMail({
+      from: `"${SMTP_FROM_NAME}" <${SMTP_FROM}>`,
+      to,
+      subject,
+      text,
+    })
+
+    return { sent: true }
+  } catch (error) {
+    console.error("tier_status_email_failed", error instanceof Error ? error.message : error)
+    return { skipped: true }
   }
 }
 
@@ -8409,6 +8563,89 @@ app.get("/user", requireSessionUser, async (req, res) => {
   }
 })
 
+app.get("/notifications", requireSessionUser, async (req, res) => {
+  try {
+    const notifications = (Array.isArray(req.user.accountNotifications) ? req.user.accountNotifications : [])
+      .slice()
+      .sort((left, right) => {
+        const leftTime = new Date(left?.createdAt || 0).getTime()
+        const rightTime = new Date(right?.createdAt || 0).getTime()
+        return rightTime - leftTime
+      })
+      .slice(0, 100)
+      .map(sanitizeAccountNotification)
+
+    return res.json({
+      notifications,
+      unreadCount: notifications.filter((item) => !item?.readAt).length,
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to load notifications." })
+  }
+})
+
+app.post("/notifications/read-all", requireSessionUser, async (req, res) => {
+  try {
+    const now = new Date()
+    const notifications = Array.isArray(req.user.accountNotifications) ? req.user.accountNotifications : []
+    req.user.accountNotifications = notifications.map((item) =>
+      item?.readAt
+        ? item
+        : {
+            ...item,
+            readAt: now,
+          },
+    )
+    await req.user.save()
+
+    return res.json({
+      notifications: req.user.accountNotifications.map(sanitizeAccountNotification),
+      unreadCount: 0,
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to update notifications." })
+  }
+})
+
+app.post("/notifications/:id/read", requireSessionUser, async (req, res) => {
+  try {
+    const notificationId = String(req.params.id || "").trim()
+    if (!notificationId) {
+      return res.status(400).json({ error: "Notification ID is required." })
+    }
+
+    const notifications = Array.isArray(req.user.accountNotifications) ? req.user.accountNotifications : []
+    let matched = false
+
+    req.user.accountNotifications = notifications.map((item) => {
+      if (String(item?.id || "") !== notificationId) {
+        return item
+      }
+      matched = true
+      return {
+        ...item,
+        readAt: item?.readAt || new Date(),
+      }
+    })
+
+    if (!matched) {
+      return res.status(404).json({ error: "Notification not found." })
+    }
+
+    await req.user.save()
+    const serialized = req.user.accountNotifications.map(sanitizeAccountNotification)
+    return res.json({
+      notifications: serialized,
+      unreadCount: serialized.filter((item) => !item?.readAt).length,
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to update notification." })
+  }
+})
+
 app.put("/user", requireSessionUser, async (req, res) => {
   try {
     const user = req.user
@@ -8641,7 +8878,19 @@ app.post("/kyc/upgrade-submission", requireSessionUser, async (req, res) => {
       user.kycUpgradeStatus = "approved"
       user.kycUpgradeTargetTier = 2
       user.kycUpgradeSubmittedAt = new Date()
+      appendUserNotification(user, {
+        type: "kyc_tier_upgraded",
+        title: "Tier Upgrade Approved",
+        message: "Your account has been upgraded from Tier 1 to Tier 2.",
+        metadata: { fromTier: currentTier, toTier: 2 },
+      })
       await user.save()
+      await sendTierStatusEmail({
+        user,
+        fromTier: currentTier,
+        toTier: 2,
+        approved: true,
+      })
 
       await createAuditLog({
         actorType: "user",
@@ -8734,6 +8983,12 @@ app.post("/kyc/upgrade-submission", requireSessionUser, async (req, res) => {
     user.kycUpgradeStatus = "awaiting_review"
     user.kycUpgradeTargetTier = requestedTier
     user.kycUpgradeSubmittedAt = new Date()
+    appendUserNotification(user, {
+      type: "kyc_upgrade_submitted",
+      title: "Tier Upgrade Submitted",
+      message: `Your Tier ${requestedTier} upgrade request is now awaiting review.`,
+      metadata: { fromTier: currentTier, toTier: requestedTier, submissionId: submission._id.toString() },
+    })
     await user.save()
 
     await createAuditLog({
@@ -9900,20 +10155,34 @@ app.post("/portal/kyc-upgrade-submissions/:id/approve", requireAdminSession, asy
       return res.status(404).json({ error: "Creator not found for this submission." })
     }
 
-    user.kycTier = Number(submission.targetTier) || user.kycTier
+    const previousTier = getTierLevel(user)
+    const targetTier = Number(submission.targetTier) || previousTier
+    user.kycTier = targetTier
     user.kycUpgradeStatus = "approved"
-    user.kycUpgradeTargetTier = Number(submission.targetTier) || 0
+    user.kycUpgradeTargetTier = targetTier || 0
     user.kycUpgradeSubmittedAt = submission.submittedAt || new Date()
-    user.selfieVerified = user.selfieVerified || Number(submission.targetTier) >= 3
-    user.kycStatus = Number(submission.targetTier) >= 4 ? "verified" : "pending"
+    user.selfieVerified = user.selfieVerified || targetTier >= 3
+    user.kycStatus = targetTier >= 4 ? "verified" : "pending"
+    appendUserNotification(user, {
+      type: "kyc_tier_upgraded",
+      title: "Tier Upgrade Approved",
+      message: `Your Tier ${targetTier} upgrade has been approved.`,
+      metadata: { fromTier: previousTier, toTier: targetTier, submissionId: submission._id.toString() },
+    })
 
-    if (Number(submission.targetTier) >= 4) {
+    if (targetTier >= 4) {
       user.proofOfAddressSubmitted = true
       user.socialMediaVerified = true
       user.manualReviewStatus = "approved"
     }
 
     await user.save()
+    await sendTierStatusEmail({
+      user,
+      fromTier: previousTier,
+      toTier: targetTier,
+      approved: true,
+    })
 
     submission.status = "approved"
     submission.reviewedBy = req.adminSession._id.toString()
@@ -9969,10 +10238,24 @@ app.post("/portal/kyc-upgrade-submissions/:id/reject", requireAdminSession, asyn
     await submission.save()
 
     if (user) {
+      const targetTier = Number(submission.targetTier) || 0
       user.kycUpgradeStatus = "rejected"
-      user.kycUpgradeTargetTier = Number(submission.targetTier) || 0
+      user.kycUpgradeTargetTier = targetTier
       user.kycUpgradeSubmittedAt = submission.submittedAt || user.kycUpgradeSubmittedAt
+      appendUserNotification(user, {
+        type: "kyc_upgrade_rejected",
+        title: "Tier Upgrade Rejected",
+        message: `Your Tier ${targetTier} upgrade request was rejected. ${rejectionReason}`,
+        metadata: { toTier: targetTier, rejectionReason, submissionId: submission._id.toString() },
+      })
       await user.save()
+      await sendTierStatusEmail({
+        user,
+        fromTier: getTierLevel(user),
+        toTier: targetTier,
+        approved: false,
+        rejectionReason,
+      })
     }
 
     await createAuditLog({
