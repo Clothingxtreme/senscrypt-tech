@@ -863,6 +863,8 @@ const userSchema = new mongoose.Schema(
       default: "incomplete",
       index: true,
     },
+    onboardingTourCompleted: { type: Boolean, default: false },
+    onboardingTourCompletedAt: Date,
     bvnVerified: { type: Boolean, default: false },
     ninVerified: { type: Boolean, default: false },
     selfieVerified: { type: Boolean, default: false },
@@ -2338,7 +2340,7 @@ function sanitizePayoutProfileChangeRequest(request) {
   return {
     id: request._id,
     creatorId: request.creatorId?._id || request.creatorId || "",
-    creator: request.creatorId?._id ? sanitizeUser(request.creatorId) : undefined,
+    creator: request.creatorId?._id ? sanitizePrivilegedUser(request.creatorId) : undefined,
     currentProfile: sanitizePayoutProfile(request.currentProfile),
     requestedProfile: sanitizePayoutProfile(request.requestedProfile),
     supportNote: request.supportNote || "",
@@ -2358,7 +2360,7 @@ function sanitizeKycUpgradeSubmission(request) {
   return {
     id: request._id,
     creatorId: request.creatorId?._id || request.creatorId || "",
-    creator: request.creatorId?._id ? sanitizeUser(request.creatorId) : undefined,
+    creator: request.creatorId?._id ? sanitizePrivilegedUser(request.creatorId) : undefined,
     creatorEmail: request.creatorEmail || request.creatorId?.email || "",
     currentTier: Number(request.currentTier) || 1,
     targetTier: Number(request.targetTier) || 2,
@@ -3375,6 +3377,8 @@ function sanitizeUser(user) {
     profileImage: user.profileImage || "",
     phoneNumber: user.phoneNumber || "",
     phoneVerified: Boolean(user.phoneVerified),
+    onboardingTourCompleted: Boolean(user.onboardingTourCompleted),
+    onboardingTourCompletedAt: user.onboardingTourCompletedAt || "",
     kycTier: getTierLevel(user),
     kycStatus: user.kycStatus || "incomplete",
     kyc: sanitizeKyc(user),
@@ -3387,6 +3391,22 @@ function sanitizeUser(user) {
     virtualAccount: user.virtualAccount || null,
     notificationUnreadCount: unreadNotifications,
     createdAt: user.createdAt,
+  }
+}
+
+function sanitizePrivilegedUser(user) {
+  const sanitized = sanitizeUser(user)
+  if (!sanitized) return null
+
+  const identity = user?.identity && typeof user.identity === "object" ? user.identity : {}
+
+  return {
+    ...sanitized,
+    identity: {
+      ...sanitized.identity,
+      bvn: String(identity.bvn || "").trim(),
+      nin: String(identity.nin || "").trim(),
+    },
   }
 }
 
@@ -7302,7 +7322,6 @@ app.post("/auth/register", async (req, res) => {
       password,
       phoneNumber = "",
       bvn = "",
-      nin = "",
       dateOfBirth = "",
       firstName = "",
       middleName = "",
@@ -7321,7 +7340,7 @@ app.post("/auth/register", async (req, res) => {
     const rawPassword = String(password)
     const cleanPhoneNumber = normalizePhoneNumber(phoneNumber)
     const trimmedBvn = String(bvn || "").trim()
-    const trimmedNin = String(nin || "").trim()
+    const trimmedNin = ""
     const trimmedDateOfBirth = String(dateOfBirth || "").trim()
     const legal = validateLegalNameParts({ firstName, middleName, lastName })
     const trimmedName = buildFullNameFromParts({
@@ -7344,10 +7363,6 @@ app.post("/auth/register", async (req, res) => {
 
     if (trimmedBvn && !/^\d{11}$/.test(trimmedBvn)) {
       return res.status(400).json({ error: "BVN must be 11 digits when provided." })
-    }
-
-    if (trimmedNin && !/^\d{11}$/.test(trimmedNin)) {
-      return res.status(400).json({ error: "NIN must be 11 digits when provided." })
     }
 
     if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmedDateOfBirth)) {
@@ -7403,10 +7418,6 @@ app.post("/auth/register", async (req, res) => {
       verificationTypes.push("bvn")
     }
 
-    if (trimmedNin) {
-      verificationTypes.push("nin")
-    }
-
     if (verificationTypes.length > 0) {
       try {
         const verifiedIdentitySnapshots = await verifyIdentityWithMonnify(
@@ -7434,7 +7445,7 @@ app.post("/auth/register", async (req, res) => {
         const statusCode = Number(error?.statusCode || 0)
 
         return res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
-          error: message || "Could not verify BVN/NIN details with Monnify.",
+          error: message || "Could not verify BVN details with Monnify.",
         })
       }
     }
@@ -9204,6 +9215,25 @@ app.put("/user", requireSessionUser, async (req, res) => {
   }
 })
 
+app.patch("/user/onboarding-tour", requireSessionUser, async (req, res) => {
+  try {
+    const completed = req.body?.completed !== false
+
+    req.user.onboardingTourCompleted = Boolean(completed)
+    req.user.onboardingTourCompletedAt = completed ? new Date() : undefined
+    await req.user.save()
+
+    return res.json({
+      success: true,
+      onboardingTourCompleted: Boolean(req.user.onboardingTourCompleted),
+      onboardingTourCompletedAt: req.user.onboardingTourCompletedAt || "",
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to update onboarding tour status." })
+  }
+})
+
 app.get("/kyc/upgrade-options", requireSessionUser, async (req, res) => {
   try {
     const user = req.user
@@ -10411,7 +10441,7 @@ app.get("/portal/users", requireAdminSession, async (req, res) => {
     ])
 
     res.json({
-      users: users.map(sanitizeUser),
+      users: users.map(sanitizePrivilegedUser),
       pagination: getPaginationMeta({ page, limit, total }),
       search,
     })
@@ -10441,7 +10471,7 @@ app.get("/portal/users/:id", requireAdminSession, async (req, res) => {
     ])
 
     res.json({
-      user: sanitizeUser(user),
+      user: sanitizePrivilegedUser(user),
       payouts: payouts.map(sanitizePortalPayout),
       changeRequests: changeRequests.map(sanitizePayoutProfileChangeRequest),
       donations: donations.map(sanitizePortalDonation),
@@ -10531,7 +10561,7 @@ app.post("/portal/users/:id/identity-verification", requireAdminSession, async (
 
     res.json({
       ...verificationResult,
-      user: sanitizeUser(user),
+      user: sanitizePrivilegedUser(user),
       verification: sanitizeIdentityVerification(user.identityVerification),
     })
   } catch (error) {
@@ -10666,7 +10696,7 @@ app.post("/portal/kyc-upgrade-submissions/:id/approve", requireAdminSession, asy
 
     return res.json({
       submission: sanitizeKycUpgradeSubmission(submission),
-      user: sanitizeUser(user),
+      user: sanitizePrivilegedUser(user),
     })
   } catch (error) {
     console.error(error)
@@ -10734,7 +10764,7 @@ app.post("/portal/kyc-upgrade-submissions/:id/reject", requireAdminSession, asyn
 
     return res.json({
       submission: sanitizeKycUpgradeSubmission(submission),
-      user: user ? sanitizeUser(user) : null,
+      user: user ? sanitizePrivilegedUser(user) : null,
     })
   } catch (error) {
     console.error(error)
@@ -10863,7 +10893,7 @@ app.patch("/portal/users/:id", requireAdminSession, async (req, res) => {
       },
     })
 
-    res.json({ user: sanitizeUser(user) })
+    res.json({ user: sanitizePrivilegedUser(user) })
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to update portal user." })
@@ -10933,7 +10963,7 @@ app.post("/portal/payout-profile-change-requests/:id/approve", requireAdminSessi
       },
     })
 
-    res.json({ request: sanitizePayoutProfileChangeRequest(request), user: sanitizeUser(user) })
+    res.json({ request: sanitizePayoutProfileChangeRequest(request), user: sanitizePrivilegedUser(user) })
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to approve payout profile change." })
@@ -11111,7 +11141,7 @@ app.post("/portal/payouts/:id/cancel", requireAdminSession, async (req, res) => 
 app.get("/admin/users", requireAdminSession, async (req, res) => {
   try {
     const users = await User.find().sort({ createdAt: -1 })
-    res.json({ users: users.map(sanitizeUser) })
+    res.json({ users: users.map(sanitizePrivilegedUser) })
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to load users." })
@@ -11242,7 +11272,7 @@ app.post("/admin/users", requireAdminSession, async (req, res) => {
       },
     })
 
-    res.status(201).json({ user: sanitizeUser(user) })
+    res.status(201).json({ user: sanitizePrivilegedUser(user) })
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to create user." })
@@ -11392,7 +11422,7 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
       },
     })
 
-    res.json({ user: sanitizeUser(user) })
+    res.json({ user: sanitizePrivilegedUser(user) })
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to update user." })
@@ -11435,7 +11465,7 @@ app.post("/admin/users/:id/identity-verification", requireAdminSession, async (r
 
     res.json({
       ...verificationResult,
-      user: sanitizeUser(user),
+      user: sanitizePrivilegedUser(user),
       verification: sanitizeIdentityVerification(user.identityVerification),
     })
   } catch (error) {
@@ -11495,7 +11525,7 @@ app.post("/admin/users/:id/virtual-account", requireAdminSession, async (req, re
       },
     })
 
-    res.json({ user: sanitizeUser(user), virtualAccount })
+    res.json({ user: sanitizePrivilegedUser(user), virtualAccount })
   } catch (error) {
     console.error(error)
     res.status(502).json({
@@ -11557,7 +11587,7 @@ app.post("/admin/users/:id/virtual-account/sync", requireAdminSession, async (re
       metadata: { userId: user._id.toString(), email: user.email, accountNumber, bankName },
     })
 
-    res.json({ user: sanitizeUser(user), virtualAccount: user.virtualAccount })
+    res.json({ user: sanitizePrivilegedUser(user), virtualAccount: user.virtualAccount })
   } catch (error) {
     console.error(error)
     res.status(502).json({ error: error instanceof Error ? error.message : "Sync failed." })
@@ -11840,7 +11870,7 @@ app.delete("/admin/users/:id/virtual-account", requireAdminSession, async (req, 
     })
 
     res.json({
-      user: sanitizeUser(updatedUser),
+      user: sanitizePrivilegedUser(updatedUser),
       virtualAccount: null,
       remoteDeallocation,
     })
