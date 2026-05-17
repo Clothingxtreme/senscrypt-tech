@@ -786,6 +786,7 @@ const kycUpgradeSubmissionSchema = new mongoose.Schema(
     },
     governmentIdImageUrl: { type: String, default: "" },
     selfieImageUrl: { type: String, default: "" },
+    selfieEvidenceImageUrls: { type: [String], default: [] },
     transactionHistoryConfirmed: { type: Boolean, default: false },
     addressVerificationProvided: { type: Boolean, default: false },
     creatorBusinessVerificationProvided: { type: Boolean, default: false },
@@ -2013,6 +2014,9 @@ function sanitizeKycUpgradeSubmission(request) {
     status: request.status || "awaiting_review",
     governmentIdImageUrl: request.governmentIdImageUrl || "",
     selfieImageUrl: request.selfieImageUrl || "",
+    selfieEvidenceImageUrls: Array.isArray(request.selfieEvidenceImageUrls)
+      ? request.selfieEvidenceImageUrls.filter((item) => typeof item === "string" && item.trim()).slice(0, 4)
+      : [],
     transactionHistoryConfirmed: Boolean(request.transactionHistoryConfirmed),
     addressVerificationProvided: Boolean(request.addressVerificationProvided),
     creatorBusinessVerificationProvided: Boolean(request.creatorBusinessVerificationProvided),
@@ -8918,6 +8922,9 @@ app.post("/kyc/upgrade-submission", requireSessionUser, async (req, res) => {
 
     const governmentIdDataUrl = String(req.body?.governmentIdDataUrl || "").trim()
     const selfieDataUrl = String(req.body?.selfieDataUrl || "").trim()
+    const selfieEvidenceDataUrls = Array.isArray(req.body?.selfieEvidenceDataUrls)
+      ? req.body.selfieEvidenceDataUrls.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 4)
+      : []
     const transactionHistoryConfirmed = Boolean(req.body?.transactionHistoryConfirmed)
     const addressVerificationProvided = Boolean(req.body?.addressVerificationProvided)
     const creatorBusinessVerificationProvided = Boolean(req.body?.creatorBusinessVerificationProvided)
@@ -8930,6 +8937,11 @@ app.post("/kyc/upgrade-submission", requireSessionUser, async (req, res) => {
 
     if (!selfieDataUrl) {
       return res.status(400).json({ error: "Selfie verification image is required." })
+    }
+    if (selfieEvidenceDataUrls.length < 2) {
+      return res.status(400).json({
+        error: "Complete at least 2 liveness action captures before submitting.",
+      })
     }
 
     if (requestedTier === 3 && !transactionHistoryConfirmed) {
@@ -8961,6 +8973,13 @@ app.post("/kyc/upgrade-submission", requireSessionUser, async (req, res) => {
       dataUrl: selfieDataUrl,
       filePrefix: "selfie",
     })
+    const selfieEvidenceImageUrls = selfieEvidenceDataUrls.map((dataUrl, index) =>
+      saveKycImageUpload({
+        req,
+        dataUrl,
+        filePrefix: `selfie-evidence-${index + 1}`,
+      }),
+    )
 
     const submission = await KycUpgradeSubmission.create({
       creatorId: user._id,
@@ -8970,6 +8989,7 @@ app.post("/kyc/upgrade-submission", requireSessionUser, async (req, res) => {
       status: "awaiting_review",
       governmentIdImageUrl,
       selfieImageUrl,
+      selfieEvidenceImageUrls,
       transactionHistoryConfirmed,
       addressVerificationProvided,
       creatorBusinessVerificationProvided,
