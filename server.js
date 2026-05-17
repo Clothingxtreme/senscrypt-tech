@@ -238,6 +238,46 @@ async function saveGiftSoundUpload({ req, buffer, mimeType, originalFileName }) 
   }
 }
 
+function parseImageDataUrl(dataUrl = "") {
+  const match = String(dataUrl || "").match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/)
+  if (!match) return null
+
+  const mimeType = match[1].toLowerCase()
+  const extensionByMime = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+  }
+  const extension = extensionByMime[mimeType]
+
+  if (!extension) return null
+
+  return {
+    mimeType,
+    extension,
+    buffer: Buffer.from(match[2], "base64"),
+  }
+}
+
+function saveKycImageUpload({ req, dataUrl, filePrefix }) {
+  const parsed = parseImageDataUrl(dataUrl)
+
+  if (!parsed || !Buffer.isBuffer(parsed.buffer) || parsed.buffer.length === 0) {
+    throw createStatusCodeError("Upload a valid PNG, JPG, or WEBP image.", 400)
+  }
+
+  if (parsed.buffer.length > 5 * 1024 * 1024) {
+    throw createStatusCodeError("Each KYC image must be 5 MB or smaller.", 400)
+  }
+
+  const fileName = `${filePrefix}-${req.user._id}-${Date.now()}-${Math.round(Math.random() * 1_000_000)}${parsed.extension}`
+  const filePath = path.join(kycUploadsDir, fileName)
+  fs.writeFileSync(filePath, parsed.buffer)
+
+  return `${getPublicRequestBaseUrl(req)}/uploads/kyc-docs/${fileName}`
+}
+
 async function normalizeCustomGiftSoundUploads(req, customGifts) {
   if (!Array.isArray(customGifts)) {
     return customGifts
@@ -273,7 +313,9 @@ app.set("trust proxy", true)
 
 const uploadsRoot = path.join(__dirname, "uploads")
 const giftSoundsUploadDir = path.join(uploadsRoot, "gift-sounds")
+const kycUploadsDir = path.join(uploadsRoot, "kyc-docs")
 fs.mkdirSync(giftSoundsUploadDir, { recursive: true })
+fs.mkdirSync(kycUploadsDir, { recursive: true })
 
 app.use(
   cors({
@@ -313,6 +355,40 @@ const io = new Server(server, {
 const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
 const MIN_CREATOR_WITHDRAWAL = 5000
+const TIER_LIMITS = {
+  1: {
+    singleGift: 100_000,
+    dailyGift: 300_000,
+    monthlyGift: 3_000_000,
+    singleWithdrawal: 150_000,
+    dailyWithdrawal: 500_000,
+    monthlyWithdrawal: 5_000_000,
+  },
+  2: {
+    singleGift: 300_000,
+    dailyGift: 1_500_000,
+    monthlyGift: 15_000_000,
+    singleWithdrawal: 500_000,
+    dailyWithdrawal: 2_000_000,
+    monthlyWithdrawal: 20_000_000,
+  },
+  3: {
+    singleGift: 1_000_000,
+    dailyGift: 5_000_000,
+    monthlyGift: 50_000_000,
+    singleWithdrawal: 2_000_000,
+    dailyWithdrawal: 10_000_000,
+    monthlyWithdrawal: 100_000_000,
+  },
+  4: {
+    singleGift: 5_000_000,
+    dailyGift: 20_000_000,
+    monthlyGift: 200_000_000,
+    singleWithdrawal: 10_000_000,
+    dailyWithdrawal: 50_000_000,
+    monthlyWithdrawal: 500_000_000,
+  },
+}
 let lastDatabaseError = ""
 
 const defaultOverlaySettings = {
@@ -627,6 +703,37 @@ const platformWithdrawalSchema = new mongoose.Schema({
 
 const PlatformWithdrawal = mongoose.model("PlatformWithdrawal", platformWithdrawalSchema)
 
+const kycUpgradeSubmissionSchema = new mongoose.Schema(
+  {
+    creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
+    creatorEmail: { type: String, default: "" },
+    currentTier: { type: Number, enum: [1, 2, 3, 4], required: true },
+    targetTier: { type: Number, enum: [2, 3, 4], required: true },
+    status: {
+      type: String,
+      enum: ["awaiting_review", "approved", "rejected"],
+      default: "awaiting_review",
+      index: true,
+    },
+    governmentIdImageUrl: { type: String, default: "" },
+    selfieImageUrl: { type: String, default: "" },
+    transactionHistoryConfirmed: { type: Boolean, default: false },
+    addressVerificationProvided: { type: Boolean, default: false },
+    creatorBusinessVerificationProvided: { type: Boolean, default: false },
+    enhancedDueDiligenceAccepted: { type: Boolean, default: false },
+    supportNote: { type: String, default: "" },
+    reviewedBy: { type: String, default: "" },
+    reviewedAt: Date,
+    rejectionReason: { type: String, default: "" },
+    submittedAt: { type: Date, default: Date.now },
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: Date,
+  },
+  { timestamps: false },
+)
+
+const KycUpgradeSubmission = mongoose.model("KycUpgradeSubmission", kycUpgradeSubmissionSchema)
+
 const adminSessionSchema = new mongoose.Schema(
   {
     token: { type: String, required: true, unique: true },
@@ -679,7 +786,7 @@ const userSchema = new mongoose.Schema(
     profileImage: { type: String, default: "" },
     phoneNumber: { type: String, default: "" },
     phoneVerified: { type: Boolean, default: false },
-    kycTier: { type: Number, enum: [1, 2, 3], default: 1, index: true },
+    kycTier: { type: Number, enum: [1, 2, 3, 4], default: 1, index: true },
     kycStatus: {
       type: String,
       enum: ["incomplete", "pending", "verified", "rejected"],
@@ -693,6 +800,13 @@ const userSchema = new mongoose.Schema(
     proofOfAddressSubmitted: { type: Boolean, default: false },
     bankStatementSubmitted: { type: Boolean, default: false },
     socialMediaVerified: { type: Boolean, default: false },
+    kycUpgradeStatus: {
+      type: String,
+      enum: ["none", "awaiting_review", "approved", "rejected"],
+      default: "none",
+    },
+    kycUpgradeTargetTier: { type: Number, enum: [0, 2, 3, 4], default: 0 },
+    kycUpgradeSubmittedAt: Date,
     manualReviewStatus: {
       type: String,
       enum: ["not_required", "pending", "approved", "rejected"],
@@ -940,10 +1054,55 @@ function requiresMonnifyCustomerVerification() {
   return getMonnifyEnvironment() === "live"
 }
 
-const KYC_DAILY_RECEIVING_LIMITS = {
-  1: 500_000,
-  2: 2_000_000,
-  3: 10_000_000,
+const KYC_DAILY_RECEIVING_LIMITS = Object.fromEntries(
+  Object.entries(TIER_LIMITS).map(([tier, limits]) => [tier, limits.dailyGift]),
+)
+
+function getTierLevel(user) {
+  const tier = Number(user?.kycTier) || 1
+  if (tier <= 1) return 1
+  if (tier >= 4) return 4
+  return tier
+}
+
+function getTierLimits(userOrTier) {
+  const tier =
+    typeof userOrTier === "number"
+      ? getTierLevel({ kycTier: userOrTier })
+      : getTierLevel(userOrTier)
+  return TIER_LIMITS[tier] || TIER_LIMITS[1]
+}
+
+function getNextTier(userOrTier) {
+  const tier =
+    typeof userOrTier === "number"
+      ? getTierLevel({ kycTier: userOrTier })
+      : getTierLevel(userOrTier)
+  return tier >= 4 ? null : tier + 1
+}
+
+function getTierRequirements(tier) {
+  const level = getTierLevel({ kycTier: tier })
+
+  if (level === 1) {
+    return ["BVN verification required"]
+  }
+
+  if (level === 2) {
+    return ["BVN verification", "NIN verification"]
+  }
+
+  if (level === 3) {
+    return ["Selfie verification", "Government ID upload", "Successful transaction history"]
+  }
+
+  return [
+    "Full KYC",
+    "Address verification",
+    "Creator/business verification",
+    "Enhanced due diligence",
+    "Dedicated compliance review",
+  ]
 }
 
 function getPaystackEnvironment() {
@@ -1458,6 +1617,139 @@ function getKycDailyReceivingLimit(user) {
   return configuredLimit
 }
 
+function getStartOfDay(value = new Date()) {
+  const date = new Date(value)
+  date.setHours(0, 0, 0, 0)
+  return date
+}
+
+function getStartOfMonth(value = new Date()) {
+  return new Date(value.getFullYear(), value.getMonth(), 1)
+}
+
+async function getCreatorDonationTotalsForLimits(creatorId, now = new Date()) {
+  const dayStart = getStartOfDay(now)
+  const monthStart = getStartOfMonth(now)
+  const [dailyResult, monthlyResult] = await Promise.all([
+    Donation.aggregate([
+      {
+        $match: {
+          creatorId,
+          date: { $gte: dayStart },
+          walletStatus: { $ne: "rejected" },
+        },
+      },
+      { $group: { _id: null, amount: { $sum: "$amount" } } },
+    ]),
+    Donation.aggregate([
+      {
+        $match: {
+          creatorId,
+          date: { $gte: monthStart },
+          walletStatus: { $ne: "rejected" },
+        },
+      },
+      { $group: { _id: null, amount: { $sum: "$amount" } } },
+    ]),
+  ])
+
+  return {
+    daily: Number(dailyResult[0]?.amount) || 0,
+    monthly: Number(monthlyResult[0]?.amount) || 0,
+  }
+}
+
+async function getCreatorWithdrawalTotalsForLimits(creatorId, now = new Date()) {
+  const dayStart = getStartOfDay(now)
+  const monthStart = getStartOfMonth(now)
+  const [dailyResult, monthlyResult] = await Promise.all([
+    Payout.aggregate([
+      {
+        $match: {
+          creatorId,
+          createdAt: { $gte: dayStart },
+          status: { $nin: ["failed", "rejected", "cancelled"] },
+        },
+      },
+      { $group: { _id: null, amount: { $sum: "$amount" } } },
+    ]),
+    Payout.aggregate([
+      {
+        $match: {
+          creatorId,
+          createdAt: { $gte: monthStart },
+          status: { $nin: ["failed", "rejected", "cancelled"] },
+        },
+      },
+      { $group: { _id: null, amount: { $sum: "$amount" } } },
+    ]),
+  ])
+
+  return {
+    daily: Number(dailyResult[0]?.amount) || 0,
+    monthly: Number(monthlyResult[0]?.amount) || 0,
+  }
+}
+
+async function getGiftLimitViolation(creator, amount) {
+  const limits = getTierLimits(creator)
+  const numericAmount = Number(amount) || 0
+
+  if (numericAmount > limits.singleGift) {
+    return `Single gift limit for Tier ${getTierLevel(creator)} is NGN ${limits.singleGift.toLocaleString()}.`
+  }
+
+  const totals = await getCreatorDonationTotalsForLimits(creator._id)
+
+  if (totals.daily + numericAmount > limits.dailyGift) {
+    return `Daily gifting limit for Tier ${getTierLevel(creator)} is NGN ${limits.dailyGift.toLocaleString()}.`
+  }
+
+  if (totals.monthly + numericAmount > limits.monthlyGift) {
+    return `Monthly gifting limit for Tier ${getTierLevel(creator)} is NGN ${limits.monthlyGift.toLocaleString()}.`
+  }
+
+  return ""
+}
+
+async function assertGiftWithinTierLimits(creator, amount) {
+  const violation = await getGiftLimitViolation(creator, amount)
+  if (!violation) return
+
+  const error = createStatusCodeError(violation, 400)
+  error.errorCode = "TIER_GIFT_LIMIT_EXCEEDED"
+  throw error
+}
+
+async function assertWithdrawalWithinTierLimits(creator, amount) {
+  const limits = getTierLimits(creator)
+  const numericAmount = Number(amount) || 0
+  const tier = getTierLevel(creator)
+
+  if (numericAmount > limits.singleWithdrawal) {
+    throw createStatusCodeError(
+      `Single withdrawal limit for Tier ${tier} is NGN ${limits.singleWithdrawal.toLocaleString()}.`,
+      400,
+    )
+  }
+
+  const totals = await getCreatorWithdrawalTotalsForLimits(creator._id)
+
+  if (totals.daily + numericAmount > limits.dailyWithdrawal) {
+    throw createStatusCodeError(
+      `Daily withdrawal limit for Tier ${tier} is NGN ${limits.dailyWithdrawal.toLocaleString()}.`,
+      400,
+    )
+  }
+
+  if (totals.monthly + numericAmount > limits.monthlyWithdrawal) {
+    throw createStatusCodeError(
+      `Monthly withdrawal limit for Tier ${tier} is NGN ${limits.monthlyWithdrawal.toLocaleString()}.`,
+      400,
+    )
+  }
+}
+
 function getDefaultWallet() {
   return {
     availableBalance: 0,
@@ -1571,10 +1863,25 @@ function sanitizeWallet(wallet) {
 }
 
 function sanitizeKyc(user) {
+  const tier = getTierLevel(user)
+  const limits = getTierLimits(tier)
+  const nextTier = getNextTier(tier)
+
   return {
-    tier: Number(user?.kycTier) || 1,
+    tier,
     status: user?.kycStatus || "incomplete",
     dailyReceivingLimit: getKycDailyReceivingLimit(user),
+    limits: {
+      singleGift: limits.singleGift,
+      dailyGift: limits.dailyGift,
+      monthlyGift: limits.monthlyGift,
+      singleWithdrawal: limits.singleWithdrawal,
+      dailyWithdrawal: limits.dailyWithdrawal,
+      monthlyWithdrawal: limits.monthlyWithdrawal,
+    },
+    nextTier,
+    requirements: getTierRequirements(tier),
+    nextTierRequirements: nextTier ? getTierRequirements(nextTier) : [],
     phoneVerified: Boolean(user?.phoneVerified),
     bvnVerified: Boolean(user?.bvnVerified),
     ninVerified: Boolean(user?.ninVerified),
@@ -1583,6 +1890,9 @@ function sanitizeKyc(user) {
     proofOfAddressSubmitted: Boolean(user?.proofOfAddressSubmitted),
     bankStatementSubmitted: Boolean(user?.bankStatementSubmitted),
     socialMediaVerified: Boolean(user?.socialMediaVerified),
+    upgradeStatus: user?.kycUpgradeStatus || "none",
+    upgradeTargetTier: Number(user?.kycUpgradeTargetTier) || 0,
+    upgradeSubmittedAt: user?.kycUpgradeSubmittedAt || "",
     manualReviewStatus: user?.manualReviewStatus || "not_required",
   }
 }
@@ -1604,6 +1914,33 @@ function sanitizePayoutProfileChangeRequest(request) {
     rejectionReason: request.rejectionReason || "",
     cooldownUntil: request.cooldownUntil || "",
     createdAt: request.createdAt || "",
+  }
+}
+
+function sanitizeKycUpgradeSubmission(request) {
+  if (!request) return null
+
+  return {
+    id: request._id,
+    creatorId: request.creatorId?._id || request.creatorId || "",
+    creator: request.creatorId?._id ? sanitizeUser(request.creatorId) : undefined,
+    creatorEmail: request.creatorEmail || request.creatorId?.email || "",
+    currentTier: Number(request.currentTier) || 1,
+    targetTier: Number(request.targetTier) || 2,
+    status: request.status || "awaiting_review",
+    governmentIdImageUrl: request.governmentIdImageUrl || "",
+    selfieImageUrl: request.selfieImageUrl || "",
+    transactionHistoryConfirmed: Boolean(request.transactionHistoryConfirmed),
+    addressVerificationProvided: Boolean(request.addressVerificationProvided),
+    creatorBusinessVerificationProvided: Boolean(request.creatorBusinessVerificationProvided),
+    enhancedDueDiligenceAccepted: Boolean(request.enhancedDueDiligenceAccepted),
+    supportNote: request.supportNote || "",
+    reviewedBy: request.reviewedBy || "",
+    reviewedAt: request.reviewedAt || "",
+    rejectionReason: request.rejectionReason || "",
+    submittedAt: request.submittedAt || request.createdAt || "",
+    createdAt: request.createdAt || "",
+    updatedAt: request.updatedAt || "",
   }
 }
 
@@ -2598,7 +2935,7 @@ function sanitizeUser(user) {
     profileImage: user.profileImage || "",
     phoneNumber: user.phoneNumber || "",
     phoneVerified: Boolean(user.phoneVerified),
-    kycTier: Number(user.kycTier) || 1,
+    kycTier: getTierLevel(user),
     kycStatus: user.kycStatus || "incomplete",
     kyc: sanitizeKyc(user),
     wallet: sanitizeWallet(user.wallet),
@@ -3950,6 +4287,15 @@ function normalizePaystackDedicatedAccount(response, user, customerCode) {
 async function createPaystackDedicatedAccountForUser(user) {
   if (!isPaystackConfigured()) {
     throw new Error("Paystack is not configured yet. Add PAYSTACK_SECRET_KEY to Backend/.env.")
+  }
+
+  if (!user?.bvnVerified) {
+    const bvnRequiredError = createStatusCodeError(
+      "Please verify your BVN before generating a virtual account.",
+      400,
+    )
+    bvnRequiredError.errorCode = "BVN_VERIFICATION_REQUIRED"
+    throw bvnRequiredError
   }
 
   if (
@@ -6168,9 +6514,7 @@ async function findCreatorForPaystackEvent(eventData = {}) {
 }
 
 function startOfToday() {
-  const date = new Date()
-  date.setHours(0, 0, 0, 0)
-  return date
+  return getStartOfDay(new Date())
 }
 
 async function assessDonationRisk({ creator, amount, sourceDetails }) {
@@ -6263,22 +6607,26 @@ async function applyWalletCredit({ creator, donation, status }) {
           "wallet.availableBalance": creatorShare,
           "wallet.totalReceived": grossAmount,
         }
-      : {
-          "wallet.pendingBalance": creatorShare,
-        }
+      : status === "pending_review"
+        ? {
+            "wallet.pendingBalance": creatorShare,
+          }
+        : {}
 
-  await User.updateOne(
-    { _id: creator._id },
-    {
-      $inc: inc,
-      $set: { "wallet.updatedAt": new Date() },
-    },
-  )
+  if (Object.keys(inc).length > 0) {
+    await User.updateOne(
+      { _id: creator._id },
+      {
+        $inc: inc,
+        $set: { "wallet.updatedAt": new Date() },
+      },
+    )
+  }
 
   await WalletTransaction.create({
     creatorId: creator._id,
     donationId: donation._id,
-    type: status === "available" ? "credit" : "pending_credit",
+    type: status === "available" ? "credit" : status === "pending_review" ? "pending_credit" : "reject",
     amount: creatorShare,
     grossAmount,
     platformFee,
@@ -6454,12 +6802,12 @@ app.post("/auth/register", async (req, res) => {
       return res.status(400).json({ error: "Accept the identity policy before creating an account." })
     }
 
-    if (!/^\d{11}$/.test(trimmedBvn)) {
-      return res.status(400).json({ error: "BVN must be 11 digits." })
+    if (trimmedBvn && !/^\d{11}$/.test(trimmedBvn)) {
+      return res.status(400).json({ error: "BVN must be 11 digits when provided." })
     }
 
-    if (!/^\d{11}$/.test(trimmedNin)) {
-      return res.status(400).json({ error: "NIN must be 11 digits." })
+    if (trimmedNin && !/^\d{11}$/.test(trimmedNin)) {
+      return res.status(400).json({ error: "NIN must be 11 digits when provided." })
     }
 
     if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmedDateOfBirth)) {
@@ -6504,34 +6852,57 @@ app.post("/auth/register", async (req, res) => {
       registrationNextStep = "payout"
     }
 
-    let identityVerification
+    let identityVerification = {
+      bvn: { status: "unverified" },
+      nin: { status: "unverified" },
+    }
 
-    try {
-      identityVerification = await verifyIdentityWithMonnify(
-        getIdentitySubject({
-          bvn: trimmedBvn,
-          nin: trimmedNin,
-          dateOfBirth: trimmedDateOfBirth,
-          phoneNumber: cleanPhoneNumber,
-          firstName: legal.first,
-          middleName: legal.middle,
-          lastName: legal.last,
-        }),
-      )
-    } catch (error) {
-      const message = getAxiosErrorMessage(
-        error,
-        error instanceof Error ? error.message : "Identity verification failed.",
-      )
-      console.error("register.identity_verification_failed", message)
-      const statusCode = Number(error?.statusCode || 0)
+    const verificationTypes = []
 
-      return res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
-        error: message || "Could not verify BVN/NIN details with Monnify.",
-      })
+    if (trimmedBvn) {
+      verificationTypes.push("bvn")
+    }
+
+    if (trimmedNin) {
+      verificationTypes.push("nin")
+    }
+
+    if (verificationTypes.length > 0) {
+      try {
+        const verifiedIdentitySnapshots = await verifyIdentityWithMonnify(
+          getIdentitySubject({
+            bvn: trimmedBvn,
+            nin: trimmedNin,
+            dateOfBirth: trimmedDateOfBirth,
+            phoneNumber: cleanPhoneNumber,
+            firstName: legal.first,
+            middleName: legal.middle,
+            lastName: legal.last,
+          }),
+          { types: verificationTypes },
+        )
+        identityVerification = {
+          ...identityVerification,
+          ...verifiedIdentitySnapshots,
+        }
+      } catch (error) {
+        const message = getAxiosErrorMessage(
+          error,
+          error instanceof Error ? error.message : "Identity verification failed.",
+        )
+        console.error("register.identity_verification_failed", message)
+        const statusCode = Number(error?.statusCode || 0)
+
+        return res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
+          error: message || "Could not verify BVN/NIN details with Monnify.",
+        })
+      }
     }
 
     const signupCompletedAt = payoutProfile ? new Date() : undefined
+    const bvnVerified = identityVerification.bvn?.status === "verified"
+    const ninVerified = identityVerification.nin?.status === "verified"
+    const hasAnyVerifiedIdentity = bvnVerified || ninVerified
 
     user = await User.create({
       name: trimmedName,
@@ -6546,9 +6917,9 @@ app.post("/auth/register", async (req, res) => {
       phoneNumber: cleanPhoneNumber,
       phoneVerified: false,
       kycTier: 1,
-      kycStatus: "pending",
-      bvnVerified: identityVerification.bvn?.status === "verified",
-      ninVerified: identityVerification.nin?.status === "verified",
+      kycStatus: hasAnyVerifiedIdentity ? "pending" : "incomplete",
+      bvnVerified,
+      ninVerified,
       bankAccountMatched: Boolean(payoutProfile),
       manualReviewStatus: "not_required",
       wallet: {
@@ -6593,12 +6964,19 @@ app.post("/auth/register", async (req, res) => {
       try {
         await provisionVirtualAccountForUser(user)
       } catch (error) {
-        const reason =
-          error instanceof Error ? error.message : "Could not provision a dedicated virtual account."
+        const requiresBvnVerification = String(error?.errorCode || "") === "BVN_VERIFICATION_REQUIRED"
 
-        await markPaystackVirtualAccountPending(user, reason)
-        warning =
-          "Your account was created, but the virtual account could not be provisioned yet. It has been marked as pending so you can continue into the dashboard."
+        if (requiresBvnVerification) {
+          warning =
+            "Your account was created as Tier 1 (unverified). Please verify your BVN in Settings before generating your virtual account."
+        } else {
+          const reason =
+            error instanceof Error ? error.message : "Could not provision a dedicated virtual account."
+
+          await markPaystackVirtualAccountPending(user, reason)
+          warning =
+            "Your account was created, but the virtual account could not be provisioned yet. It has been marked as pending so you can continue into the dashboard."
+        }
       }
     }
 
@@ -6861,11 +7239,14 @@ app.post("/users/:id/virtual-account", requireSessionUser, async (req, res) => {
     return res.json({ virtualAccount })
   } catch (error) {
     console.error(error)
-    return res.status(502).json({
+    const statusCode = Number(error?.statusCode || 0)
+
+    return res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
       error:
         error instanceof Error
           ? error.message
           : "Could not provision a Paystack dedicated virtual account.",
+      code: String(error?.errorCode || ""),
     })
   }
 })
@@ -7136,6 +7517,44 @@ app.post("/api/webhooks/paystack", async (req, res) => {
           paystackTransactionId,
           destinationAccountNumber: destinationDetails.destinationAccountNumber,
           amount: grossAmount,
+        },
+      })
+
+      return res.sendStatus(200)
+    }
+
+    const giftLimitViolation = await getGiftLimitViolation(creator, grossAmount)
+    if (giftLimitViolation) {
+      await ComplianceInflow.create({
+        provider: "paystack",
+        amount: grossAmount,
+        currency: eventData.currency || "NGN",
+        paymentStatus: "PAID",
+        paymentMethod: eventData.channel || "paystack",
+        eventType,
+        paidOn: parseProviderDate(eventData.paid_at || eventData.paidAt),
+        ...sourceDetails,
+        ...destinationDetails,
+        paystackReference: transactionReference || undefined,
+        paystackTransactionId: paystackTransactionId || undefined,
+        rawPaystackPayload: payload,
+        status: "held",
+        validationReason: giftLimitViolation,
+        linkedCreatorId: creator._id,
+        linkedCreatorEmail: creator.email,
+        date: new Date(),
+        updatedAt: new Date(),
+      })
+
+      await createAuditLog({
+        actorType: "system",
+        eventType: "donation.tier_limit_blocked",
+        message: `Paystack donation exceeded Tier ${getTierLevel(creator)} gift limits.`,
+        metadata: {
+          creatorId: creator._id.toString(),
+          amount: grossAmount,
+          reason: giftLimitViolation,
+          transactionReference,
         },
       })
 
@@ -7557,6 +7976,35 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
       return res.status(400).json({ error: "Enter a valid test donation amount." })
     }
 
+    await assertGiftWithinTierLimits(req.user, amount)
+
+    const giftLimitViolation = await getGiftLimitViolation(creator, amount)
+    if (giftLimitViolation) {
+      await upsertComplianceInflowFromMonnify({
+        eventType,
+        eventData,
+        data,
+        creator,
+        status: "held",
+        validationReason: giftLimitViolation,
+      })
+
+      await createAuditLog({
+        actorType: "system",
+        eventType: "donation.tier_limit_blocked",
+        message: `Monnify donation exceeded Tier ${getTierLevel(creator)} gift limits.`,
+        metadata: {
+          creatorId: creator._id.toString(),
+          amount,
+          reason: giftLimitViolation,
+          transactionReference,
+          paymentReference,
+        },
+      })
+
+      return res.sendStatus(200)
+    }
+
     const split = calculateRevenueSplit(amount)
     const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1_000_000)}`
     const donation = await Donation.create({
@@ -7857,6 +8305,8 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
       })
     }
 
+    await assertWithdrawalWithinTierLimits(req.user, payoutAmount)
+
     if (payoutAmount > availableCreatorBalance) {
       return res.status(400).json({
         error: "Creators can only withdraw up to their 80% share of earnings.",
@@ -8104,6 +8554,211 @@ app.put("/user", requireSessionUser, async (req, res) => {
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to update user." })
+  }
+})
+
+app.get("/kyc/upgrade-options", requireSessionUser, async (req, res) => {
+  try {
+    const user = req.user
+    const currentTier = getTierLevel(user)
+    const nextTier = getNextTier(currentTier)
+    const successfulDonations = await Donation.countDocuments({
+      creatorId: user._id,
+      walletStatus: { $ne: "rejected" },
+    })
+    const hasTransactionHistory = successfulDonations > 0
+
+    const requirementsMet = {
+      bvnVerified: Boolean(user.bvnVerified),
+      ninVerified: Boolean(user.ninVerified),
+      selfieVerified: Boolean(user.selfieVerified),
+      hasTransactionHistory,
+      proofOfAddressSubmitted: Boolean(user.proofOfAddressSubmitted),
+      creatorBusinessVerificationProvided: Boolean(user.socialMediaVerified),
+      enhancedDueDiligenceAccepted:
+        Boolean(user.manualReviewStatus === "approved") || Boolean(user.kycStatus === "verified"),
+    }
+
+    return res.json({
+      currentTier,
+      currentTierRequirements: getTierRequirements(currentTier),
+      currentLimits: getTierLimits(currentTier),
+      nextTier,
+      nextTierRequirements: nextTier ? getTierRequirements(nextTier) : [],
+      nextLimits: nextTier ? getTierLimits(nextTier) : null,
+      requirementsMet,
+      upgradeStatus: user.kycUpgradeStatus || "none",
+      upgradeTargetTier: Number(user.kycUpgradeTargetTier) || 0,
+      upgradeSubmittedAt: user.kycUpgradeSubmittedAt || "",
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to load tier upgrade options." })
+  }
+})
+
+app.get("/kyc/upgrade-submissions", requireSessionUser, async (req, res) => {
+  try {
+    const submissions = await KycUpgradeSubmission.find({ creatorId: req.user._id })
+      .sort({ createdAt: -1 })
+      .limit(20)
+
+    return res.json({
+      submissions: submissions.map(sanitizeKycUpgradeSubmission),
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to load KYC upgrade submissions." })
+  }
+})
+
+app.post("/kyc/upgrade-submission", requireSessionUser, async (req, res) => {
+  try {
+    const user = req.user
+    const currentTier = getTierLevel(user)
+    const nextTier = getNextTier(currentTier)
+    const requestedTier = Number(req.body?.targetTier) || 0
+
+    if (!nextTier) {
+      return res.status(400).json({ error: "Tier 4 is the highest tier. No further upgrade is available." })
+    }
+
+    if (requestedTier !== nextTier) {
+      return res.status(400).json({
+        error: `You can only upgrade one tier at a time. Your next available upgrade is Tier ${nextTier}.`,
+      })
+    }
+
+    if (requestedTier === 2) {
+      if (!user.bvnVerified || !user.ninVerified) {
+        return res.status(400).json({
+          error: "Tier 2 upgrade requires both BVN and NIN verification.",
+        })
+      }
+
+      user.kycTier = 2
+      user.kycStatus = user.kycStatus === "verified" ? user.kycStatus : "pending"
+      user.kycUpgradeStatus = "approved"
+      user.kycUpgradeTargetTier = 2
+      user.kycUpgradeSubmittedAt = new Date()
+      await user.save()
+
+      await createAuditLog({
+        actorType: "user",
+        actorId: user._id.toString(),
+        eventType: "kyc.tier_upgraded",
+        message: `${user.email} upgraded to Tier 2.`,
+        metadata: { fromTier: currentTier, toTier: 2 },
+      })
+
+      return res.json({
+        user: sanitizeUser(user),
+        message: "Tier upgraded to Tier 2 successfully.",
+      })
+    }
+
+    const existingPending = await KycUpgradeSubmission.findOne({
+      creatorId: user._id,
+      status: "awaiting_review",
+    })
+    if (existingPending) {
+      return res.status(409).json({
+        error: "You already have a KYC upgrade submission awaiting review in the portal.",
+      })
+    }
+
+    const governmentIdDataUrl = String(req.body?.governmentIdDataUrl || "").trim()
+    const selfieDataUrl = String(req.body?.selfieDataUrl || "").trim()
+    const transactionHistoryConfirmed = Boolean(req.body?.transactionHistoryConfirmed)
+    const addressVerificationProvided = Boolean(req.body?.addressVerificationProvided)
+    const creatorBusinessVerificationProvided = Boolean(req.body?.creatorBusinessVerificationProvided)
+    const enhancedDueDiligenceAccepted = Boolean(req.body?.enhancedDueDiligenceAccepted)
+    const supportNote = String(req.body?.supportNote || "").trim()
+
+    if (!governmentIdDataUrl) {
+      return res.status(400).json({ error: "Government-issued ID upload is required." })
+    }
+
+    if (!selfieDataUrl) {
+      return res.status(400).json({ error: "Selfie verification image is required." })
+    }
+
+    if (requestedTier === 3 && !transactionHistoryConfirmed) {
+      return res.status(400).json({
+        error: "Tier 3 upgrade requires successful transaction history confirmation.",
+      })
+    }
+
+    if (requestedTier === 4) {
+      if (!transactionHistoryConfirmed) {
+        return res.status(400).json({ error: "Tier 4 upgrade requires successful transaction history confirmation." })
+      }
+
+      if (!addressVerificationProvided || !creatorBusinessVerificationProvided || !enhancedDueDiligenceAccepted) {
+        return res.status(400).json({
+          error:
+            "Tier 4 requires address verification, creator/business verification, and enhanced due diligence confirmation.",
+        })
+      }
+    }
+
+    const governmentIdImageUrl = saveKycImageUpload({
+      req,
+      dataUrl: governmentIdDataUrl,
+      filePrefix: "government-id",
+    })
+    const selfieImageUrl = saveKycImageUpload({
+      req,
+      dataUrl: selfieDataUrl,
+      filePrefix: "selfie",
+    })
+
+    const submission = await KycUpgradeSubmission.create({
+      creatorId: user._id,
+      creatorEmail: user.email,
+      currentTier,
+      targetTier: requestedTier,
+      status: "awaiting_review",
+      governmentIdImageUrl,
+      selfieImageUrl,
+      transactionHistoryConfirmed,
+      addressVerificationProvided,
+      creatorBusinessVerificationProvided,
+      enhancedDueDiligenceAccepted,
+      supportNote,
+      submittedAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+
+    user.kycUpgradeStatus = "awaiting_review"
+    user.kycUpgradeTargetTier = requestedTier
+    user.kycUpgradeSubmittedAt = new Date()
+    await user.save()
+
+    await createAuditLog({
+      actorType: "user",
+      actorId: user._id.toString(),
+      eventType: "kyc.upgrade_submitted",
+      message: `${user.email} submitted Tier ${requestedTier} KYC upgrade documents.`,
+      metadata: {
+        currentTier,
+        targetTier: requestedTier,
+        submissionId: submission._id.toString(),
+      },
+    })
+
+    return res.status(201).json({
+      message: "KYC upgrade submission sent to portal for review.",
+      submission: sanitizeKycUpgradeSubmission(submission),
+      user: sanitizeUser(user),
+    })
+  } catch (error) {
+    console.error(error)
+    const statusCode = Number(error?.statusCode || 0)
+    return res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 500).json({
+      error: error instanceof Error ? error.message : "Could not submit KYC tier upgrade.",
+    })
   }
 })
 
@@ -9198,6 +9853,150 @@ app.post("/portal/users/:id/identity-verification", requireAdminSession, async (
   }
 })
 
+app.get("/portal/kyc-upgrade-submissions", requireAdminSession, async (req, res) => {
+  try {
+    const statusFilter = String(req.query?.status || "").trim().toLowerCase()
+    const page = parsePositiveInteger(req.query.page, 1)
+    const limit = Math.min(parsePositiveInteger(req.query.limit, 25), 100)
+    const skip = (page - 1) * limit
+    const query = {}
+
+    if (["awaiting_review", "approved", "rejected"].includes(statusFilter)) {
+      query.status = statusFilter
+    }
+
+    const [submissions, total] = await Promise.all([
+      KycUpgradeSubmission.find(query)
+        .populate("creatorId")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+      KycUpgradeSubmission.countDocuments(query),
+    ])
+
+    return res.json({
+      submissions: submissions.map(sanitizeKycUpgradeSubmission),
+      pagination: getPaginationMeta({ page, limit, total }),
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to load KYC upgrade submissions." })
+  }
+})
+
+app.post("/portal/kyc-upgrade-submissions/:id/approve", requireAdminSession, async (req, res) => {
+  try {
+    const submission = await KycUpgradeSubmission.findById(req.params.id)
+    if (!submission) {
+      return res.status(404).json({ error: "KYC upgrade submission not found." })
+    }
+
+    if (submission.status !== "awaiting_review") {
+      return res.status(409).json({ error: "This KYC upgrade submission has already been reviewed." })
+    }
+
+    const user = await User.findById(submission.creatorId)
+    if (!user) {
+      return res.status(404).json({ error: "Creator not found for this submission." })
+    }
+
+    user.kycTier = Number(submission.targetTier) || user.kycTier
+    user.kycUpgradeStatus = "approved"
+    user.kycUpgradeTargetTier = Number(submission.targetTier) || 0
+    user.kycUpgradeSubmittedAt = submission.submittedAt || new Date()
+    user.selfieVerified = user.selfieVerified || Number(submission.targetTier) >= 3
+    user.kycStatus = Number(submission.targetTier) >= 4 ? "verified" : "pending"
+
+    if (Number(submission.targetTier) >= 4) {
+      user.proofOfAddressSubmitted = true
+      user.socialMediaVerified = true
+      user.manualReviewStatus = "approved"
+    }
+
+    await user.save()
+
+    submission.status = "approved"
+    submission.reviewedBy = req.adminSession._id.toString()
+    submission.reviewedAt = new Date()
+    submission.updatedAt = new Date()
+    await submission.save()
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.kyc_upgrade.approved",
+      message: `Approved Tier ${submission.targetTier} upgrade for ${user.email}.`,
+      metadata: {
+        submissionId: submission._id.toString(),
+        creatorId: user._id.toString(),
+        targetTier: submission.targetTier,
+      },
+    })
+
+    return res.json({
+      submission: sanitizeKycUpgradeSubmission(submission),
+      user: sanitizeUser(user),
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to approve this KYC upgrade submission." })
+  }
+})
+
+app.post("/portal/kyc-upgrade-submissions/:id/reject", requireAdminSession, async (req, res) => {
+  try {
+    const submission = await KycUpgradeSubmission.findById(req.params.id)
+    if (!submission) {
+      return res.status(404).json({ error: "KYC upgrade submission not found." })
+    }
+
+    if (submission.status !== "awaiting_review") {
+      return res.status(409).json({ error: "This KYC upgrade submission has already been reviewed." })
+    }
+
+    const rejectionReason = String(req.body?.rejectionReason || "").trim()
+    if (!rejectionReason) {
+      return res.status(400).json({ error: "Provide a rejection reason for this submission." })
+    }
+
+    const user = await User.findById(submission.creatorId)
+
+    submission.status = "rejected"
+    submission.reviewedBy = req.adminSession._id.toString()
+    submission.reviewedAt = new Date()
+    submission.rejectionReason = rejectionReason
+    submission.updatedAt = new Date()
+    await submission.save()
+
+    if (user) {
+      user.kycUpgradeStatus = "rejected"
+      user.kycUpgradeTargetTier = Number(submission.targetTier) || 0
+      user.kycUpgradeSubmittedAt = submission.submittedAt || user.kycUpgradeSubmittedAt
+      await user.save()
+    }
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.kyc_upgrade.rejected",
+      message: `Rejected Tier ${submission.targetTier} upgrade submission.`,
+      metadata: {
+        submissionId: submission._id.toString(),
+        creatorId: user?._id?.toString?.() || "",
+        rejectionReason,
+      },
+    })
+
+    return res.json({
+      submission: sanitizeKycUpgradeSubmission(submission),
+      user: user ? sanitizeUser(user) : null,
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to reject this KYC upgrade submission." })
+  }
+})
+
 app.patch("/portal/users/:id", requireAdminSession, async (req, res) => {
   try {
     const user = await User.findById(req.params.id)
@@ -9264,7 +10063,7 @@ app.patch("/portal/users/:id", requireAdminSession, async (req, res) => {
       user.identity.dateOfBirth = nextDateOfBirth
     }
 
-    if ([1, 2, 3].includes(Number(req.body?.kycTier))) {
+    if ([1, 2, 3, 4].includes(Number(req.body?.kycTier))) {
       user.kycTier = Number(req.body.kycTier)
     }
 
@@ -9788,7 +10587,7 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
       user.identity.dateOfBirth = nextDateOfBirth
     }
 
-    if ([1, 2, 3].includes(Number(req.body?.kycTier))) {
+    if ([1, 2, 3, 4].includes(Number(req.body?.kycTier))) {
       user.kycTier = Number(req.body.kycTier)
     }
 
