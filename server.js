@@ -3399,13 +3399,31 @@ function sanitizePrivilegedUser(user) {
   if (!sanitized) return null
 
   const identity = user?.identity && typeof user.identity === "object" ? user.identity : {}
+  const resolveIdentityNumber = (kind) => {
+    const normalizedKind = kind === "nin" ? "nin" : "bvn"
+    const keyUpper = normalizedKind === "bvn" ? "Bvn" : "Nin"
+    const candidates = [
+      identity?.[normalizedKind],
+      identity?.[`submitted${keyUpper}`],
+      user?.[normalizedKind],
+      user?.[`submitted${keyUpper}`],
+      user?.[`submitted${normalizedKind.toUpperCase()}`],
+    ]
+
+    for (const candidate of candidates) {
+      const value = String(candidate || "").trim()
+      if (value) return value
+    }
+
+    return ""
+  }
 
   return {
     ...sanitized,
     identity: {
       ...sanitized.identity,
-      bvn: String(identity.bvn || "").trim(),
-      nin: String(identity.nin || "").trim(),
+      bvn: resolveIdentityNumber("bvn"),
+      nin: resolveIdentityNumber("nin"),
     },
   }
 }
