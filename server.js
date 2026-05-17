@@ -4275,6 +4275,37 @@ async function sendTierStatusEmail({ user, fromTier, toTier, approved, rejection
   }
 }
 
+async function sendTierSubmissionEmail({ user, fromTier, toTier }) {
+  try {
+    const to = String(user?.email || "").trim().toLowerCase()
+    if (!to || !isEmailTransportConfigured()) {
+      return { skipped: true }
+    }
+
+    const transport = getMailTransporter()
+    if (!transport) {
+      return { skipped: true }
+    }
+
+    const safeFromTier = Number(fromTier) || 1
+    const safeToTier = Number(toTier) || safeFromTier
+    const subject = `Your Tier ${safeToTier} upgrade request was submitted`
+    const text = `Hi ${user.name || "Creator"}, your Tier ${safeToTier} upgrade request (from Tier ${safeFromTier}) has been submitted and is now awaiting review.`
+
+    await transport.sendMail({
+      from: `"${SMTP_FROM_NAME}" <${SMTP_FROM}>`,
+      to,
+      subject,
+      text,
+    })
+
+    return { sent: true }
+  } catch (error) {
+    console.error("tier_submission_email_failed", error instanceof Error ? error.message : error)
+    return { skipped: true }
+  }
+}
+
 function getAxiosErrorMessage(error, fallbackMessage) {
   if (!(error instanceof AxiosError)) {
     return fallbackMessage
@@ -9385,6 +9416,11 @@ app.post("/kyc/upgrade-submission", requireSessionUser, async (req, res) => {
       metadata: { fromTier: currentTier, toTier: requestedTier, submissionId: submission._id.toString() },
     })
     await user.save()
+    await sendTierSubmissionEmail({
+      user,
+      fromTier: currentTier,
+      toTier: requestedTier,
+    })
 
     await createAuditLog({
       actorType: "user",
