@@ -10104,6 +10104,7 @@ app.get("/portal/settlements", requireAdminSession, async (req, res) => {
 
     res.json({
       payouts: payouts.map(sanitizePortalPayout),
+      payoutTransferProvider: getPayoutBankProvider(),
       pagination: getPaginationMeta({ page, limit, total }),
     })
   } catch (error) {
@@ -10130,6 +10131,7 @@ app.get("/portal/settlements/history", requireAdminSession, async (req, res) => 
 
     res.json({
       payouts: payouts.map(sanitizePortalPayout),
+      payoutTransferProvider: getPayoutBankProvider(),
       pagination: getPaginationMeta({ page, limit, total }),
     })
   } catch (error) {
