@@ -2,3 +2,4 @@
 .env.example
 node_modules
 uploads
+.env_copy

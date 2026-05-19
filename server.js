@@ -52,6 +52,7 @@ const PAYSTACK_DVA_SUBACCOUNT = readEnv("PAYSTACK_DVA_SUBACCOUNT")
 const PAYSTACK_DVA_SPLIT_CODE = readEnv("PAYSTACK_DVA_SPLIT_CODE")
 const PAYSTACK_WEBHOOK_IP_ALLOWLIST = readEnv("PAYSTACK_WEBHOOK_IP_ALLOWLIST")
 const PAYOUT_TRANSFER_PROVIDER = (readEnv("PAYOUT_TRANSFER_PROVIDER") || "paystack").toLowerCase()
+const COLLECTION_PROVIDER = (readEnv("COLLECTION_PROVIDER") || "paystack").toLowerCase()
 const GOOGLE_CLIENT_ID = readEnv("GOOGLE_CLIENT_ID")
 const APPLE_CLIENT_ID = readEnv("APPLE_CLIENT_ID")
 const ADMIN_EMAIL = readEnv("ADMIN_EMAIL")
@@ -70,6 +71,13 @@ const SMTP_FROM_NAME = readEnv("SMTP_FROM_NAME") || "StreamTip"
 const MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER = readEnv(
   "MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER",
 )
+const DIRECT_SPLIT_MIGRATION_MODE = /^(1|true|yes)$/i.test(
+  readEnv("DIRECT_SPLIT_MIGRATION_MODE"),
+)
+const DIRECT_SPLIT_SETTLEMENT_MODE = /^(1|true|yes)$/i.test(
+  readEnv("DIRECT_SPLIT_SETTLEMENT_MODE"),
+)
+const MONNIFY_INCOME_SPLIT_CONFIG_JSON = readEnv("MONNIFY_INCOME_SPLIT_CONFIG_JSON")
 
 const missingRequiredEnv = ["MONGODB_URI"].filter((key) => !process.env[key])
 if (missingRequiredEnv.length > 0) {
@@ -102,6 +110,19 @@ function parseCsvList(value) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean)
+}
+
+function parseMonnifyIncomeSplitConfig(value) {
+  const raw = String(value || "").trim()
+  if (!raw) return []
+
+  try {
+    const parsed = JSON.parse(raw)
+    const list = Array.isArray(parsed) ? parsed : [parsed]
+    return list.filter((item) => item && typeof item === "object")
+  } catch (_error) {
+    return []
+  }
 }
 
 let mailTransporter = null
@@ -144,6 +165,29 @@ const monnify = createMonnifyService({
   baseUrl: MONNIFY_BASE_URL,
   ninVerificationPath: MONNIFY_NIN_VERIFICATION_PATH,
 })
+const monnifyIncomeSplitConfig = parseMonnifyIncomeSplitConfig(MONNIFY_INCOME_SPLIT_CONFIG_JSON)
+
+function isDonationCollectionPausedForMigration() {
+  return DIRECT_SPLIT_MIGRATION_MODE
+}
+
+function getDonationCollectionPausedMessage() {
+  return "Virtual-account collections are temporarily paused during payout migration. Please try again shortly."
+}
+
+function getCreatorPayoutFundsFlow() {
+  return isDonationCollectionPausedForMigration() || DIRECT_SPLIT_SETTLEMENT_MODE
+    ? "legacy_wallet"
+    : "wallet"
+}
+
+function useDirectSplitSettlementForIncomingCollections() {
+  return DIRECT_SPLIT_SETTLEMENT_MODE && !isDonationCollectionPausedForMigration()
+}
+
+function getIncomingDonationFundsFlow() {
+  return useDirectSplitSettlementForIncomingCollections() ? "direct_split" : "wallet"
+}
 
 function isOriginAllowed(origin) {
   if (!origin || allowedOrigins === "*") {
@@ -606,7 +650,7 @@ const donationSchema = new mongoose.Schema({
   alertMessage: String,
   walletStatus: {
     type: String,
-    enum: ["available", "pending_review", "rejected"],
+    enum: ["available", "pending_review", "rejected", "migration_hold"],
     default: "available",
     index: true,
   },
@@ -628,6 +672,7 @@ const donationSchema = new mongoose.Schema({
   monnifyTransactionReference: { type: String, index: true, sparse: true },
   monnifyPaymentReference: { type: String, index: true, sparse: true },
   providerPayload: { type: mongoose.Schema.Types.Mixed, default: undefined },
+  fundsFlow: { type: String, enum: ["wallet", "direct_split"], default: "wallet", index: true },
   date: { type: Date, default: Date.now },
 })
 
@@ -725,6 +770,7 @@ const payoutSchema = new mongoose.Schema({
   transferRecipientCode: String,
   paystackTransferCode: String,
   providerPayload: { type: mongoose.Schema.Types.Mixed, default: undefined },
+  fundsFlow: { type: String, default: "wallet", index: true },
   previousTransferReferences: { type: [String], default: undefined },
   retryCount: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now },
@@ -984,6 +1030,8 @@ const userSchema = new mongoose.Schema(
       paystackCustomerCode: String,
       dedicatedAccountId: String,
       assignmentStatus: String,
+      settlementMode: String,
+      incomeSplitConfigApplied: { type: [mongoose.Schema.Types.Mixed], default: undefined },
       createdAt: Date,
       updatedAt: Date,
       deprecatedAt: Date,
@@ -1003,6 +1051,8 @@ const userSchema = new mongoose.Schema(
           paystackCustomerCode: String,
           dedicatedAccountId: String,
           assignmentStatus: String,
+          settlementMode: String,
+          incomeSplitConfigApplied: { type: [mongoose.Schema.Types.Mixed], default: undefined },
           createdAt: Date,
           updatedAt: Date,
           deprecatedAt: Date,
@@ -2831,6 +2881,12 @@ function getComplianceInflowValidationReason({
   const normalizedPaymentStatus = String(paymentStatus || "").toUpperCase()
 
   if (donation) {
+    if (String(donation.walletStatus || "").toLowerCase() === "migration_hold") {
+      return "Held during direct-split migration. Wallet credit is disabled."
+    }
+    if (String(donation.fundsFlow || "wallet").toLowerCase() === "direct_split") {
+      return "Direct split-settlement mode: donation recorded for analytics/alerts without wallet credit."
+    }
     return "Resolved into a StreamTip gift donation."
   }
 
@@ -3388,7 +3444,11 @@ function sanitizeUser(user) {
     }),
     identityVerification: sanitizeIdentityVerification(user.identityVerification),
     payoutProfile: sanitizePayoutProfile(user.payoutProfile),
-    virtualAccount: user.virtualAccount || null,
+    virtualAccount: isDonationCollectionPausedForMigration() ? null : user.virtualAccount || null,
+    donationCollectionPaused: isDonationCollectionPausedForMigration(),
+    directSplitSettlementMode: useDirectSplitSettlementForIncomingCollections(),
+    payoutFundsFlow: getCreatorPayoutFundsFlow(),
+    collectionProvider: getCollectionProvider(),
     notificationUnreadCount: unreadNotifications,
     createdAt: user.createdAt,
   }
@@ -3420,6 +3480,7 @@ function sanitizePrivilegedUser(user) {
 
   return {
     ...sanitized,
+    virtualAccount: user?.virtualAccount || null,
     identity: {
       ...sanitized.identity,
       bvn: resolveIdentityNumber("bvn"),
@@ -3542,6 +3603,7 @@ function sanitizePortalPayout(payout) {
     transferReference: payout.transferReference,
     providerReference: payout.providerReference || "",
     providerMessage: payout.providerMessage || "",
+    fundsFlow: payout.fundsFlow || "wallet",
     provider: getPayoutProvider(payout),
     paystackTransferCode: payout.paystackTransferCode || "",
     transferRecipientCode: payout.transferRecipientCode || "",
@@ -3608,6 +3670,7 @@ function sanitizePortalDonation(donation, options = {}) {
     alertDisplayName: donation.alertDisplayName || donation.sender || "",
     alertMessage: donation.alertMessage || donation.narration || "",
     walletStatus: donation.walletStatus || "available",
+    fundsFlow: donation.fundsFlow || "wallet",
     riskFlags: donation.riskFlags || [],
     riskScore: donation.riskScore || 0,
     riskReason: donation.riskReason || "",
@@ -3647,7 +3710,13 @@ function sanitizeCreatorDonation(donation) {
     provider: donation.provider || "monnify",
     paymentStatus: donation.paymentStatus || "",
     walletStatus: donation.walletStatus || "available",
-    status: donation.walletStatus === "pending_review" ? "pending" : donation.walletStatus === "rejected" ? "failed" : "completed",
+    fundsFlow: donation.fundsFlow || "wallet",
+    status:
+      donation.walletStatus === "pending_review" || donation.walletStatus === "migration_hold"
+        ? "pending"
+        : donation.walletStatus === "rejected"
+          ? "failed"
+          : "completed",
     riskFlags: donation.riskFlags || [],
     transactionReference:
       donation.transactionReference ||
@@ -4686,10 +4755,12 @@ async function createOrLoginOAuthUser({ provider, sub, email, name, picture = ""
     try {
       await provisionVirtualAccountForUser(user)
     } catch (error) {
-      await markPaystackVirtualAccountPending(
-        user,
-        error instanceof Error ? error.message : "Could not provision a Paystack dedicated virtual account.",
-      )
+      if (isCollectionProviderPaystack()) {
+        await markPaystackVirtualAccountPending(
+          user,
+          error instanceof Error ? error.message : "Could not provision a virtual account.",
+        )
+      }
     }
 
     await createAuditLog({
@@ -4712,10 +4783,12 @@ async function createOrLoginOAuthUser({ provider, sub, email, name, picture = ""
       try {
         await provisionVirtualAccountForUser(user)
       } catch (error) {
-        await markPaystackVirtualAccountPending(
-          user,
-          error instanceof Error ? error.message : "Could not provision a Paystack dedicated virtual account.",
-        )
+        if (isCollectionProviderPaystack()) {
+          await markPaystackVirtualAccountPending(
+            user,
+            error instanceof Error ? error.message : "Could not provision a virtual account.",
+          )
+        }
       }
     }
   }
@@ -4892,6 +4965,7 @@ async function createPaystackDedicatedAccountForUser(user) {
     validationResult = await validatePaystackCustomerForUser(user, customerCode)
   } catch (error) {
     const message = getAxiosErrorMessage(error, "Paystack customer validation failed.")
+    const httpStatus = Number(error?.response?.status || error?.statusCode || 0)
     // BVN validation is a Paystack-gated feature. If it's not enabled on this integration,
     // skip validation and continue with DVA creation instead of blocking the user.
     if (
@@ -4900,7 +4974,7 @@ async function createPaystackDedicatedAccountForUser(user) {
     ) {
       validationResult = { skipped: true, reason: message }
     } else {
-      throw new Error(message)
+      throw createStatusCodeError(message, httpStatus)
     }
   }
 
@@ -4924,15 +4998,24 @@ async function createPaystackDedicatedAccountForUser(user) {
     }
 
     console.log("[Paystack] BVN validation skipped — going directly to /dedicated_account/assign")
-    await paystack.assignDedicatedVirtualAccount({
-      email: customerPayload.email,
-      first_name: customerPayload.first_name,
-      last_name: customerPayload.last_name,
-      phone,
-      preferred_bank: PAYSTACK_PREFERRED_DVA_BANK || undefined,
-      ...dvaSplitField,
-      country: "NG",
-    })
+    try {
+      await paystack.assignDedicatedVirtualAccount({
+        email: customerPayload.email,
+        first_name: customerPayload.first_name,
+        last_name: customerPayload.last_name,
+        phone,
+        preferred_bank: PAYSTACK_PREFERRED_DVA_BANK || undefined,
+        ...dvaSplitField,
+        country: "NG",
+      })
+    } catch (assignError) {
+      const assignMessage = getAxiosErrorMessage(
+        assignError,
+        "Paystack dedicated account assignment failed.",
+      )
+      const assignStatus = Number(assignError?.response?.status || assignError?.statusCode || 0)
+      throw createStatusCodeError(assignMessage, assignStatus)
+    }
 
     // /dedicated_account/assign is async — Paystack will send a
     // dedicatedaccount.assign.success webhook when the account is ready.
@@ -5054,7 +5137,16 @@ async function markPaystackVirtualAccountPending(user, reason = "", customerCode
 }
 
 async function provisionVirtualAccountForUser(user) {
-  return createPaystackDedicatedAccountForUser(user)
+  if (isDonationCollectionPausedForMigration()) {
+    const error = new Error(getDonationCollectionPausedMessage())
+    error.statusCode = 503
+    error.errorCode = "VIRTUAL_ACCOUNT_COLLECTION_PAUSED"
+    throw error
+  }
+
+  return getCollectionProvider() === "monnify"
+    ? createReservedAccountForUser(user)
+    : createPaystackDedicatedAccountForUser(user)
 }
 
 function normalizeDateOnly(value) {
@@ -5233,6 +5325,21 @@ async function syncDonationFromMonnifyTransaction(donation) {
 
 function getPayoutBankProvider() {
   return PAYOUT_TRANSFER_PROVIDER === "paystack" ? "paystack" : "monnify"
+}
+
+function getCollectionProvider() {
+  return COLLECTION_PROVIDER === "monnify" ? "monnify" : "paystack"
+}
+
+function isCollectionProviderPaystack() {
+  return getCollectionProvider() === "paystack"
+}
+
+function getCreatorWithdrawalProviderForFundsFlow(fundsFlow = "wallet") {
+  if (String(fundsFlow || "").toLowerCase() === "legacy_wallet") {
+    return "monnify"
+  }
+  return getPayoutBankProvider()
 }
 
 async function getPaystackSupportedBanks() {
@@ -5445,6 +5552,13 @@ async function createReservedAccountForUser(user) {
   const monnifySuffix = `streamtip-${String(user._id).slice(-6)}`
   const monnifyCustomerEmail = buildMonnifyCustomerEmail(user.email, monnifySuffix)
   const monnifyCustomerName = buildMonnifyCustomerName(user.name, monnifySuffix)
+  const shouldUseDirectSplit = useDirectSplitSettlementForIncomingCollections()
+
+  if (shouldUseDirectSplit && monnifyIncomeSplitConfig.length === 0) {
+    throw new Error(
+      "Direct split-settlement mode is enabled, but MONNIFY_INCOME_SPLIT_CONFIG_JSON is empty. Add incomeSplitConfig before provisioning virtual accounts.",
+    )
+  }
 
   const requestReservedAccount = async (customerEmail) =>
     axios.post(
@@ -5457,6 +5571,9 @@ async function createReservedAccountForUser(user) {
         customerEmail,
         customerName: monnifyCustomerName,
         getAllAvailableBanks: true,
+        ...(shouldUseDirectSplit && monnifyIncomeSplitConfig.length > 0
+          ? { incomeSplitConfig: monnifyIncomeSplitConfig }
+          : {}),
         ...(bvn ? { bvn } : {}),
         ...(nin ? { nin } : {}),
       },
@@ -5533,6 +5650,10 @@ async function createReservedAccountForUser(user) {
     status: "active",
     provider: "monnify",
     environment: currentEnvironment,
+    settlementMode: shouldUseDirectSplit ? "direct_split" : "wallet",
+    incomeSplitConfigApplied: shouldUseDirectSplit
+      ? monnifyIncomeSplitConfig
+      : undefined,
     createdAt: new Date(),
   }
 
@@ -5645,6 +5766,74 @@ async function removeVirtualAccountForUser(user) {
     user: updatedUser || user,
     previousVirtualAccount,
     remoteDeallocation,
+  }
+}
+
+async function deactivateVirtualAccountsBatch({
+  limit = 100,
+  dryRun = true,
+} = {}) {
+  const normalizedLimit = Math.min(Math.max(Number(limit) || 0, 1), 500)
+  const users = await User.find({
+    role: "creator",
+    "virtualAccount.accountNumber": { $exists: true, $ne: "" },
+  })
+    .sort({ createdAt: 1 })
+    .limit(normalizedLimit)
+
+  const results = []
+
+  for (const user of users) {
+    const accountNumber = String(user.virtualAccount?.accountNumber || "")
+    const accountReference = String(user.virtualAccount?.accountReference || "")
+    const provider = String(user.virtualAccount?.provider || "")
+
+    if (dryRun) {
+      results.push({
+        userId: user._id.toString(),
+        email: user.email,
+        status: "dry_run",
+        provider,
+        accountNumberLast4: accountNumber.slice(-4),
+        accountReference,
+      })
+      continue
+    }
+
+    try {
+      const { user: updatedUser, remoteDeallocation } = await removeVirtualAccountForUser(user)
+      results.push({
+        userId: user._id.toString(),
+        email: user.email,
+        status: "deactivated",
+        provider,
+        accountNumberLast4: accountNumber.slice(-4),
+        accountReference,
+        remoteDeallocation,
+        virtualAccountCleared: !Boolean(updatedUser?.virtualAccount?.accountNumber),
+      })
+    } catch (error) {
+      results.push({
+        userId: user._id.toString(),
+        email: user.email,
+        status: "failed",
+        provider,
+        accountNumberLast4: accountNumber.slice(-4),
+        accountReference,
+        error: error instanceof Error ? error.message : "Could not deactivate virtual account.",
+      })
+    }
+  }
+
+  return {
+    dryRun,
+    count: results.length,
+    summary: {
+      deactivated: results.filter((item) => item.status === "deactivated").length,
+      failed: results.filter((item) => item.status === "failed").length,
+      dryRun: results.filter((item) => item.status === "dry_run").length,
+    },
+    results,
   }
 }
 
@@ -6354,6 +6543,9 @@ async function getRevenueTotals({ creatorId } = {}) {
     if ((donation.walletStatus || "available") !== "pending_review") {
       return sum
     }
+    if (String(donation.fundsFlow || "wallet") !== "wallet") {
+      return sum
+    }
 
     if (typeof donation.creatorShare === "number") {
       return sum + donation.creatorShare
@@ -6376,6 +6568,23 @@ async function getRevenueTotals({ creatorId } = {}) {
     if ((donation.walletStatus || "available") !== "available") {
       return sum
     }
+    if (String(donation.fundsFlow || "wallet") !== "wallet") {
+      return sum
+    }
+
+    if (typeof donation.creatorShare === "number") {
+      return sum + donation.creatorShare
+    }
+
+    return sum + calculateRevenueSplit(donation.amount).creatorShare
+  }, 0)
+  const directSplitCreatorRevenue = donations.reduce((sum, donation) => {
+    if ((donation.walletStatus || "available") === "rejected") {
+      return sum
+    }
+    if (String(donation.fundsFlow || "wallet") !== "direct_split") {
+      return sum
+    }
 
     if (typeof donation.creatorShare === "number") {
       return sum + donation.creatorShare
@@ -6388,15 +6597,22 @@ async function getRevenueTotals({ creatorId } = {}) {
     (sum, withdrawal) => sum + (Number(withdrawal.amount) || 0),
     0,
   )
+  const creatorWalletSnapshot = creatorId
+    ? await User.findById(creatorId).select({ wallet: 1 }).lean()
+    : null
+  const walletAvailableBalance = Number(creatorWalletSnapshot?.wallet?.availableBalance || 0)
 
   return {
     grossRevenue,
     platformRevenue,
     creatorRevenue,
+    directSplitCreatorRevenue,
     pendingCreatorRevenue,
     totalPaidOut,
     totalPlatformWithdrawn,
-    creatorAvailableBalance: Math.max(0, creatorRevenue - totalPaidOut),
+    creatorAvailableBalance: creatorId
+      ? Math.max(0, walletAvailableBalance)
+      : Math.max(0, creatorRevenue - totalPaidOut),
     pendingPlatformRevenue: Math.max(0, platformRevenue - totalPlatformWithdrawn),
   }
 }
@@ -7176,6 +7392,21 @@ async function assessDonationRisk({ creator, amount, sourceDetails }) {
 }
 
 async function applyWalletCredit({ creator, donation, status }) {
+  if (isDonationCollectionPausedForMigration()) {
+    donation.walletStatus = "migration_hold"
+    donation.riskReason = donation.riskReason || "Held during direct-split migration."
+    donation.riskFlags = Array.from(new Set([...(donation.riskFlags || []), "migration_wallet_credit_blocked"]))
+    donation.creditedToWalletAt = undefined
+    await donation.save()
+    return
+  }
+
+  if (String(donation.fundsFlow || "wallet") === "direct_split") {
+    donation.creditedToWalletAt = undefined
+    await donation.save()
+    return
+  }
+
   const creatorShare = Number(donation.creatorShare) || 0
   const grossAmount = Number(donation.amount) || 0
   const platformFee = Number(donation.platformFee) || 0
@@ -7223,6 +7454,12 @@ async function applyWalletCredit({ creator, donation, status }) {
 }
 
 function buildOverlayAlertPayload(donation) {
+  const walletStatus = String(donation.walletStatus || "").toLowerCase()
+  const alertStatus =
+    walletStatus === "pending_review" || walletStatus === "migration_hold"
+      ? "pending_review"
+      : "available"
+
   return {
     streamerId: donation.creatorId?.toString?.() || String(donation.creatorId || ""),
     amount: Number(donation.amount) || 0,
@@ -7235,16 +7472,22 @@ function buildOverlayAlertPayload(donation) {
       donation.monnifyTransactionReference ||
       donation.monnifyPaymentReference ||
       "",
-    status: donation.walletStatus === "pending_review" ? "pending_review" : "available",
+    status: alertStatus,
   }
 }
 
 function emitDonationAlert(creatorId, donation) {
+  const walletStatus = String(donation.walletStatus || "").toLowerCase()
+  const alertStatus =
+    walletStatus === "pending_review" || walletStatus === "migration_hold"
+      ? "pending_review"
+      : "available"
+
   const payload = {
     ...(donation.toObject ? donation.toObject() : donation),
     senderName: donation.alertDisplayName || donation.sender || "Someone sent you a tip",
     message: donation.alertMessage || donation.narration || donation.message || "",
-    status: donation.walletStatus === "pending_review" ? "pending_review" : "available",
+    status: alertStatus,
   }
   const alertPayload = buildOverlayAlertPayload(donation)
 
@@ -7542,9 +7785,14 @@ app.post("/auth/register", async (req, res) => {
           const reason =
             error instanceof Error ? error.message : "Could not provision a dedicated virtual account."
 
-          await markPaystackVirtualAccountPending(user, reason)
-          warning =
-            "Your account was created, but the virtual account could not be provisioned yet. It has been marked as pending so you can continue into the dashboard."
+          if (isCollectionProviderPaystack()) {
+            await markPaystackVirtualAccountPending(user, reason)
+            warning =
+              "Your account was created, but the virtual account could not be provisioned yet. It has been marked as pending so you can continue into the dashboard."
+          } else {
+            warning =
+              "Your account was created, but the virtual account could not be provisioned yet. Please retry from your account page after a short while."
+          }
         }
       }
     }
@@ -7794,6 +8042,13 @@ app.post("/admin/auth/logout", requireAdminSession, async (req, res) => {
 
 app.post("/users/:id/virtual-account", requireSessionUser, async (req, res) => {
   try {
+    if (isDonationCollectionPausedForMigration()) {
+      return res.status(503).json({
+        error: getDonationCollectionPausedMessage(),
+        code: "VIRTUAL_ACCOUNT_COLLECTION_PAUSED",
+      })
+    }
+
     if (String(req.user._id) !== String(req.params.id)) {
       return res.status(403).json({ error: "You can only provision a virtual account for your own user." })
     }
@@ -7808,13 +8063,13 @@ app.post("/users/:id/virtual-account", requireSessionUser, async (req, res) => {
     return res.json({ virtualAccount })
   } catch (error) {
     console.error(error)
-    const statusCode = Number(error?.statusCode || 0)
+    const statusCode = Number(error?.statusCode || error?.response?.status || 0)
 
     return res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
       error:
         error instanceof Error
           ? error.message
-          : "Could not provision a Paystack dedicated virtual account.",
+          : "Could not provision a virtual account.",
       code: String(error?.errorCode || ""),
     })
   }
@@ -7822,8 +8077,21 @@ app.post("/users/:id/virtual-account", requireSessionUser, async (req, res) => {
 
 app.post("/users/:id/virtual-account/requery", requireSessionUser, async (req, res) => {
   try {
+    if (isDonationCollectionPausedForMigration()) {
+      return res.status(503).json({
+        error: getDonationCollectionPausedMessage(),
+        code: "VIRTUAL_ACCOUNT_COLLECTION_PAUSED",
+      })
+    }
+
     if (String(req.user._id) !== String(req.params.id)) {
       return res.status(403).json({ error: "You can only requery your own virtual account." })
+    }
+
+    if (String(req.user.virtualAccount?.provider || "").toLowerCase() !== "paystack") {
+      return res.status(409).json({
+        error: "Virtual account requery is only available for Paystack virtual accounts.",
+      })
     }
 
     const result = await requeryPaystackVirtualAccountForUser(
@@ -8131,6 +8399,7 @@ app.post("/api/webhooks/paystack", async (req, res) => {
     }
 
     const split = calculateRevenueSplit(grossAmount)
+    const donationFundsFlow = getIncomingDonationFundsFlow()
     const risk = await assessDonationRisk({
       creator,
       amount: split.gross,
@@ -8158,6 +8427,7 @@ app.post("/api/webhooks/paystack", async (req, res) => {
       alertDisplayName: alertDisplay.name,
       alertMessage: alertDisplay.message,
       walletStatus: risk.status,
+      fundsFlow: donationFundsFlow,
       riskFlags: risk.flags,
       riskScore: risk.riskScore,
       riskReason: risk.reason,
@@ -8187,7 +8457,11 @@ app.post("/api/webhooks/paystack", async (req, res) => {
       rawPaystackPayload: payload,
       status: "resolved",
       validationReason:
-        risk.status === "pending_review"
+        donation.walletStatus === "migration_hold"
+          ? "Held during direct-split migration. Wallet credit is disabled."
+          : donation.fundsFlow === "direct_split"
+            ? "Direct split-settlement mode: donation recorded for analytics/alerts without wallet credit."
+          : risk.status === "pending_review"
           ? `Resolved into pending wallet credit: ${risk.reason}.`
           : "Resolved into an available StreamTip wallet credit.",
       linkedCreatorId: creator._id,
@@ -8202,7 +8476,7 @@ app.post("/api/webhooks/paystack", async (req, res) => {
     await createAuditLog({
       actorType: "system",
       eventType: "webhook.paystack.charge_success",
-      message: `Paystack DVA donation credited as ${risk.status}.`,
+      message: `Paystack DVA donation processed as ${donation.walletStatus || risk.status}.`,
       metadata: {
         creatorId: creator._id.toString(),
         amount: split.gross,
@@ -8211,6 +8485,7 @@ app.post("/api/webhooks/paystack", async (req, res) => {
         transactionReference,
         paystackTransactionId,
         walletStatus: risk.status,
+        fundsFlow: donation.fundsFlow || donationFundsFlow,
         riskFlags: risk.flags,
         destinationAccountNumber: destinationDetails.destinationAccountNumber,
         sourceAccountNumberLast4: String(sourceDetails.sourceAccountNumber || "").slice(-4),
@@ -8443,6 +8718,7 @@ app.post("/webhook/monnify", async (req, res) => {
     }
     console.info("donation.sender_name_resolution", senderNameResolutionMetadata)
 
+    const donationFundsFlow = getIncomingDonationFundsFlow()
     const donation = await Donation.create({
       creatorId: creator._id,
       creatorEmail: creator.email,
@@ -8464,6 +8740,7 @@ app.post("/webhook/monnify", async (req, res) => {
       destinationBankCode: destinationDetails.destinationBankCode || undefined,
       monnifyTransactionReference: transactionReference || undefined,
       monnifyPaymentReference: paymentReference || undefined,
+      fundsFlow: donationFundsFlow,
       providerPayload: data,
     })
 
@@ -8524,6 +8801,13 @@ app.post("/webhook/monnify", async (req, res) => {
 
 app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
   try {
+    if (isDonationCollectionPausedForMigration()) {
+      return res.status(503).json({
+        error: getDonationCollectionPausedMessage(),
+        code: "VIRTUAL_ACCOUNT_COLLECTION_PAUSED",
+      })
+    }
+
     if (!isMonnifySandbox()) {
       return res.status(403).json({
         error: "Test donations are only available while Monnify is set to sandbox mode.",
@@ -8575,6 +8859,7 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
     }
 
     const split = calculateRevenueSplit(amount)
+    const donationFundsFlow = getIncomingDonationFundsFlow()
     const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1_000_000)}`
     const donation = await Donation.create({
       creatorId: req.user._id,
@@ -8587,6 +8872,7 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
       eventType: "monnify.test_api",
       paymentStatus: "PAID",
       provider: "monnify",
+      fundsFlow: donationFundsFlow,
       transactionReference: `TEST-TXN-${uniqueSuffix}`,
       destinationAccountNumber: req.user.virtualAccount.accountNumber,
       destinationBankName: req.user.virtualAccount.bankName || "Monnify",
@@ -8885,9 +9171,14 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
       })
     }
 
+    const payoutFundsFlow = getCreatorPayoutFundsFlow()
+    const payoutProvider = getCreatorWithdrawalProviderForFundsFlow(payoutFundsFlow)
     const transferReference =
-      PAYOUT_TRANSFER_PROVIDER === "paystack" ? createPaystackTransferReference() : createTransferReference()
+      payoutProvider === "paystack" ? createPaystackTransferReference() : createTransferReference()
     const requiresReviewReasons = ["portal_review_required"]
+    if (payoutFundsFlow === "legacy_wallet") {
+      requiresReviewReasons.push("legacy_wallet_withdrawal")
+    }
     const recentWithdrawalWindow = new Date(Date.now() - 24 * 60 * 60 * 1000)
     const recentWithdrawals = await Payout.find({
       creatorId: req.user._id,
@@ -8915,12 +9206,13 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
       bankCode: payoutProfile.bankCode,
       accountNumber: payoutProfile.accountNumber,
       accountName: payoutProfile.accountName,
-      provider: PAYOUT_TRANSFER_PROVIDER,
+      provider: payoutProvider,
       status: "pending_admin_approval",
       reviewStatus: "awaiting_review",
       reviewReason: requiresReviewReasons.join(","),
       transferReference,
       providerReference: transferReference,
+      fundsFlow: payoutFundsFlow,
       providerMessage: "Awaiting StreamTip settlement review before transfer processing.",
       createdAt: new Date(),
     })
@@ -10105,6 +10397,8 @@ app.get("/portal/settlements", requireAdminSession, async (req, res) => {
     res.json({
       payouts: payouts.map(sanitizePortalPayout),
       payoutTransferProvider: getPayoutBankProvider(),
+      creatorWithdrawalProvider: getCreatorWithdrawalProviderForFundsFlow(getCreatorPayoutFundsFlow()),
+      collectionProvider: getCollectionProvider(),
       pagination: getPaginationMeta({ page, limit, total }),
     })
   } catch (error) {
@@ -10132,6 +10426,8 @@ app.get("/portal/settlements/history", requireAdminSession, async (req, res) => 
     res.json({
       payouts: payouts.map(sanitizePortalPayout),
       payoutTransferProvider: getPayoutBankProvider(),
+      creatorWithdrawalProvider: getCreatorWithdrawalProviderForFundsFlow(getCreatorPayoutFundsFlow()),
+      collectionProvider: getCollectionProvider(),
       pagination: getPaginationMeta({ page, limit, total }),
     })
   } catch (error) {
@@ -10505,6 +10801,13 @@ app.get("/portal/users/:id", requireAdminSession, async (req, res) => {
 
 app.post("/portal/users/:id/paystack-requery", requireAdminSession, async (req, res) => {
   try {
+    if (isDonationCollectionPausedForMigration()) {
+      return res.status(503).json({
+        error: getDonationCollectionPausedMessage(),
+        code: "VIRTUAL_ACCOUNT_COLLECTION_PAUSED",
+      })
+    }
+
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ error: "Invalid user ID." })
     }
@@ -10513,6 +10816,12 @@ app.post("/portal/users/:id/paystack-requery", requireAdminSession, async (req, 
 
     if (!user) {
       return res.status(404).json({ error: "User not found." })
+    }
+
+    if (String(user.virtualAccount?.provider || "").toLowerCase() !== "paystack") {
+      return res.status(409).json({
+        error: "Paystack requery is only available for Paystack virtual accounts.",
+      })
     }
 
     const result = await requeryPaystackVirtualAccountForUser(
@@ -10538,6 +10847,31 @@ app.post("/portal/users/:id/paystack-requery", requireAdminSession, async (req, 
           ? error.message
           : "Could not request a Paystack virtual-account requery.",
     })
+  }
+})
+
+app.post("/portal/migration/deactivate-virtual-accounts", requireAdminSession, async (req, res) => {
+  try {
+    const result = await deactivateVirtualAccountsBatch({
+      limit: parsePositiveInteger(req.body?.limit, 100),
+      dryRun: req.body?.dryRun !== false,
+    })
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.migration.virtual_accounts.deactivate_batch",
+      message: `Portal ran virtual-account deactivation batch for ${result.count} creator(s).`,
+      metadata: {
+        dryRun: result.dryRun,
+        summary: result.summary,
+      },
+    })
+
+    return res.json(result)
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to run virtual-account deactivation batch." })
   }
 })
 
@@ -11526,6 +11860,13 @@ app.post("/admin/users/:id/identity-verification", requireAdminSession, async (r
 
 app.post("/admin/users/:id/virtual-account", requireAdminSession, async (req, res) => {
   try {
+    if (isDonationCollectionPausedForMigration()) {
+      return res.status(503).json({
+        error: getDonationCollectionPausedMessage(),
+        code: "VIRTUAL_ACCOUNT_COLLECTION_PAUSED",
+      })
+    }
+
     const user = await User.findById(req.params.id)
 
     if (!user) {
@@ -11552,7 +11893,7 @@ app.post("/admin/users/:id/virtual-account", requireAdminSession, async (req, re
       error:
         error instanceof Error
           ? error.message
-          : "Could not provision a Paystack dedicated virtual account.",
+          : "Could not provision a virtual account.",
     })
   }
 })
@@ -11560,6 +11901,13 @@ app.post("/admin/users/:id/virtual-account", requireAdminSession, async (req, re
 // Sync: fetch existing dedicated account from Paystack for a user and activate it in DB
 app.post("/admin/users/:id/virtual-account/sync", requireAdminSession, async (req, res) => {
   try {
+    if (isDonationCollectionPausedForMigration()) {
+      return res.status(503).json({
+        error: getDonationCollectionPausedMessage(),
+        code: "VIRTUAL_ACCOUNT_COLLECTION_PAUSED",
+      })
+    }
+
     const user = await User.findById(req.params.id)
     if (!user) return res.status(404).json({ error: "User not found." })
 
@@ -11642,6 +11990,13 @@ app.get("/admin/paystack/migration-candidates", requireAdminSession, async (req,
 
 app.post("/admin/paystack/migrate-virtual-accounts", requireAdminSession, async (req, res) => {
   try {
+    if (isDonationCollectionPausedForMigration()) {
+      return res.status(503).json({
+        error: getDonationCollectionPausedMessage(),
+        code: "VIRTUAL_ACCOUNT_COLLECTION_PAUSED",
+      })
+    }
+
     if (!isPaystackConfigured()) {
       return res.status(400).json({ error: "Paystack is not configured yet." })
     }
@@ -11717,6 +12072,31 @@ app.post("/admin/paystack/migrate-virtual-accounts", requireAdminSession, async 
   }
 })
 
+app.post("/admin/migration/deactivate-virtual-accounts", requireAdminSession, async (req, res) => {
+  try {
+    const result = await deactivateVirtualAccountsBatch({
+      limit: parsePositiveInteger(req.body?.limit, 100),
+      dryRun: req.body?.dryRun !== false,
+    })
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "admin.migration.virtual_accounts.deactivate_batch",
+      message: `Admin ran virtual-account deactivation batch for ${result.count} creator(s).`,
+      metadata: {
+        dryRun: result.dryRun,
+        summary: result.summary,
+      },
+    })
+
+    return res.json(result)
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to run virtual-account deactivation batch." })
+  }
+})
+
 app.post("/payout-profile", requireSessionUser, async (req, res) => {
   try {
     if (req.user.payoutProfile?.locked) {
@@ -11751,15 +12131,25 @@ app.post("/payout-profile", requireSessionUser, async (req, res) => {
 
     let warning = ""
 
-    try {
-      await provisionVirtualAccountForUser(req.user)
-    } catch (error) {
-      const reason =
-        error instanceof Error ? error.message : "Could not provision a dedicated virtual account."
-
-      await markPaystackVirtualAccountPending(req.user, reason)
+    if (isDonationCollectionPausedForMigration()) {
       warning =
-        "Your payout account was locked, but the virtual account could not be provisioned yet. It has been marked as pending."
+        "Your payout account was locked. Virtual-account collections are temporarily paused during migration."
+    } else {
+      try {
+        await provisionVirtualAccountForUser(req.user)
+      } catch (error) {
+        const reason =
+          error instanceof Error ? error.message : "Could not provision a dedicated virtual account."
+
+        if (isCollectionProviderPaystack()) {
+          await markPaystackVirtualAccountPending(req.user, reason)
+          warning =
+            "Your payout account was locked, but the virtual account could not be provisioned yet. It has been marked as pending."
+        } else {
+          warning =
+            "Your payout account was locked, but the virtual account could not be provisioned yet. Please retry from your account page after a short while."
+        }
+      }
     }
 
     await createAuditLog({
