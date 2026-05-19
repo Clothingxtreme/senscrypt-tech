@@ -4191,6 +4191,25 @@ function sanitizePublicOverlayUser(user) {
   }
 }
 
+function normalizeLeaderboardResetAt(value) {
+  if (!value) {
+    return undefined
+  }
+
+  const parsed = value instanceof Date ? value : new Date(value)
+
+  if (Number.isNaN(parsed.getTime())) {
+    return undefined
+  }
+
+  const now = new Date()
+  if (parsed.getTime() > now.getTime()) {
+    return now
+  }
+
+  return parsed
+}
+
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex")
   const hash = crypto.scryptSync(password, salt, 64).toString("hex")
@@ -9091,12 +9110,11 @@ app.put("/overlay-state", requireSessionUser, async (req, res) => {
         ? sanitizeOverlayCustomizationForServer(req.body.customization)
         : currentState.customization,
       customGifts: nextCustomGifts,
-      leaderboardResetAt:
+      leaderboardResetAt: normalizeLeaderboardResetAt(
         typeof req.body?.leaderboardResetAt === "string" && req.body.leaderboardResetAt
-          ? new Date(req.body.leaderboardResetAt)
-          : currentState.leaderboardResetAt
-            ? new Date(currentState.leaderboardResetAt)
-            : undefined,
+          ? req.body.leaderboardResetAt
+          : currentState.leaderboardResetAt,
+      ),
       updatedAt: new Date(),
     }
 
@@ -9126,9 +9144,7 @@ app.get("/public/overlay/:creatorId", async (req, res) => {
     }
 
     const overlayState = getOverlayStateForUser(user)
-    const leaderboardResetAt = overlayState.leaderboardResetAt
-      ? new Date(overlayState.leaderboardResetAt)
-      : null
+    const leaderboardResetAt = normalizeLeaderboardResetAt(overlayState.leaderboardResetAt)
     const donationQuery = {
       creatorId: user._id,
       $or: [
