@@ -8196,7 +8196,11 @@ app.post("/api/webhooks/paystack", async (req, res) => {
       return res.sendStatus(200)
     }
 
-    if (eventType !== "charge.success" && eventType !== "dedicatedaccount.assign.success") {
+    if (
+      eventType !== "charge.success" &&
+      eventType !== "dedicatedaccount.assign.success" &&
+      eventType !== "dedicatedaccount.assign.failed"
+    ) {
       await createAuditLog({
         actorType: "system",
         eventType: "webhook.paystack.ignored",
@@ -8244,6 +8248,74 @@ app.post("/api/webhooks/paystack", async (req, res) => {
       } else {
         console.warn("[Paystack] dedicatedaccount.assign.success — could not find creator or missing account number", { customerCode, accountNumber })
       }
+      return res.sendStatus(200)
+    }
+
+    // Handle dedicated account assignment failure
+    if (eventType === "dedicatedaccount.assign.failed") {
+      const customerCode = getPaystackCustomerCode(eventData)
+      const providerMessage = String(
+        eventData.message ||
+          eventData.reason ||
+          eventData.gateway_response ||
+          eventData.responseMessage ||
+          payload.message ||
+          "Paystack dedicated account assignment failed.",
+      ).trim()
+      const creator = await findCreatorForPaystackEvent(eventData)
+
+      if (creator) {
+        const currentVirtualAccount = creator.virtualAccount?.toObject?.() || creator.virtualAccount || {}
+        const isActive = String(currentVirtualAccount.status || "").toLowerCase() === "active"
+
+        creator.virtualAccount = {
+          ...currentVirtualAccount,
+          accountReference:
+            String(currentVirtualAccount.accountReference || "").trim() ||
+            String(customerCode || `PAYSTACK-PENDING-${creator._id}`).trim(),
+          accountName: String(currentVirtualAccount.accountName || buildPaystackAccountName(creator)).trim(),
+          accountNumber: isActive
+            ? String(currentVirtualAccount.accountNumber || "").trim()
+            : "Provisioning failed",
+          bankName: String(currentVirtualAccount.bankName || "Paystack").trim(),
+          bankCode: String(currentVirtualAccount.bankCode || "").trim(),
+          reservationReference: String(currentVirtualAccount.reservationReference || "").trim(),
+          status: isActive ? "active" : "failed",
+          provider: "paystack",
+          environment: getPaystackEnvironment(),
+          paystackCustomerCode:
+            String(customerCode || currentVirtualAccount.paystackCustomerCode || "").trim() || undefined,
+          dedicatedAccountId: String(
+            getPaystackDedicatedAccountId(eventData) || currentVirtualAccount.dedicatedAccountId || "",
+          ).trim(),
+          assignmentStatus: "failed",
+          updatedAt: new Date(),
+          createdAt: currentVirtualAccount.createdAt || new Date(),
+        }
+        await creator.save()
+
+        await createAuditLog({
+          actorType: "system",
+          actorId: creator._id.toString(),
+          eventType: "paystack.virtual_account.assignment_failed",
+          message: `Paystack virtual account assignment failed for ${creator.email}.`,
+          metadata: {
+            customerCode,
+            providerMessage,
+          },
+        })
+      } else {
+        await createAuditLog({
+          actorType: "system",
+          eventType: "webhook.paystack.assign_failed_unmatched",
+          message: "Paystack dedicated account assignment failed webhook could not be matched to a creator.",
+          metadata: {
+            customerCode,
+            providerMessage,
+          },
+        })
+      }
+
       return res.sendStatus(200)
     }
 
