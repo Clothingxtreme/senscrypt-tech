@@ -4891,6 +4891,12 @@ async function validatePaystackCustomerForUser(user, customerCode) {
   return getPaystackResponseData(response)
 }
 
+function hasMonnifyVerifiedBvnForUser(user) {
+  const provider = String(user?.identityVerification?.provider || "").toLowerCase().trim()
+  const bvnStatus = String(user?.identityVerification?.bvn?.status || "").toLowerCase().trim()
+  return Boolean(user?.bvnVerified) && provider === "monnify" && bvnStatus === "verified"
+}
+
 function normalizePaystackDedicatedAccount(response, user, customerCode) {
   const data = getPaystackResponseData(response)
   const bank = data.bank && typeof data.bank === "object" ? data.bank : {}
@@ -4960,21 +4966,29 @@ async function createPaystackDedicatedAccountForUser(user) {
 
   const { customerCode } = await createOrUpdatePaystackCustomerForUser(user)
   let validationResult = null
+  const canTrustExistingMonnifyBvn = hasMonnifyVerifiedBvnForUser(user)
 
-  try {
-    validationResult = await validatePaystackCustomerForUser(user, customerCode)
-  } catch (error) {
-    const message = getAxiosErrorMessage(error, "Paystack customer validation failed.")
-    const httpStatus = Number(error?.response?.status || error?.statusCode || 0)
-    // BVN validation is a Paystack-gated feature. If it's not enabled on this integration,
-    // skip validation and continue with DVA creation instead of blocking the user.
-    if (
-      message.toLowerCase().includes("not available on this integration") ||
-      message.toLowerCase().includes("bvn") && message.toLowerCase().includes("not available")
-    ) {
-      validationResult = { skipped: true, reason: message }
-    } else {
-      throw createStatusCodeError(message, httpStatus)
+  if (canTrustExistingMonnifyBvn) {
+    validationResult = {
+      skipped: true,
+      reason: "Monnify BVN verification already passed for this user.",
+    }
+  } else {
+    try {
+      validationResult = await validatePaystackCustomerForUser(user, customerCode)
+    } catch (error) {
+      const message = getAxiosErrorMessage(error, "Paystack customer validation failed.")
+      const httpStatus = Number(error?.response?.status || error?.statusCode || 0)
+      // BVN validation is a Paystack-gated feature. If it's not enabled on this integration,
+      // skip validation and continue with DVA creation instead of blocking the user.
+      if (
+        message.toLowerCase().includes("not available on this integration") ||
+        (message.toLowerCase().includes("bvn") && message.toLowerCase().includes("not available"))
+      ) {
+        validationResult = { skipped: true, reason: message }
+      } else {
+        throw createStatusCodeError(message, httpStatus)
+      }
     }
   }
 
