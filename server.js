@@ -3129,10 +3129,12 @@ function getBankTransferNarrationDisplay(value) {
   const displayNarration = sanitizeDonorDisplayName(typedNarration)
   const normalizedNarration = normalizeName(displayNarration)
   const normalizedSender = normalizeName(senderName)
+  const hasEnoughNarrationCharacters = normalizedNarration.length >= 4
 
   if (
     displayNarration &&
     normalizedNarration &&
+    hasEnoughNarrationCharacters &&
     normalizedNarration !== normalizedSender &&
     !isSystemNarration(displayNarration, [])
   ) {
@@ -3192,8 +3194,10 @@ function getNarrationAlertDisplay(narration, { creatorNames = [], senderCandidat
   }
 
   const displayName = sanitizeDonorDisplayName(narrationText)
+  const normalizedDisplayName = normalizeName(displayName)
+  const hasEnoughNarrationCharacters = normalizedDisplayName.length >= 4
 
-  return displayName
+  return displayName && hasEnoughNarrationCharacters
     ? {
         name: displayName,
         message: displayName,
@@ -5543,11 +5547,16 @@ async function createReservedAccountForUser(user) {
   }
 
   const currentEnvironment = getMonnifyEnvironment()
+  const shouldUseDirectSplit = useDirectSplitSettlementForIncomingCollections()
+  const currentSettlementMode = String(user.virtualAccount?.settlementMode || "wallet").toLowerCase()
+  const isCurrentModeCompatible =
+    !shouldUseDirectSplit || currentSettlementMode === "direct_split"
 
   if (
     user.virtualAccount?.accountNumber &&
     user.virtualAccount.status === "active" &&
-    user.virtualAccount.environment === currentEnvironment
+    user.virtualAccount.environment === currentEnvironment &&
+    isCurrentModeCompatible
   ) {
     return user.virtualAccount
   }
@@ -5566,8 +5575,6 @@ async function createReservedAccountForUser(user) {
   const monnifySuffix = `streamtip-${String(user._id).slice(-6)}`
   const monnifyCustomerEmail = buildMonnifyCustomerEmail(user.email, monnifySuffix)
   const monnifyCustomerName = buildMonnifyCustomerName(user.name, monnifySuffix)
-  const shouldUseDirectSplit = useDirectSplitSettlementForIncomingCollections()
-
   if (shouldUseDirectSplit && monnifyIncomeSplitConfig.length === 0) {
     throw new Error(
       "Direct split-settlement mode is enabled, but MONNIFY_INCOME_SPLIT_CONFIG_JSON is empty. Add incomeSplitConfig before provisioning virtual accounts.",
