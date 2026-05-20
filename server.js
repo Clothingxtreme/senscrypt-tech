@@ -47,12 +47,13 @@ const FRONTEND_ORIGIN = readEnv("FRONTEND_ORIGIN")
 const MONNIFY_WEBHOOK_IP_ALLOWLIST = readEnv("MONNIFY_WEBHOOK_IP_ALLOWLIST")
 const PAYSTACK_SECRET_KEY = readEnv("PAYSTACK_SECRET_KEY")
 const PAYSTACK_BASE_URL = readEnv("PAYSTACK_BASE_URL") || "https://api.paystack.co"
+const PAYSTACK_ENABLED = /^(1|true|yes)$/i.test(readEnv("PAYSTACK_ENABLED"))
 const PAYSTACK_PREFERRED_DVA_BANK = readEnv("PAYSTACK_PREFERRED_DVA_BANK")
 const PAYSTACK_DVA_SUBACCOUNT = readEnv("PAYSTACK_DVA_SUBACCOUNT")
 const PAYSTACK_DVA_SPLIT_CODE = readEnv("PAYSTACK_DVA_SPLIT_CODE")
 const PAYSTACK_WEBHOOK_IP_ALLOWLIST = readEnv("PAYSTACK_WEBHOOK_IP_ALLOWLIST")
-const PAYOUT_TRANSFER_PROVIDER = (readEnv("PAYOUT_TRANSFER_PROVIDER") || "paystack").toLowerCase()
-const COLLECTION_PROVIDER = (readEnv("COLLECTION_PROVIDER") || "paystack").toLowerCase()
+const PAYOUT_TRANSFER_PROVIDER = (readEnv("PAYOUT_TRANSFER_PROVIDER") || "monnify").toLowerCase()
+const COLLECTION_PROVIDER = (readEnv("COLLECTION_PROVIDER") || "monnify").toLowerCase()
 const GOOGLE_CLIENT_ID = readEnv("GOOGLE_CLIENT_ID")
 const APPLE_CLIENT_ID = readEnv("APPLE_CLIENT_ID")
 const ADMIN_EMAIL = readEnv("ADMIN_EMAIL")
@@ -71,6 +72,9 @@ const SMTP_FROM_NAME = readEnv("SMTP_FROM_NAME") || "StreamTip"
 const MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER = readEnv(
   "MONNIFY_DISBURSEMENT_SOURCE_ACCOUNT_NUMBER",
 )
+const MONNIFY_PLATFORM_SUBACCOUNT_CODE = readEnv("MONNIFY_PLATFORM_SUBACCOUNT_CODE")
+const MONNIFY_STREAMER_SPLIT_PERCENTAGE = Number(readEnv("MONNIFY_STREAMER_SPLIT_PERCENTAGE") || 80)
+const MONNIFY_SUBACCOUNT_EMAIL_DOMAIN = readEnv("MONNIFY_SUBACCOUNT_EMAIL_DOMAIN")
 const DIRECT_SPLIT_MIGRATION_MODE = /^(1|true|yes)$/i.test(
   readEnv("DIRECT_SPLIT_MIGRATION_MODE"),
 )
@@ -123,6 +127,27 @@ function parseMonnifyIncomeSplitConfig(value) {
   } catch (_error) {
     return []
   }
+}
+
+function normalizeMonnifySplitPercentage(value, fallback) {
+  const parsed = Math.round(Number(value))
+  if (!Number.isFinite(parsed)) {
+    return fallback
+  }
+  if (parsed <= 0) {
+    return fallback <= 0 ? 0 : fallback
+  }
+  return Math.min(99, Math.max(1, parsed))
+}
+
+function compactMonnifySplitConfig(value) {
+  const list = Array.isArray(value) ? value : []
+  return list
+    .map((item) => ({
+      subAccountCode: String(item?.subAccountCode || "").trim(),
+      splitPercentage: normalizeMonnifySplitPercentage(item?.splitPercentage, 0),
+    }))
+    .filter((item) => item.subAccountCode && item.splitPercentage > 0)
 }
 
 let mailTransporter = null
@@ -1016,6 +1041,12 @@ const userSchema = new mongoose.Schema(
       lockedAt: Date,
       changeRequiresSupport: { type: Boolean, default: true },
       verificationProvider: { type: String, default: "monnify" },
+      monnifySubAccountCode: String,
+      monnifySubAccountEmail: String,
+      monnifySubAccountAccountNumber: String,
+      monnifySubAccountBankCode: String,
+      monnifySubAccountSyncedAt: Date,
+      monnifySubAccountLastError: String,
     },
     virtualAccount: {
       accountReference: String,
@@ -1031,6 +1062,7 @@ const userSchema = new mongoose.Schema(
       dedicatedAccountId: String,
       assignmentStatus: String,
       settlementMode: String,
+      monnifySubAccountCode: String,
       incomeSplitConfigApplied: { type: [mongoose.Schema.Types.Mixed], default: undefined },
       createdAt: Date,
       updatedAt: Date,
@@ -1052,6 +1084,7 @@ const userSchema = new mongoose.Schema(
           dedicatedAccountId: String,
           assignmentStatus: String,
           settlementMode: String,
+          monnifySubAccountCode: String,
           incomeSplitConfigApplied: { type: [mongoose.Schema.Types.Mixed], default: undefined },
           createdAt: Date,
           updatedAt: Date,
@@ -1250,6 +1283,10 @@ function getTierRequirements(tier) {
 }
 
 function getPaystackEnvironment() {
+  if (!PAYSTACK_ENABLED) {
+    return "disabled"
+  }
+
   if (!PAYSTACK_SECRET_KEY) {
     return "unconfigured"
   }
@@ -1258,7 +1295,7 @@ function getPaystackEnvironment() {
 }
 
 function isPaystackConfigured() {
-  return paystack.isConfigured()
+  return PAYSTACK_ENABLED && paystack.isConfigured()
 }
 
 function normalizePhoneNumber(value) {
@@ -2336,6 +2373,10 @@ function sanitizePayoutProfile(profile) {
     lockedAt: profile.lockedAt || "",
     changeRequiresSupport: profile.changeRequiresSupport !== false,
     verificationProvider: profile.verificationProvider || "monnify",
+    monnifySubAccountCode: profile.monnifySubAccountCode || "",
+    monnifySubAccountEmail: profile.monnifySubAccountEmail || "",
+    monnifySubAccountSyncedAt: profile.monnifySubAccountSyncedAt || "",
+    monnifySubAccountLastError: profile.monnifySubAccountLastError || "",
   }
 }
 
@@ -5273,6 +5314,282 @@ async function getMonnifyAccessToken() {
   return monnify.getAccessToken()
 }
 
+function getMonnifySplitPercentages() {
+  const streamer = normalizeMonnifySplitPercentage(MONNIFY_STREAMER_SPLIT_PERCENTAGE, 80)
+  const platform = 100 - streamer
+  return { streamer, platform }
+}
+
+function buildMonnifySubAccountEmail(user) {
+  const fallbackLocalPart = `streamer-${String(user?._id || "").slice(-8) || Date.now()}`
+  const configuredDomain = String(MONNIFY_SUBACCOUNT_EMAIL_DOMAIN || "").trim().replace(/^@/, "")
+  const sourceEmail = String(user?.email || "").trim().toLowerCase()
+
+  if (configuredDomain) {
+    const localPart = sourceEmail.includes("@")
+      ? sourceEmail.split("@")[0]
+      : fallbackLocalPart
+    return `${localPart}+subacct@${configuredDomain}`
+  }
+
+  return sourceEmail || `${fallbackLocalPart}@streamtip.local`
+}
+
+function extractMonnifySubAccountEntry(data) {
+  if (!data || typeof data !== "object") {
+    return null
+  }
+
+  const subAccountCode = String(
+    data.subAccountCode || data.subAccount?.subAccountCode || data.code || "",
+  ).trim()
+  if (!subAccountCode) {
+    return null
+  }
+
+  return {
+    subAccountCode,
+    bankCode: String(data.bankCode || data.bank?.code || "").trim(),
+    accountNumber: String(data.accountNumber || data.accountNo || "").replace(/\D/g, ""),
+    email: String(data.email || data.customerEmail || "").trim().toLowerCase(),
+  }
+}
+
+async function listMonnifySubAccounts(accessToken) {
+  const response = await axios.get(`${MONNIFY_BASE_URL}/api/v1/sub-accounts`, {
+    params: { page: 0, size: 500 },
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+    },
+  })
+
+  const body = response.data?.responseBody
+  const collections = [
+    Array.isArray(body) ? body : [],
+    Array.isArray(body?.content) ? body.content : [],
+    Array.isArray(body?.items) ? body.items : [],
+    Array.isArray(body?.subAccounts) ? body.subAccounts : [],
+  ]
+
+  return collections
+    .flat()
+    .map(extractMonnifySubAccountEntry)
+    .filter(Boolean)
+}
+
+async function createMonnifySubAccount({
+  accessToken,
+  bankCode,
+  accountNumber,
+  email,
+  defaultSplitPercentage,
+}) {
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  }
+  const payload = {
+    currencyCode: "NGN",
+    bankCode,
+    accountNumber,
+    email,
+    defaultSplitPercentage,
+  }
+
+  let response
+
+  try {
+    response = await axios.post(`${MONNIFY_BASE_URL}/api/v1/sub-accounts`, [payload], { headers })
+  } catch (_arrayStyleError) {
+    try {
+      response = await axios.post(`${MONNIFY_BASE_URL}/api/v1/sub-accounts`, payload, { headers })
+    } catch {
+      const fallbackPayload = { ...payload }
+      delete fallbackPayload.defaultSplitPercentage
+      response = await axios.post(`${MONNIFY_BASE_URL}/api/v1/sub-accounts`, [fallbackPayload], { headers })
+    }
+  }
+
+  const entry =
+    (Array.isArray(response.data?.responseBody)
+      ? extractMonnifySubAccountEntry(response.data.responseBody[0])
+      : null) ||
+    extractMonnifySubAccountEntry(response.data?.responseBody) ||
+    (Array.isArray(response.data?.responseBody?.content)
+      ? extractMonnifySubAccountEntry(response.data.responseBody.content[0])
+      : null)
+
+  if (!entry?.subAccountCode) {
+    throw new Error("Monnify did not return a valid subAccountCode.")
+  }
+
+  return entry
+}
+
+async function ensureMonnifyStreamerSubAccount(user, accessToken) {
+  const profile = getLockedPayoutProfile(user)
+  const profileAccountNumber = String(profile.accountNumber || "").replace(/\D/g, "")
+  const profileBankCode = String(profile.bankCode || "").trim()
+
+  if (!profileBankCode || profileAccountNumber.length !== 10) {
+    throw new Error("A locked payout profile with a valid bank account is required.")
+  }
+
+  const existingCode = String(profile.monnifySubAccountCode || "").trim()
+  const existingMatchesProfile =
+    String(profile.monnifySubAccountAccountNumber || "").replace(/\D/g, "") === profileAccountNumber &&
+    String(profile.monnifySubAccountBankCode || "").trim() === profileBankCode
+
+  if (existingCode && existingMatchesProfile) {
+    return {
+      subAccountCode: existingCode,
+      accountNumber: profileAccountNumber,
+      bankCode: profileBankCode,
+      email: String(profile.monnifySubAccountEmail || "").trim().toLowerCase(),
+    }
+  }
+
+  const { streamer: defaultSplitPercentage } = getMonnifySplitPercentages()
+  const email = String(profile.monnifySubAccountEmail || "").trim().toLowerCase() || buildMonnifySubAccountEmail(user)
+
+  try {
+    const created = await createMonnifySubAccount({
+      accessToken,
+      bankCode: profileBankCode,
+      accountNumber: profileAccountNumber,
+      email,
+      defaultSplitPercentage,
+    })
+
+    user.payoutProfile = {
+      ...(user.payoutProfile?.toObject?.() || user.payoutProfile || {}),
+      monnifySubAccountCode: created.subAccountCode,
+      monnifySubAccountEmail: created.email || email,
+      monnifySubAccountAccountNumber: created.accountNumber || profileAccountNumber,
+      monnifySubAccountBankCode: created.bankCode || profileBankCode,
+      monnifySubAccountSyncedAt: new Date(),
+      monnifySubAccountLastError: "",
+    }
+    await user.save()
+
+    return {
+      subAccountCode: created.subAccountCode,
+      accountNumber: created.accountNumber || profileAccountNumber,
+      bankCode: created.bankCode || profileBankCode,
+      email: created.email || email,
+    }
+  } catch (error) {
+    try {
+      const existingSubAccounts = await listMonnifySubAccounts(accessToken)
+      const matched = existingSubAccounts.find((item) => {
+        if (!item) return false
+        if (item.accountNumber && item.accountNumber !== profileAccountNumber) return false
+        if (item.bankCode && profileBankCode && item.bankCode !== profileBankCode) return false
+        if (item.email && email && item.email !== email) return false
+        return Boolean(item.subAccountCode)
+      })
+
+      if (matched?.subAccountCode) {
+        user.payoutProfile = {
+          ...(user.payoutProfile?.toObject?.() || user.payoutProfile || {}),
+          monnifySubAccountCode: matched.subAccountCode,
+          monnifySubAccountEmail: matched.email || email,
+          monnifySubAccountAccountNumber: matched.accountNumber || profileAccountNumber,
+          monnifySubAccountBankCode: matched.bankCode || profileBankCode,
+          monnifySubAccountSyncedAt: new Date(),
+          monnifySubAccountLastError: "",
+        }
+        await user.save()
+
+        return {
+          subAccountCode: matched.subAccountCode,
+          accountNumber: matched.accountNumber || profileAccountNumber,
+          bankCode: matched.bankCode || profileBankCode,
+          email: matched.email || email,
+        }
+      }
+    } catch (_listError) {
+      // Best effort fallback when Monnify list endpoint cannot be queried.
+    }
+
+    user.payoutProfile = {
+      ...(user.payoutProfile?.toObject?.() || user.payoutProfile || {}),
+      monnifySubAccountLastError: getAxiosErrorMessage(
+        error,
+        "Failed to create Monnify subaccount for this streamer.",
+      ),
+    }
+    await user.save()
+
+    throw error
+  }
+}
+
+function getLegacyMonnifySplitConfig() {
+  return compactMonnifySplitConfig(monnifyIncomeSplitConfig)
+}
+
+async function getMonnifyIncomeSplitConfigForUser({ user, accessToken }) {
+  if (!useDirectSplitSettlementForIncomingCollections()) {
+    return []
+  }
+
+  const platformSubAccountCode = String(MONNIFY_PLATFORM_SUBACCOUNT_CODE || "").trim()
+  if (!platformSubAccountCode) {
+    return getLegacyMonnifySplitConfig()
+  }
+
+  const streamerSubAccount = await ensureMonnifyStreamerSubAccount(user, accessToken)
+  const streamerSubAccountCode = String(streamerSubAccount?.subAccountCode || "").trim()
+  if (!streamerSubAccountCode) {
+    throw new Error("Monnify streamer subaccount could not be created for this creator.")
+  }
+
+  if (streamerSubAccountCode === platformSubAccountCode) {
+    throw new Error("Streamer subaccount and platform subaccount must be different.")
+  }
+
+  const { streamer, platform } = getMonnifySplitPercentages()
+  return compactMonnifySplitConfig([
+    { subAccountCode: streamerSubAccountCode, splitPercentage: streamer },
+    { subAccountCode: platformSubAccountCode, splitPercentage: platform },
+  ])
+}
+
+async function updateMonnifyReservedAccountSplitConfig({
+  accessToken,
+  accountReference,
+  incomeSplitConfig,
+}) {
+  const normalizedReference = String(accountReference || "").trim()
+  if (!normalizedReference) {
+    throw new Error("Monnify account reference is required to update split config.")
+  }
+
+  const normalizedConfig = compactMonnifySplitConfig(incomeSplitConfig)
+  if (!normalizedConfig.length) {
+    throw new Error("A valid income split config is required.")
+  }
+
+  const response = await axios.put(
+    `${MONNIFY_BASE_URL}/api/v1/bank-transfer/reserved-accounts/${encodeURIComponent(
+      normalizedReference,
+    )}/income-split-config`,
+    { incomeSplitConfig: normalizedConfig },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+    },
+  )
+
+  return response.data?.responseBody || response.data || {}
+}
+
 async function getMonnifyTransactionStatus(transactionReference) {
   if (!isMonnifyConfigured()) {
     throw new Error("Monnify is not configured yet.")
@@ -5361,10 +5678,18 @@ async function syncDonationFromMonnifyTransaction(donation) {
 }
 
 function getPayoutBankProvider() {
+  if (!isPaystackConfigured()) {
+    return "monnify"
+  }
+
   return PAYOUT_TRANSFER_PROVIDER === "paystack" ? "paystack" : "monnify"
 }
 
 function getCollectionProvider() {
+  if (!isPaystackConfigured()) {
+    return "monnify"
+  }
+
   return COLLECTION_PROVIDER === "monnify" ? "monnify" : "paystack"
 }
 
@@ -5567,6 +5892,10 @@ async function createReservedAccountForUser(user) {
 
   const currentEnvironment = getMonnifyEnvironment()
   const shouldUseDirectSplit = useDirectSplitSettlementForIncomingCollections()
+  const accessToken = await getMonnifyAccessToken()
+  const resolvedIncomeSplitConfig = shouldUseDirectSplit
+    ? await getMonnifyIncomeSplitConfigForUser({ user, accessToken })
+    : []
   const currentSettlementMode = String(user.virtualAccount?.settlementMode || "wallet").toLowerCase()
   const isCurrentModeCompatible =
     !shouldUseDirectSplit || currentSettlementMode === "direct_split"
@@ -5580,6 +5909,41 @@ async function createReservedAccountForUser(user) {
     return user.virtualAccount
   }
 
+  if (
+    shouldUseDirectSplit &&
+    user.virtualAccount?.accountNumber &&
+    user.virtualAccount.status === "active" &&
+    user.virtualAccount.environment === currentEnvironment &&
+    currentSettlementMode !== "direct_split" &&
+    String(user.virtualAccount?.accountReference || "").trim()
+  ) {
+    try {
+      await updateMonnifyReservedAccountSplitConfig({
+        accessToken,
+        accountReference: user.virtualAccount.accountReference,
+        incomeSplitConfig: resolvedIncomeSplitConfig,
+      })
+
+      const nextVirtualAccount = {
+        ...(user.virtualAccount?.toObject?.() || user.virtualAccount || {}),
+        settlementMode: "direct_split",
+        monnifySubAccountCode:
+          String(user.payoutProfile?.monnifySubAccountCode || "").trim() || undefined,
+        incomeSplitConfigApplied: resolvedIncomeSplitConfig,
+        updatedAt: new Date(),
+      }
+      user.virtualAccount = nextVirtualAccount
+      await user.save()
+      return user.virtualAccount
+    } catch (error) {
+      const message = getAxiosErrorMessage(
+        error,
+        "Could not update income split config on existing Monnify reserved account.",
+      )
+      console.error("monnify.split_update_failed", message)
+    }
+  }
+
   const bvn = String(user.identity?.bvn || "").trim()
   const nin = String(user.identity?.nin || "").trim()
 
@@ -5589,14 +5953,13 @@ async function createReservedAccountForUser(user) {
     )
   }
 
-  const accessToken = await getMonnifyAccessToken()
   const accountReference = `STIP-${user._id}-${Date.now()}`
   const monnifySuffix = `streamtip-${String(user._id).slice(-6)}`
   const monnifyCustomerEmail = buildMonnifyCustomerEmail(user.email, monnifySuffix)
   const monnifyCustomerName = buildMonnifyCustomerName(user.name, monnifySuffix)
-  if (shouldUseDirectSplit && monnifyIncomeSplitConfig.length === 0) {
+  if (shouldUseDirectSplit && resolvedIncomeSplitConfig.length === 0) {
     throw new Error(
-      "Direct split-settlement mode is enabled, but MONNIFY_INCOME_SPLIT_CONFIG_JSON is empty. Add incomeSplitConfig before provisioning virtual accounts.",
+      "Direct split-settlement mode is enabled, but no valid Monnify income split config is available for this streamer.",
     )
   }
 
@@ -5611,8 +5974,8 @@ async function createReservedAccountForUser(user) {
         customerEmail,
         customerName: monnifyCustomerName,
         getAllAvailableBanks: true,
-        ...(shouldUseDirectSplit && monnifyIncomeSplitConfig.length > 0
-          ? { incomeSplitConfig: monnifyIncomeSplitConfig }
+        ...(shouldUseDirectSplit && resolvedIncomeSplitConfig.length > 0
+          ? { incomeSplitConfig: resolvedIncomeSplitConfig }
           : {}),
         ...(bvn ? { bvn } : {}),
         ...(nin ? { nin } : {}),
@@ -5691,8 +6054,9 @@ async function createReservedAccountForUser(user) {
     provider: "monnify",
     environment: currentEnvironment,
     settlementMode: shouldUseDirectSplit ? "direct_split" : "wallet",
+    monnifySubAccountCode: String(user.payoutProfile?.monnifySubAccountCode || "").trim() || undefined,
     incomeSplitConfigApplied: shouldUseDirectSplit
-      ? monnifyIncomeSplitConfig
+      ? resolvedIncomeSplitConfig
       : undefined,
     createdAt: new Date(),
   }
@@ -6764,6 +7128,12 @@ async function buildVerifiedPayoutProfile({
     accountName: resolvedAccount.accountName,
   })
 
+  const currentProfile = user?.payoutProfile || {}
+  const isSameBankAccount =
+    String(currentProfile.bankCode || "").trim() === String(resolvedAccount.bankCode || cleanBankCode).trim() &&
+    String(currentProfile.accountNumber || "").trim() ===
+      String(resolvedAccount.accountNumber || cleanAccountNumber).trim()
+
   return {
     bankName: cleanBankName || resolvedAccount.bankName || "",
     bankCode: resolvedAccount.bankCode || cleanBankCode,
@@ -6778,6 +7148,18 @@ async function buildVerifiedPayoutProfile({
     lockedAt: new Date(),
     changeRequiresSupport: true,
     verificationProvider: resolvedAccount.verificationProvider || getPayoutBankProvider(),
+    monnifySubAccountCode: isSameBankAccount ? String(currentProfile.monnifySubAccountCode || "").trim() : "",
+    monnifySubAccountEmail: isSameBankAccount ? String(currentProfile.monnifySubAccountEmail || "").trim() : "",
+    monnifySubAccountAccountNumber: isSameBankAccount
+      ? String(currentProfile.monnifySubAccountAccountNumber || "").trim()
+      : "",
+    monnifySubAccountBankCode: isSameBankAccount
+      ? String(currentProfile.monnifySubAccountBankCode || "").trim()
+      : "",
+    monnifySubAccountSyncedAt: isSameBankAccount ? currentProfile.monnifySubAccountSyncedAt : undefined,
+    monnifySubAccountLastError: isSameBankAccount
+      ? String(currentProfile.monnifySubAccountLastError || "").trim()
+      : "",
   }
 }
 
@@ -8117,6 +8499,12 @@ app.post("/users/:id/virtual-account", requireSessionUser, async (req, res) => {
 
 app.post("/users/:id/virtual-account/requery", requireSessionUser, async (req, res) => {
   try {
+    if (!isPaystackConfigured()) {
+      return res.status(410).json({
+        error: "Paystack is disabled. StreamTip is currently running Monnify-only collections.",
+      })
+    }
+
     if (isDonationCollectionPausedForMigration()) {
       return res.status(503).json({
         error: getDonationCollectionPausedMessage(),
@@ -8162,6 +8550,10 @@ app.post("/users/:id/virtual-account/requery", requireSessionUser, async (req, r
 
 app.post("/api/webhooks/paystack", async (req, res) => {
   try {
+    if (!isPaystackConfigured()) {
+      return res.status(410).json({ error: "Paystack webhook is disabled." })
+    }
+
     if (!isPaystackWebhookIpAllowed(req)) {
       await createAuditLog({
         actorType: "system",
@@ -10910,6 +11302,12 @@ app.get("/portal/users/:id", requireAdminSession, async (req, res) => {
 
 app.post("/portal/users/:id/paystack-requery", requireAdminSession, async (req, res) => {
   try {
+    if (!isPaystackConfigured()) {
+      return res.status(410).json({
+        error: "Paystack is disabled. StreamTip is currently running Monnify-only collections.",
+      })
+    }
+
     if (isDonationCollectionPausedForMigration()) {
       return res.status(503).json({
         error: getDonationCollectionPausedMessage(),
@@ -12073,6 +12471,10 @@ app.post("/admin/users/:id/virtual-account/sync", requireAdminSession, async (re
 
 app.get("/admin/paystack/migration-candidates", requireAdminSession, async (req, res) => {
   try {
+    if (!isPaystackConfigured()) {
+      return res.status(410).json({ error: "Paystack migration is disabled." })
+    }
+
     const limit = Math.min(parsePositiveInteger(req.query.limit, 100), 500)
     const users = await User.find({
       role: "creator",
@@ -12099,15 +12501,15 @@ app.get("/admin/paystack/migration-candidates", requireAdminSession, async (req,
 
 app.post("/admin/paystack/migrate-virtual-accounts", requireAdminSession, async (req, res) => {
   try {
+    if (!isPaystackConfigured()) {
+      return res.status(410).json({ error: "Paystack migration is disabled." })
+    }
+
     if (isDonationCollectionPausedForMigration()) {
       return res.status(503).json({
         error: getDonationCollectionPausedMessage(),
         code: "VIRTUAL_ACCOUNT_COLLECTION_PAUSED",
       })
-    }
-
-    if (!isPaystackConfigured()) {
-      return res.status(400).json({ error: "Paystack is not configured yet." })
     }
 
     const limit = Math.min(parsePositiveInteger(req.body?.limit, 25), 100)
