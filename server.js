@@ -9754,7 +9754,45 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
 
 app.get("/donations", requireSessionUser, async (req, res) => {
   try {
-    const donations = await Donation.find({ creatorId: req.user._id }).sort({ date: -1 })
+    const filter = { creatorId: req.user._id }
+    const { date = "", from = "", to = "" } = req.query || {}
+    const dateText = String(date || "").trim()
+    const fromText = String(from || "").trim()
+    const toText = String(to || "").trim()
+
+    if (dateText) {
+      const start = new Date(dateText)
+      if (!Number.isNaN(start.getTime())) {
+        start.setHours(0, 0, 0, 0)
+        const end = new Date(start)
+        end.setHours(23, 59, 59, 999)
+        filter.date = { $gte: start, $lte: end }
+      }
+    } else {
+      const dateFilter = {}
+
+      if (fromText) {
+        const fromDate = new Date(fromText)
+        if (!Number.isNaN(fromDate.getTime())) {
+          fromDate.setHours(0, 0, 0, 0)
+          dateFilter.$gte = fromDate
+        }
+      }
+
+      if (toText) {
+        const toDate = new Date(toText)
+        if (!Number.isNaN(toDate.getTime())) {
+          toDate.setHours(23, 59, 59, 999)
+          dateFilter.$lte = toDate
+        }
+      }
+
+      if (Object.keys(dateFilter).length) {
+        filter.date = dateFilter
+      }
+    }
+
+    const donations = await Donation.find(filter).sort({ date: -1 })
     res.json(donations.map(sanitizeCreatorDonation))
   } catch (error) {
     console.error(error)
