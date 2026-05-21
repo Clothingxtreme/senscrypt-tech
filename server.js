@@ -133,6 +133,9 @@ const WEBHOOK_IDEMPOTENCY_TTL_SECONDS = Math.max(
   Math.min(86_400, Number(readEnv("WEBHOOK_IDEMPOTENCY_TTL_SECONDS") || 3600)),
 )
 const MONITORING_ALERTS_ENABLED = /^(1|true|yes)$/i.test(readEnv("MONITORING_ALERTS_ENABLED"))
+const MONGO_SLOW_QUERY_MONITOR_ENABLED = !/^(0|false|no)$/i.test(
+  readEnv("MONGO_SLOW_QUERY_MONITOR_ENABLED"),
+)
 const MONITORING_ALERT_CHAT_ID =
   readEnv("MONITORING_ALERT_CHAT_ID") || TELEGRAM_WITHDRAWAL_CHAT_ID
 const MONITORING_ALERT_COOLDOWN_MS = Math.max(
@@ -899,6 +902,10 @@ function sanitizeSlowQueryPayload(raw) {
 }
 
 function installMongoSlowQueryMonitoring() {
+  if (!MONGO_SLOW_QUERY_MONITOR_ENABLED) {
+    return
+  }
+
   if (mongoose.Query.prototype.__streamtipSlowMonitorInstalled) {
     return
   }
@@ -912,30 +919,28 @@ function installMongoSlowQueryMonitoring() {
       return await originalQueryExec.apply(this, args)
     } finally {
       const durationMs = Date.now() - startedAt
-      if (durationMs < MONGO_SLOW_QUERY_THRESHOLD_MS) {
-        return
-      }
+      if (durationMs >= MONGO_SLOW_QUERY_THRESHOLD_MS) {
+        const count = incrementMonitoringCounter("mongoSlowQueries")
+        const metadata = {
+          model: this.model?.modelName || "",
+          collection: this.model?.collection?.name || "",
+          op: this.op || "",
+          durationMs,
+          thresholdMs: MONGO_SLOW_QUERY_THRESHOLD_MS,
+          query: sanitizeSlowQueryPayload(this.getQuery?.() || {}),
+        }
 
-      const count = incrementMonitoringCounter("mongoSlowQueries")
-      const metadata = {
-        model: this.model?.modelName || "",
-        collection: this.model?.collection?.name || "",
-        op: this.op || "",
-        durationMs,
-        thresholdMs: MONGO_SLOW_QUERY_THRESHOLD_MS,
-        query: sanitizeSlowQueryPayload(this.getQuery?.() || {}),
-      }
+        logMonitoringEvent("warn", "mongo.slow_query", metadata)
 
-      logMonitoringEvent("warn", "mongo.slow_query", metadata)
-
-      if (count >= MONGO_SLOW_QUERY_ALERT_THRESHOLD) {
-        void sendMonitoringAlert(
-          "mongo.slow_query_spike",
-          `Slow Mongo queries reached ${count} in ${Math.round(
-            MONITORING_ALERT_WINDOW_MS / 1000,
-          )}s window (latest ${durationMs}ms).`,
-          metadata,
-        )
+        if (count >= MONGO_SLOW_QUERY_ALERT_THRESHOLD) {
+          void sendMonitoringAlert(
+            "mongo.slow_query_spike",
+            `Slow Mongo queries reached ${count} in ${Math.round(
+              MONITORING_ALERT_WINDOW_MS / 1000,
+            )}s window (latest ${durationMs}ms).`,
+            metadata,
+          )
+        }
       }
     }
   }
@@ -946,30 +951,28 @@ function installMongoSlowQueryMonitoring() {
       return await originalAggregateExec.apply(this, args)
     } finally {
       const durationMs = Date.now() - startedAt
-      if (durationMs < MONGO_SLOW_QUERY_THRESHOLD_MS) {
-        return
-      }
+      if (durationMs >= MONGO_SLOW_QUERY_THRESHOLD_MS) {
+        const count = incrementMonitoringCounter("mongoSlowQueries")
+        const metadata = {
+          model: this._model?.modelName || "",
+          collection: this._model?.collection?.name || "",
+          op: "aggregate",
+          durationMs,
+          thresholdMs: MONGO_SLOW_QUERY_THRESHOLD_MS,
+          pipeline: sanitizeSlowQueryPayload(this._pipeline || []),
+        }
 
-      const count = incrementMonitoringCounter("mongoSlowQueries")
-      const metadata = {
-        model: this._model?.modelName || "",
-        collection: this._model?.collection?.name || "",
-        op: "aggregate",
-        durationMs,
-        thresholdMs: MONGO_SLOW_QUERY_THRESHOLD_MS,
-        pipeline: sanitizeSlowQueryPayload(this._pipeline || []),
-      }
+        logMonitoringEvent("warn", "mongo.slow_query", metadata)
 
-      logMonitoringEvent("warn", "mongo.slow_query", metadata)
-
-      if (count >= MONGO_SLOW_QUERY_ALERT_THRESHOLD) {
-        void sendMonitoringAlert(
-          "mongo.slow_query_spike",
-          `Slow Mongo queries reached ${count} in ${Math.round(
-            MONITORING_ALERT_WINDOW_MS / 1000,
-          )}s window (latest aggregate ${durationMs}ms).`,
-          metadata,
-        )
+        if (count >= MONGO_SLOW_QUERY_ALERT_THRESHOLD) {
+          void sendMonitoringAlert(
+            "mongo.slow_query_spike",
+            `Slow Mongo queries reached ${count} in ${Math.round(
+              MONITORING_ALERT_WINDOW_MS / 1000,
+            )}s window (latest aggregate ${durationMs}ms).`,
+            metadata,
+          )
+        }
       }
     }
   }
