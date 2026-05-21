@@ -92,6 +92,18 @@ const OVERLAY_PUBLIC_CACHE_SECONDS = Math.min(
   10,
   Math.max(1, Number(readEnv("OVERLAY_PUBLIC_CACHE_SECONDS") || 3)),
 )
+const OVERLAY_RESPONSE_CACHE_TTL_MS = Math.min(
+  10_000,
+  Math.max(0, Number(readEnv("OVERLAY_RESPONSE_CACHE_TTL_MS") || 1500)),
+)
+const OVERLAY_PUBLIC_FETCH_LIMIT = Math.min(
+  300,
+  Math.max(100, Number(readEnv("OVERLAY_PUBLIC_FETCH_LIMIT") || 160)),
+)
+const OVERLAY_PUBLIC_RESPONSE_DONATION_LIMIT = Math.min(
+  120,
+  Math.max(30, Number(readEnv("OVERLAY_PUBLIC_RESPONSE_DONATION_LIMIT") || 100)),
+)
 const SOCKET_IO_ADAPTER = String(readEnv("SOCKET_IO_ADAPTER") || "memory")
   .trim()
   .toLowerCase()
@@ -554,6 +566,8 @@ const webhookPipelineMetrics = {
   lastDurationMs: 0,
 }
 const inlineWebhookIdempotency = new Map()
+const overlayPublicResponseCache = new Map()
+const overlayPublicResponseInFlight = new Map()
 
 const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
@@ -4499,6 +4513,186 @@ function sanitizePublicOverlayUser(user) {
   }
 }
 
+function getOverlayCacheControlHeader() {
+  return `public, max-age=${OVERLAY_PUBLIC_CACHE_SECONDS}, stale-while-revalidate=${
+    OVERLAY_PUBLIC_CACHE_SECONDS * 4
+  }`
+}
+
+function parseOverlayComparableTimestamp(value) {
+  const parsed = new Date(value).getTime()
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function pruneOverlayPublicCache() {
+  if (overlayPublicResponseCache.size <= 400) {
+    return
+  }
+
+  const now = Date.now()
+  for (const [cacheKey, entry] of overlayPublicResponseCache.entries()) {
+    if (now - Number(entry?.cachedAt || 0) > OVERLAY_RESPONSE_CACHE_TTL_MS * 8) {
+      overlayPublicResponseCache.delete(cacheKey)
+    }
+  }
+
+  if (overlayPublicResponseCache.size > 400) {
+    const keys = Array.from(overlayPublicResponseCache.keys()).slice(
+      0,
+      overlayPublicResponseCache.size - 350,
+    )
+    keys.forEach((key) => overlayPublicResponseCache.delete(key))
+  }
+}
+
+function invalidateOverlayPublicCache(creatorId) {
+  const key = String(creatorId || "").trim()
+  if (!key) {
+    return
+  }
+
+  overlayPublicResponseCache.delete(key)
+}
+
+function isOverlayDonationVisibleInPublicOverlay(donation) {
+  const walletStatus = String(donation?.walletStatus || "").toLowerCase().trim()
+
+  if (!walletStatus) {
+    return true
+  }
+
+  return walletStatus === "available"
+}
+
+function buildPublicOverlayUserLean(user) {
+  if (!user) {
+    return null
+  }
+
+  const nameParts = getUserNameParts(user)
+  const displayName = buildFullNameFromParts(nameParts, user.name || user.email || "Creator")
+  const virtualAccount = user.virtualAccount && typeof user.virtualAccount === "object"
+    ? {
+        ...user.virtualAccount,
+        accountName: buildPublicStreamerAccountName(user),
+      }
+    : null
+
+  return {
+    id: user._id,
+    name: displayName,
+    firstName: nameParts.firstName,
+    middleName: nameParts.middleName,
+    lastName: nameParts.lastName,
+    email: "",
+    overlaySlug: getOverlaySlug(user),
+    role: user.role || "creator",
+    status: user.status || "active",
+    profileImage: user.profileImage || "",
+    virtualAccount,
+  }
+}
+
+async function buildPublicOverlayCacheEntry(creatorId) {
+  const creatorObjectId = new mongoose.Types.ObjectId(creatorId)
+  const user = await User.findOne({
+    _id: creatorObjectId,
+    $or: [{ status: { $exists: false } }, { status: "active" }],
+  })
+    .select({
+      _id: 1,
+      name: 1,
+      email: 1,
+      firstName: 1,
+      middleName: 1,
+      lastName: 1,
+      role: 1,
+      status: 1,
+      profileImage: 1,
+      virtualAccount: 1,
+      overlayState: 1,
+    })
+    .lean()
+
+  if (!user) {
+    return { notFound: true }
+  }
+
+  const overlayState = getOverlayStateForUser(user)
+  const leaderboardResetAt = normalizeLeaderboardResetAt(overlayState.leaderboardResetAt)
+  const donationBaseQuery = {
+    creatorId: creatorObjectId,
+    ...(leaderboardResetAt && !Number.isNaN(leaderboardResetAt.getTime())
+      ? { date: { $gte: leaderboardResetAt } }
+      : {}),
+  }
+
+  const [latestDonation, candidateDonations] = await Promise.all([
+    Donation.findOne(donationBaseQuery).select({ _id: 1, date: 1, createdAt: 1 }).sort({ date: -1 }).lean(),
+    Donation.find(donationBaseQuery)
+      .select({
+        _id: 1,
+        creatorId: 1,
+        sender: 1,
+        alertDisplayName: 1,
+        senderNameSource: 1,
+        amount: 1,
+        creatorShare: 1,
+        platformFee: 1,
+        alertMessage: 1,
+        narration: 1,
+        provider: 1,
+        paymentStatus: 1,
+        walletStatus: 1,
+        fundsFlow: 1,
+        riskFlags: 1,
+        transactionReference: 1,
+        paystackReference: 1,
+        monnifyTransactionReference: 1,
+        monnifyPaymentReference: 1,
+        date: 1,
+        createdAt: 1,
+      })
+      .sort({ date: -1 })
+      .limit(OVERLAY_PUBLIC_FETCH_LIMIT)
+      .lean(),
+  ])
+
+  const overlayUpdatedAtMs = parseOverlayComparableTimestamp(user?.overlayState?.updatedAt)
+  const latestDonationTimestamp = latestDonation
+    ? parseOverlayComparableTimestamp(latestDonation.date || latestDonation.createdAt)
+    : 0
+  const overlayVersion = [
+    "overlay",
+    creatorId,
+    overlayUpdatedAtMs,
+    latestDonationTimestamp,
+    latestDonation?._id ? String(latestDonation._id) : "none",
+  ].join(":")
+  const etag = `W/"${overlayVersion}"`
+  const lastModifiedMs = Math.max(overlayUpdatedAtMs, latestDonationTimestamp)
+  const lastModifiedHeader =
+    lastModifiedMs > 0 ? new Date(lastModifiedMs).toUTCString() : new Date(0).toUTCString()
+
+  const donations = candidateDonations
+    .filter((donation) => isOverlayDonationVisibleInPublicOverlay(donation))
+    .slice(0, OVERLAY_PUBLIC_RESPONSE_DONATION_LIMIT)
+    .map(sanitizeCreatorDonation)
+
+  return {
+    notFound: false,
+    payload: {
+      ...overlayState,
+      user: buildPublicOverlayUserLean(user),
+      donations,
+    },
+    etag,
+    lastModifiedMs,
+    lastModifiedHeader,
+    cachedAt: Date.now(),
+  }
+}
+
 function normalizeLeaderboardResetAt(value) {
   if (!value) {
     return undefined
@@ -8253,6 +8447,7 @@ function emitDonationAlert(creatorId, donation) {
   }
   const alertPayload = buildOverlayAlertPayload(donation)
 
+  invalidateOverlayPublicCache(creatorId)
   io.to(getCreatorRoom(creatorId)).emit("newDonation", payload)
   io.to(getCreatorRoom(creatorId)).emit("overlayAlert", alertPayload)
 }
@@ -10058,6 +10253,7 @@ app.put("/overlay-state", requireSessionUser, async (req, res) => {
     req.user.overlayState = nextState
     req.user.markModified('overlayState')
     await req.user.save()
+    invalidateOverlayPublicCache(req.user._id)
 
     return res.json(getOverlayStateForUser(req.user))
   } catch (error) {
@@ -10074,58 +10270,45 @@ app.get("/public/overlay/:creatorId", async (req, res) => {
       return res.status(404).json({ error: "Overlay not found." })
     }
 
-    const user = await User.findById(creatorId)
+    pruneOverlayPublicCache()
+    const now = Date.now()
+    const cachedEntry = overlayPublicResponseCache.get(creatorId)
+    const freshCache =
+      cachedEntry && now - Number(cachedEntry.cachedAt || 0) <= OVERLAY_RESPONSE_CACHE_TTL_MS
+        ? cachedEntry
+        : null
 
-    if (!user || (user.status && user.status !== "active")) {
+    let overlayEntry = freshCache
+
+    if (!overlayEntry) {
+      let fetchPromise = overlayPublicResponseInFlight.get(creatorId)
+
+      if (!fetchPromise) {
+        fetchPromise = buildPublicOverlayCacheEntry(creatorId).finally(() => {
+          overlayPublicResponseInFlight.delete(creatorId)
+        })
+        overlayPublicResponseInFlight.set(creatorId, fetchPromise)
+      }
+
+      overlayEntry = await fetchPromise
+
+      if (overlayEntry && !overlayEntry.notFound) {
+        overlayPublicResponseCache.set(creatorId, overlayEntry)
+      }
+    }
+
+    if (!overlayEntry || overlayEntry.notFound) {
       return res.status(404).json({ error: "Overlay not found." })
     }
 
-    const overlayState = getOverlayStateForUser(user)
-    const leaderboardResetAt = normalizeLeaderboardResetAt(overlayState.leaderboardResetAt)
-    const donationQuery = {
-      creatorId: user._id,
-      $or: [
-        { walletStatus: "available" },
-        { walletStatus: { $exists: false } },
-        { walletStatus: null },
-      ],
-      ...(leaderboardResetAt && !Number.isNaN(leaderboardResetAt.getTime())
-        ? { date: { $gte: leaderboardResetAt } }
-        : {}),
-    }
-    const latestDonation = await Donation.findOne(donationQuery)
-      .select({ _id: 1, date: 1, createdAt: 1 })
-      .sort({ date: -1 })
-      .lean()
-
-    const overlayUpdatedAtMs = user?.overlayState?.updatedAt
-      ? new Date(user.overlayState.updatedAt).getTime()
-      : 0
-    const latestDonationTimestamp = latestDonation
-      ? new Date(latestDonation.date || latestDonation.createdAt || 0).getTime()
-      : 0
-    const overlayVersion = [
-      "overlay",
-      creatorId,
-      Number.isFinite(overlayUpdatedAtMs) ? overlayUpdatedAtMs : 0,
-      Number.isFinite(latestDonationTimestamp) ? latestDonationTimestamp : 0,
-      latestDonation?._id ? String(latestDonation._id) : "none",
-    ].join(":")
-    const overlayEtag = `W/"${overlayVersion}"`
+    const overlayEtag = overlayEntry.etag
     const ifNoneMatch = String(req.headers["if-none-match"] || "").trim()
     const ifModifiedSince = String(req.headers["if-modified-since"] || "").trim()
-    const lastModifiedMs = Math.max(overlayUpdatedAtMs || 0, latestDonationTimestamp || 0)
-    const lastModifiedHeader =
-      lastModifiedMs > 0 ? new Date(lastModifiedMs).toUTCString() : new Date(0).toUTCString()
+    const lastModifiedMs = Number(overlayEntry.lastModifiedMs || 0)
 
     res.set("ETag", overlayEtag)
-    res.set("Last-Modified", lastModifiedHeader)
-    res.set(
-      "Cache-Control",
-      `public, max-age=${OVERLAY_PUBLIC_CACHE_SECONDS}, stale-while-revalidate=${
-        OVERLAY_PUBLIC_CACHE_SECONDS * 4
-      }`,
-    )
+    res.set("Last-Modified", overlayEntry.lastModifiedHeader)
+    res.set("Cache-Control", getOverlayCacheControlHeader())
 
     if (
       (ifNoneMatch && ifNoneMatch === overlayEtag) ||
@@ -10134,39 +10317,7 @@ app.get("/public/overlay/:creatorId", async (req, res) => {
       return res.status(304).end()
     }
 
-    const donations = await Donation.find(donationQuery)
-      .select({
-        _id: 1,
-        creatorId: 1,
-        sender: 1,
-        alertDisplayName: 1,
-        senderNameSource: 1,
-        amount: 1,
-        creatorShare: 1,
-        platformFee: 1,
-        alertMessage: 1,
-        narration: 1,
-        provider: 1,
-        paymentStatus: 1,
-        walletStatus: 1,
-        fundsFlow: 1,
-        riskFlags: 1,
-        transactionReference: 1,
-        paystackReference: 1,
-        monnifyTransactionReference: 1,
-        monnifyPaymentReference: 1,
-        date: 1,
-        createdAt: 1,
-      })
-      .sort({ date: -1 })
-      .limit(100)
-      .lean()
-
-    return res.json({
-      ...overlayState,
-      user: sanitizePublicOverlayUser(user),
-      donations: donations.map(sanitizeCreatorDonation),
-    })
+    return res.json(overlayEntry.payload)
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: "Failed to load public overlay." })
