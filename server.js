@@ -132,6 +132,41 @@ const WEBHOOK_IDEMPOTENCY_TTL_SECONDS = Math.max(
   60,
   Math.min(86_400, Number(readEnv("WEBHOOK_IDEMPOTENCY_TTL_SECONDS") || 3600)),
 )
+const MONITORING_ALERTS_ENABLED = /^(1|true|yes)$/i.test(readEnv("MONITORING_ALERTS_ENABLED"))
+const MONITORING_ALERT_CHAT_ID =
+  readEnv("MONITORING_ALERT_CHAT_ID") || TELEGRAM_WITHDRAWAL_CHAT_ID
+const MONITORING_ALERT_COOLDOWN_MS = Math.max(
+  30_000,
+  Math.min(3_600_000, Number(readEnv("MONITORING_ALERT_COOLDOWN_MS") || 300_000)),
+)
+const MONITORING_ALERT_WINDOW_MS = Math.max(
+  60_000,
+  Math.min(3_600_000, Number(readEnv("MONITORING_ALERT_WINDOW_MS") || 300_000)),
+)
+const SOCKET_REDIS_ERROR_ALERT_THRESHOLD = Math.max(
+  1,
+  Number(readEnv("SOCKET_REDIS_ERROR_ALERT_THRESHOLD") || 5),
+)
+const WEBHOOK_QUEUE_FAILED_ALERT_THRESHOLD = Math.max(
+  1,
+  Number(readEnv("WEBHOOK_QUEUE_FAILED_ALERT_THRESHOLD") || 3),
+)
+const WEBHOOK_LAG_ALERT_MS = Math.max(
+  1000,
+  Number(readEnv("WEBHOOK_LAG_ALERT_MS") || 30_000),
+)
+const MONGO_SLOW_QUERY_THRESHOLD_MS = Math.max(
+  50,
+  Number(readEnv("MONGO_SLOW_QUERY_THRESHOLD_MS") || 700),
+)
+const MONGO_SLOW_QUERY_ALERT_THRESHOLD = Math.max(
+  1,
+  Number(readEnv("MONGO_SLOW_QUERY_ALERT_THRESHOLD") || 20),
+)
+const MONITORING_HEARTBEAT_SECONDS = Math.max(
+  15,
+  Math.min(3600, Number(readEnv("MONITORING_HEARTBEAT_SECONDS") || 60)),
+)
 
 const missingRequiredEnv = ["MONGODB_URI"].filter((key) => !process.env[key])
 if (missingRequiredEnv.length > 0) {
@@ -564,10 +599,20 @@ const webhookPipelineMetrics = {
   lastProcessedAt: "",
   lastError: "",
   lastDurationMs: 0,
+  lastLagMs: 0,
+  maxLagMs: 0,
 }
 const inlineWebhookIdempotency = new Map()
 const overlayPublicResponseCache = new Map()
 const overlayPublicResponseInFlight = new Map()
+const monitoringAlertLastSentAt = new Map()
+const monitoringCounters = {
+  socketRedisErrors: 0,
+  queueFailedJobs: 0,
+  mongoSlowQueries: 0,
+}
+let monitoringCounterWindowStartedAt = Date.now()
+let monitoringHeartbeatTimer = null
 
 const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
@@ -731,6 +776,208 @@ function requireDatabaseReady(_req, res, next) {
     error: "Database is not connected. Check MONGODB_URI in the backend environment variables.",
   })
 }
+
+function clampMonitoringMessage(value, limit = 1600) {
+  const text = String(value || "").trim()
+  if (!text) return ""
+  return text.length > limit ? `${text.slice(0, limit)}...` : text
+}
+
+function safeMonitoringJson(value, limit = 800) {
+  try {
+    const serialized = JSON.stringify(value)
+    return clampMonitoringMessage(serialized, limit)
+  } catch (_error) {
+    return ""
+  }
+}
+
+function getMonitoringWindowAgeMs() {
+  return Date.now() - monitoringCounterWindowStartedAt
+}
+
+function resetMonitoringCounters() {
+  monitoringCounters.socketRedisErrors = 0
+  monitoringCounters.queueFailedJobs = 0
+  monitoringCounters.mongoSlowQueries = 0
+  monitoringCounterWindowStartedAt = Date.now()
+}
+
+function rollMonitoringWindowIfNeeded() {
+  if (getMonitoringWindowAgeMs() >= MONITORING_ALERT_WINDOW_MS) {
+    resetMonitoringCounters()
+  }
+}
+
+function incrementMonitoringCounter(field) {
+  rollMonitoringWindowIfNeeded()
+  if (!Object.prototype.hasOwnProperty.call(monitoringCounters, field)) {
+    return 0
+  }
+  monitoringCounters[field] += 1
+  return monitoringCounters[field]
+}
+
+function logMonitoringEvent(level, eventType, metadata = {}) {
+  const payload = {
+    eventType,
+    ts: new Date().toISOString(),
+    windowMs: MONITORING_ALERT_WINDOW_MS,
+    ...metadata,
+  }
+  const serialized = safeMonitoringJson(payload, 2500)
+
+  if (level === "error") {
+    console.error("monitor.event", serialized)
+    return
+  }
+  if (level === "warn") {
+    console.warn("monitor.event", serialized)
+    return
+  }
+  console.info("monitor.event", serialized)
+}
+
+async function sendMonitoringAlert(key, message, metadata = {}, options = {}) {
+  if (!MONITORING_ALERTS_ENABLED || !TELEGRAM_BOT_TOKEN || !MONITORING_ALERT_CHAT_ID) {
+    return
+  }
+
+  const now = Date.now()
+  const cooldownMs = Math.max(
+    15_000,
+    Number(options.cooldownMs || MONITORING_ALERT_COOLDOWN_MS),
+  )
+  const lastSentAt = Number(monitoringAlertLastSentAt.get(key) || 0)
+
+  if (now - lastSentAt < cooldownMs) {
+    return
+  }
+
+  monitoringAlertLastSentAt.set(key, now)
+
+  const lines = [
+    `StreamTip monitor alert`,
+    ``,
+    `Type: ${key}`,
+    `Message: ${clampMonitoringMessage(message, 500)}`,
+    `Time: ${new Date(now).toISOString()}`,
+  ]
+  const meta = safeMonitoringJson(metadata, 1000)
+  if (meta) {
+    lines.push(`Meta: ${meta}`)
+  }
+
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        chat_id: MONITORING_ALERT_CHAT_ID,
+        text: lines.join("\n"),
+        disable_web_page_preview: true,
+      },
+      { timeout: 10_000 },
+    )
+  } catch (error) {
+    console.error(
+      "monitor.alert.send_failed",
+      error instanceof AxiosError
+        ? getAxiosErrorMessage(error, "Failed to send monitoring alert.")
+        : error instanceof Error
+          ? error.message
+          : String(error),
+    )
+  }
+}
+
+function sanitizeSlowQueryPayload(raw) {
+  if (!raw || typeof raw !== "object") {
+    return ""
+  }
+
+  return safeMonitoringJson(raw, 600)
+}
+
+function installMongoSlowQueryMonitoring() {
+  if (mongoose.Query.prototype.__streamtipSlowMonitorInstalled) {
+    return
+  }
+
+  const originalQueryExec = mongoose.Query.prototype.exec
+  const originalAggregateExec = mongoose.Aggregate.prototype.exec
+
+  mongoose.Query.prototype.exec = async function patchedQueryExec(...args) {
+    const startedAt = Date.now()
+    try {
+      return await originalQueryExec.apply(this, args)
+    } finally {
+      const durationMs = Date.now() - startedAt
+      if (durationMs < MONGO_SLOW_QUERY_THRESHOLD_MS) {
+        return
+      }
+
+      const count = incrementMonitoringCounter("mongoSlowQueries")
+      const metadata = {
+        model: this.model?.modelName || "",
+        collection: this.model?.collection?.name || "",
+        op: this.op || "",
+        durationMs,
+        thresholdMs: MONGO_SLOW_QUERY_THRESHOLD_MS,
+        query: sanitizeSlowQueryPayload(this.getQuery?.() || {}),
+      }
+
+      logMonitoringEvent("warn", "mongo.slow_query", metadata)
+
+      if (count >= MONGO_SLOW_QUERY_ALERT_THRESHOLD) {
+        void sendMonitoringAlert(
+          "mongo.slow_query_spike",
+          `Slow Mongo queries reached ${count} in ${Math.round(
+            MONITORING_ALERT_WINDOW_MS / 1000,
+          )}s window (latest ${durationMs}ms).`,
+          metadata,
+        )
+      }
+    }
+  }
+
+  mongoose.Aggregate.prototype.exec = async function patchedAggregateExec(...args) {
+    const startedAt = Date.now()
+    try {
+      return await originalAggregateExec.apply(this, args)
+    } finally {
+      const durationMs = Date.now() - startedAt
+      if (durationMs < MONGO_SLOW_QUERY_THRESHOLD_MS) {
+        return
+      }
+
+      const count = incrementMonitoringCounter("mongoSlowQueries")
+      const metadata = {
+        model: this._model?.modelName || "",
+        collection: this._model?.collection?.name || "",
+        op: "aggregate",
+        durationMs,
+        thresholdMs: MONGO_SLOW_QUERY_THRESHOLD_MS,
+        pipeline: sanitizeSlowQueryPayload(this._pipeline || []),
+      }
+
+      logMonitoringEvent("warn", "mongo.slow_query", metadata)
+
+      if (count >= MONGO_SLOW_QUERY_ALERT_THRESHOLD) {
+        void sendMonitoringAlert(
+          "mongo.slow_query_spike",
+          `Slow Mongo queries reached ${count} in ${Math.round(
+            MONITORING_ALERT_WINDOW_MS / 1000,
+          )}s window (latest aggregate ${durationMs}ms).`,
+          metadata,
+        )
+      }
+    }
+  }
+
+  mongoose.Query.prototype.__streamtipSlowMonitorInstalled = true
+}
+
+installMongoSlowQueryMonitoring()
 
 const donationSchema = new mongoose.Schema({
   creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
@@ -1407,16 +1654,48 @@ async function configureSocketAdapter() {
     const subClient = pubClient.duplicate()
 
     pubClient.on("error", (error) => {
+      const message = error instanceof Error ? error.message : String(error)
+      const count = incrementMonitoringCounter("socketRedisErrors")
+      const metadata = {
+        side: "pub",
+        count,
+        windowAgeMs: getMonitoringWindowAgeMs(),
+        error: clampMonitoringMessage(message, 400),
+      }
       console.error(
         "socket.redis.pub.error",
-        error instanceof Error ? error.message : String(error),
+        message,
       )
+      logMonitoringEvent("warn", "socket.redis.error", metadata)
+      if (count >= SOCKET_REDIS_ERROR_ALERT_THRESHOLD) {
+        void sendMonitoringAlert(
+          "socket.redis.error_spike",
+          `Socket Redis errors reached ${count} within monitoring window.`,
+          metadata,
+        )
+      }
     })
     subClient.on("error", (error) => {
+      const message = error instanceof Error ? error.message : String(error)
+      const count = incrementMonitoringCounter("socketRedisErrors")
+      const metadata = {
+        side: "sub",
+        count,
+        windowAgeMs: getMonitoringWindowAgeMs(),
+        error: clampMonitoringMessage(message, 400),
+      }
       console.error(
         "socket.redis.sub.error",
-        error instanceof Error ? error.message : String(error),
+        message,
       )
+      logMonitoringEvent("warn", "socket.redis.error", metadata)
+      if (count >= SOCKET_REDIS_ERROR_ALERT_THRESHOLD) {
+        void sendMonitoringAlert(
+          "socket.redis.error_spike",
+          `Socket Redis errors reached ${count} within monitoring window.`,
+          metadata,
+        )
+      }
     })
 
     await Promise.all([pubClient.connect(), subClient.connect()])
@@ -9871,6 +10150,8 @@ async function initializeWebhookQueue() {
       "monnify-webhooks",
       async (job) => {
         const startedAt = Date.now()
+        const queuedAtMs = parseOverlayComparableTimestamp(job?.data?.queuedAt)
+        const lagMs = queuedAtMs > 0 ? Math.max(0, startedAt - queuedAtMs) : 0
         try {
           const result = await processMonnifyWebhookPayload({
             data: job.data?.payload || {},
@@ -9883,6 +10164,25 @@ async function initializeWebhookQueue() {
           }
           webhookPipelineMetrics.lastProcessedAt = new Date().toISOString()
           webhookPipelineMetrics.lastDurationMs = Date.now() - startedAt
+          webhookPipelineMetrics.lastLagMs = lagMs
+          webhookPipelineMetrics.maxLagMs = Math.max(
+            Number(webhookPipelineMetrics.maxLagMs || 0),
+            lagMs,
+          )
+          if (lagMs >= WEBHOOK_LAG_ALERT_MS) {
+            const metadata = {
+              lagMs,
+              thresholdMs: WEBHOOK_LAG_ALERT_MS,
+              jobId: String(job?.id || ""),
+              queue: "monnify-webhooks",
+            }
+            logMonitoringEvent("warn", "webhook.queue.lag", metadata)
+            void sendMonitoringAlert(
+              "webhook.queue_lag",
+              `Monnify webhook lag reached ${lagMs}ms.`,
+              metadata,
+            )
+          }
           return result
         } catch (error) {
           webhookPipelineMetrics.monnifyFailed += 1
@@ -9899,11 +10199,28 @@ async function initializeWebhookQueue() {
     )
 
     monnifyWebhookWorker.on("failed", (job, error) => {
+      const count = incrementMonitoringCounter("queueFailedJobs")
+      const message = error instanceof Error ? error.message : String(error)
+      const metadata = {
+        count,
+        threshold: WEBHOOK_QUEUE_FAILED_ALERT_THRESHOLD,
+        jobId: String(job?.id || ""),
+        queue: "monnify-webhooks",
+        error: clampMonitoringMessage(message, 400),
+      }
       console.error(
         "webhook.queue.monnify.failed",
         job?.id,
-        error instanceof Error ? error.message : String(error),
+        message,
       )
+      logMonitoringEvent("error", "webhook.queue.failed_job", metadata)
+      if (count >= WEBHOOK_QUEUE_FAILED_ALERT_THRESHOLD) {
+        void sendMonitoringAlert(
+          "webhook.queue_failed",
+          `Monnify webhook failed jobs reached ${count} within monitoring window.`,
+          metadata,
+        )
+      }
     })
 
     webhookQueueMode = "bullmq"
@@ -9951,6 +10268,66 @@ async function enqueueMonnifyWebhookPayload(data = {}) {
 
   webhookPipelineMetrics.monnifyEnqueued += 1
   return { deduped: false, idempotencyKey }
+}
+
+function startMonitoringHeartbeat() {
+  if (monitoringHeartbeatTimer) {
+    return
+  }
+
+  const intervalMs = MONITORING_HEARTBEAT_SECONDS * 1000
+  monitoringHeartbeatTimer = setInterval(async () => {
+    try {
+      let queueCounts = null
+      if (monnifyWebhookQueue && webhookQueueMode === "bullmq") {
+        queueCounts = await monnifyWebhookQueue.getJobCounts(
+          "active",
+          "completed",
+          "delayed",
+          "failed",
+          "paused",
+          "waiting",
+        )
+      }
+
+      const snapshot = {
+        socketRedisConnected: Boolean(socketRedisPubClient?.isOpen && socketRedisSubClient?.isOpen),
+        socketAdapterMode,
+        queueMode: webhookQueueMode,
+        queueCounts,
+        queueMetrics: webhookPipelineMetrics,
+        counters: {
+          ...monitoringCounters,
+          windowAgeMs: getMonitoringWindowAgeMs(),
+        },
+      }
+
+      logMonitoringEvent("info", "monitor.heartbeat", snapshot)
+
+      if (!snapshot.socketRedisConnected && socketAdapterMode === "redis") {
+        void sendMonitoringAlert(
+          "socket.redis.disconnected",
+          "Socket Redis adapter is configured but currently disconnected.",
+          snapshot,
+        )
+      }
+    } catch (error) {
+      logMonitoringEvent("error", "monitor.heartbeat_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }, intervalMs)
+
+  monitoringHeartbeatTimer.unref?.()
+}
+
+function stopMonitoringHeartbeat() {
+  if (!monitoringHeartbeatTimer) {
+    return
+  }
+
+  clearInterval(monitoringHeartbeatTimer)
+  monitoringHeartbeatTimer = null
 }
 
 async function closeWebhookQueue() {
@@ -11214,6 +11591,21 @@ app.get("/admin/pipeline/health", requireAdminSession, async (_req, res) => {
       webhookQueueError,
       queueCounts,
       metrics: webhookPipelineMetrics,
+      monitoring: {
+        alertsEnabled: MONITORING_ALERTS_ENABLED,
+        counters: {
+          ...monitoringCounters,
+          windowAgeMs: getMonitoringWindowAgeMs(),
+          windowMs: MONITORING_ALERT_WINDOW_MS,
+        },
+        thresholds: {
+          socketRedisErrors: SOCKET_REDIS_ERROR_ALERT_THRESHOLD,
+          queueFailedJobs: WEBHOOK_QUEUE_FAILED_ALERT_THRESHOLD,
+          webhookLagMs: WEBHOOK_LAG_ALERT_MS,
+          mongoSlowQueryMs: MONGO_SLOW_QUERY_THRESHOLD_MS,
+          mongoSlowQueryCount: MONGO_SLOW_QUERY_ALERT_THRESHOLD,
+        },
+      },
       socket: {
         adapterMode: socketAdapterMode,
         adapterError: socketAdapterError,
@@ -13832,6 +14224,7 @@ const PORT = Number(process.env.PORT || 5000)
 async function startServer() {
   await configureSocketAdapter()
   await initializeWebhookQueue()
+  startMonitoringHeartbeat()
 
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`)
@@ -13875,6 +14268,10 @@ async function shutdownServer(signal) {
 
   shutdownInProgress = true
   console.log(`[Server] Received ${signal}. Shutting down...`)
+
+  try {
+    stopMonitoringHeartbeat()
+  } catch (_error) {}
 
   try {
     await closeWebhookQueue()
