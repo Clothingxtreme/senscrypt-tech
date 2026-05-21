@@ -2,12 +2,17 @@ const express = require("express")
 const http = require("http")
 const mongoose = require("mongoose")
 const cors = require("cors")
+const compression = require("compression")
 const axios = require("axios")
 const crypto = require("crypto")
 const fs = require("fs")
 const path = require("path")
 const nodemailer = require("nodemailer")
 const { Server } = require("socket.io")
+const { createAdapter } = require("@socket.io/redis-adapter")
+const { createClient } = require("redis")
+const { Queue, Worker } = require("bullmq")
+const IORedis = require("ioredis")
 const { AxiosError } = require("axios")
 const { createPaystackService } = require("./services/paystack")
 const { createMonnifyService } = require("./services/monnify")
@@ -82,6 +87,39 @@ const DIRECT_SPLIT_SETTLEMENT_MODE = /^(1|true|yes)$/i.test(
   readEnv("DIRECT_SPLIT_SETTLEMENT_MODE"),
 )
 const MONNIFY_INCOME_SPLIT_CONFIG_JSON = readEnv("MONNIFY_INCOME_SPLIT_CONFIG_JSON")
+const DONATION_PIPELINE_DEBUG = /^(1|true|yes)$/i.test(readEnv("DONATION_PIPELINE_DEBUG"))
+const OVERLAY_PUBLIC_CACHE_SECONDS = Math.min(
+  10,
+  Math.max(1, Number(readEnv("OVERLAY_PUBLIC_CACHE_SECONDS") || 3)),
+)
+const SOCKET_IO_ADAPTER = String(readEnv("SOCKET_IO_ADAPTER") || "memory")
+  .trim()
+  .toLowerCase()
+const SOCKET_IO_REDIS_URL = readEnv("SOCKET_IO_REDIS_URL")
+const SOCKET_IO_REDIS_TLS = /^(1|true|yes)$/i.test(readEnv("SOCKET_IO_REDIS_TLS"))
+const SOCKET_CLUSTER_MODE = /^(1|true|yes)$/i.test(readEnv("SOCKET_CLUSTER_MODE"))
+const WEBHOOK_ASYNC_QUEUE_ENABLED = /^(1|true|yes)$/i.test(
+  readEnv("WEBHOOK_ASYNC_QUEUE_ENABLED"),
+)
+const WEBHOOK_REDIS_URL = readEnv("WEBHOOK_REDIS_URL") || SOCKET_IO_REDIS_URL
+const WEBHOOK_REDIS_TLS = /^(1|true|yes)$/i.test(readEnv("WEBHOOK_REDIS_TLS")) || SOCKET_IO_REDIS_TLS
+const WEBHOOK_QUEUE_PREFIX = readEnv("WEBHOOK_QUEUE_PREFIX") || "streamtip"
+const WEBHOOK_QUEUE_CONCURRENCY = Math.max(
+  1,
+  Math.min(50, Number(readEnv("WEBHOOK_QUEUE_CONCURRENCY") || 8)),
+)
+const WEBHOOK_QUEUE_ATTEMPTS = Math.max(
+  1,
+  Math.min(10, Number(readEnv("WEBHOOK_QUEUE_ATTEMPTS") || 4)),
+)
+const WEBHOOK_QUEUE_BACKOFF_MS = Math.max(
+  250,
+  Math.min(60_000, Number(readEnv("WEBHOOK_QUEUE_BACKOFF_MS") || 2000)),
+)
+const WEBHOOK_IDEMPOTENCY_TTL_SECONDS = Math.max(
+  60,
+  Math.min(86_400, Number(readEnv("WEBHOOK_IDEMPOTENCY_TTL_SECONDS") || 3600)),
+)
 
 const missingRequiredEnv = ["MONGODB_URI"].filter((key) => !process.env[key])
 if (missingRequiredEnv.length > 0) {
@@ -466,6 +504,11 @@ app.use(
     },
   }),
 )
+app.use(
+  compression({
+    threshold: 1024,
+  }),
+)
 app.use("/uploads", express.static(uploadsRoot))
 app.use(
   express.json({
@@ -489,6 +532,28 @@ const io = new Server(server, {
   pingTimeout: 60000,
   pingInterval: 25000,
 })
+let socketAdapterMode = "memory"
+let socketAdapterError = ""
+let socketRedisPubClient = null
+let socketRedisSubClient = null
+let webhookQueueMode = "inline"
+let webhookQueueError = ""
+let webhookQueueConnection = null
+let monnifyWebhookQueue = null
+let monnifyWebhookWorker = null
+let webhookQueueIdempotencyConnection = null
+const webhookPipelineMetrics = {
+  monnifyEnqueued: 0,
+  monnifyProcessed: 0,
+  monnifyFailed: 0,
+  monnifyDeduped: 0,
+  monnifyInlineProcessed: 0,
+  monnifyQueueFallback: 0,
+  lastProcessedAt: "",
+  lastError: "",
+  lastDurationMs: 0,
+}
+const inlineWebhookIdempotency = new Map()
 
 const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
@@ -706,6 +771,9 @@ donationSchema.index({ sourceAccountNumber: 1 }, { sparse: true })
 donationSchema.index({ destinationAccountNumber: 1 }, { sparse: true })
 donationSchema.index({ date: -1 })
 donationSchema.index({ provider: 1, transactionReference: 1 }, { sparse: true })
+donationSchema.index({ creatorId: 1, date: -1 })
+donationSchema.index({ creatorId: 1, walletStatus: 1, date: -1 })
+donationSchema.index({ creatorId: 1, fundsFlow: 1, walletStatus: 1, date: -1 })
 
 const Donation = mongoose.model("Donation", donationSchema)
 
@@ -801,6 +869,8 @@ const payoutSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   completedAt: Date,
 })
+payoutSchema.index({ status: 1, createdAt: 1 })
+payoutSchema.index({ creatorId: 1, status: 1, createdAt: -1 })
 
 const Payout = mongoose.model("Payout", payoutSchema)
 
@@ -840,6 +910,8 @@ const platformWithdrawalSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   completedAt: Date,
 })
+platformWithdrawalSchema.index({ createdAt: -1 })
+platformWithdrawalSchema.index({ status: 1, createdAt: -1 })
 
 const PlatformWithdrawal = mongoose.model("PlatformWithdrawal", platformWithdrawalSchema)
 
@@ -895,6 +967,8 @@ const auditLogSchema = new mongoose.Schema(
   },
   { timestamps: false },
 )
+auditLogSchema.index({ createdAt: -1 })
+auditLogSchema.index({ eventType: 1, createdAt: -1 })
 
 const giftSoundSchema = new mongoose.Schema(
   {
@@ -1187,6 +1261,199 @@ if (mongoose.connection.readyState === 1) {
 
 function getCreatorRoom(userId) {
   return `creator:${String(userId)}`
+}
+
+const inflightWebhookReferenceLocks = new Map()
+
+async function withWebhookReferenceLock(reference, operation) {
+  const key = String(reference || "").trim()
+
+  if (!key) {
+    return operation()
+  }
+
+  while (inflightWebhookReferenceLocks.has(key)) {
+    await inflightWebhookReferenceLocks.get(key)
+  }
+
+  let releaseLock = () => {}
+  const lockPromise = new Promise((resolve) => {
+    releaseLock = resolve
+  })
+
+  inflightWebhookReferenceLocks.set(key, lockPromise)
+
+  try {
+    return await operation()
+  } finally {
+    inflightWebhookReferenceLocks.delete(key)
+    releaseLock()
+  }
+}
+
+function getMonnifyWebhookReferenceParts(data = {}, eventData = {}) {
+  const eventType = String(data.eventType || eventData.eventType || "monnify.webhook").trim()
+  const disbursementReference = extractMonnifyDisbursementReference(eventData, data)
+  const { transactionReference, paymentReference } = getMonnifyPaymentReferences(eventData, data)
+
+  return {
+    eventType,
+    disbursementReference: String(disbursementReference || "").trim(),
+    transactionReference: String(transactionReference || "").trim(),
+    paymentReference: String(paymentReference || "").trim(),
+  }
+}
+
+function buildMonnifyWebhookIdempotencyKey(data = {}, eventData = {}) {
+  const refs = getMonnifyWebhookReferenceParts(data, eventData)
+  const sourceReference =
+    refs.disbursementReference || refs.transactionReference || refs.paymentReference
+
+  if (sourceReference) {
+    return `monnify:${refs.eventType}:${sourceReference}`
+  }
+
+  const fallbackPayload = JSON.stringify({
+    eventType: refs.eventType,
+    accountReference: eventData?.product?.reference || "",
+    amount: eventData?.amountPaid || eventData?.amount || data?.amount || "",
+    paidOn: eventData?.paidOn || eventData?.paidAt || "",
+    sessionId:
+      eventData?.sourceDetails?.sessionId || eventData?.sessionId || eventData?.sessionId || "",
+  })
+  const hash = crypto.createHash("sha256").update(fallbackPayload).digest("hex")
+  return `monnify:${refs.eventType}:hash:${hash}`
+}
+
+function cleanupInlineWebhookIdempotency(now = Date.now()) {
+  for (const [key, expiresAt] of inlineWebhookIdempotency.entries()) {
+    if (expiresAt <= now) {
+      inlineWebhookIdempotency.delete(key)
+    }
+  }
+}
+
+async function claimWebhookIdempotencyKey(key) {
+  const normalizedKey = String(key || "").trim()
+  if (!normalizedKey) {
+    return true
+  }
+
+  if (webhookQueueIdempotencyConnection) {
+    try {
+      const claimed = await webhookQueueIdempotencyConnection.set(
+        normalizedKey,
+        "1",
+        "EX",
+        WEBHOOK_IDEMPOTENCY_TTL_SECONDS,
+        "NX",
+      )
+      return claimed === "OK"
+    } catch (error) {
+      webhookPipelineMetrics.lastError =
+        error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  const now = Date.now()
+  cleanupInlineWebhookIdempotency(now)
+
+  if (inlineWebhookIdempotency.has(normalizedKey)) {
+    return false
+  }
+
+  inlineWebhookIdempotency.set(
+    normalizedKey,
+    now + WEBHOOK_IDEMPOTENCY_TTL_SECONDS * 1000,
+  )
+  return true
+}
+
+async function configureSocketAdapter() {
+  if (SOCKET_IO_ADAPTER !== "redis") {
+    socketAdapterMode = "memory"
+    socketAdapterError = ""
+    return
+  }
+
+  if (!SOCKET_IO_REDIS_URL) {
+    socketAdapterMode = "memory"
+    socketAdapterError =
+      "SOCKET_IO_ADAPTER=redis but SOCKET_IO_REDIS_URL is empty. Falling back to in-memory adapter."
+    console.warn(socketAdapterError)
+    return
+  }
+
+  try {
+    const socketOptions = SOCKET_IO_REDIS_TLS ? { socket: { tls: true } } : {}
+    const pubClient = createClient({
+      url: SOCKET_IO_REDIS_URL,
+      ...socketOptions,
+    })
+    const subClient = pubClient.duplicate()
+
+    pubClient.on("error", (error) => {
+      console.error(
+        "socket.redis.pub.error",
+        error instanceof Error ? error.message : String(error),
+      )
+    })
+    subClient.on("error", (error) => {
+      console.error(
+        "socket.redis.sub.error",
+        error instanceof Error ? error.message : String(error),
+      )
+    })
+
+    await Promise.all([pubClient.connect(), subClient.connect()])
+    io.adapter(createAdapter(pubClient, subClient))
+
+    socketRedisPubClient = pubClient
+    socketRedisSubClient = subClient
+    socketAdapterMode = "redis"
+    socketAdapterError = ""
+    console.log("[Socket] Redis adapter connected.")
+  } catch (error) {
+    socketAdapterMode = "memory"
+    socketAdapterError =
+      error instanceof Error ? error.message : "Failed to initialize Redis adapter."
+    console.error("socket.redis.adapter_init_failed", socketAdapterError)
+  }
+}
+
+async function closeSocketAdapter() {
+  const closeAttempts = []
+
+  if (socketRedisPubClient?.isOpen) {
+    closeAttempts.push(socketRedisPubClient.quit().catch(() => undefined))
+  }
+  if (socketRedisSubClient?.isOpen) {
+    closeAttempts.push(socketRedisSubClient.quit().catch(() => undefined))
+  }
+
+  if (closeAttempts.length) {
+    await Promise.all(closeAttempts)
+  }
+
+  socketRedisPubClient = null
+  socketRedisSubClient = null
+}
+
+function createWebhookRedisConnection() {
+  if (!WEBHOOK_REDIS_URL) {
+    return null
+  }
+
+  const options = {
+    maxRetriesPerRequest: null,
+    enableReadyCheck: true,
+  }
+
+  if (WEBHOOK_REDIS_TLS) {
+    options.tls = {}
+  }
+
+  return new IORedis(WEBHOOK_REDIS_URL, options)
 }
 
 const fallbackBanks = [
@@ -4378,6 +4645,12 @@ async function createAuditLog({ actorType, actorId = "", eventType, message, met
   }
 }
 
+function createAuditLogAsync(payload) {
+  void createAuditLog(payload).catch((error) => {
+    console.error("audit_log_async_failed", error instanceof Error ? error.message : error)
+  })
+}
+
 function createAccountNotification({ type, title, message, metadata = {} }) {
   return {
     id: crypto.randomUUID(),
@@ -6928,79 +7201,120 @@ async function getRevenueTotals({ creatorId } = {}) {
     status: { $nin: ["failed", "rejected", "cancelled"] },
     ...(creatorId ? { creatorId } : {}),
   }
-  const platformWithdrawalQuery = creatorId ? { _id: null } : { status: { $ne: "failed" } }
+  const amountExpr = { $ifNull: ["$amount", 0] }
+  const roundedPlatformFeeExpr = {
+    $floor: {
+      $add: [{ $multiply: [amountExpr, PLATFORM_FEE_RATE] }, 0.5],
+    },
+  }
+  const platformFeeExpr = {
+    $ifNull: ["$platformFee", roundedPlatformFeeExpr],
+  }
+  const creatorShareExpr = {
+    $ifNull: [
+      "$creatorShare",
+      {
+        $max: [0, { $subtract: [amountExpr, roundedPlatformFeeExpr] }],
+      },
+    ],
+  }
+  const walletStatusExpr = { $ifNull: ["$walletStatus", "available"] }
+  const fundsFlowExpr = { $ifNull: ["$fundsFlow", "wallet"] }
 
-  const [donations, payouts, platformWithdrawals] = await Promise.all([
-    Donation.find(donationQuery),
-    Payout.find(payoutQuery),
-    creatorId ? [] : PlatformWithdrawal.find(platformWithdrawalQuery),
+  const [donationTotals, payoutTotals, platformWithdrawalTotals] = await Promise.all([
+    Donation.aggregate([
+      { $match: donationQuery },
+      {
+        $group: {
+          _id: null,
+          grossRevenue: {
+            $sum: {
+              $cond: [{ $ne: [walletStatusExpr, "rejected"] }, amountExpr, 0],
+            },
+          },
+          pendingCreatorRevenue: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $eq: [walletStatusExpr, "pending_review"] },
+                    { $eq: [fundsFlowExpr, "wallet"] },
+                  ],
+                },
+                creatorShareExpr,
+                0,
+              ],
+            },
+          },
+          platformRevenue: {
+            $sum: {
+              $cond: [{ $eq: [walletStatusExpr, "available"] }, platformFeeExpr, 0],
+            },
+          },
+          creatorRevenue: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $eq: [walletStatusExpr, "available"] },
+                    { $eq: [fundsFlowExpr, "wallet"] },
+                  ],
+                },
+                creatorShareExpr,
+                0,
+              ],
+            },
+          },
+          directSplitCreatorRevenue: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $ne: [walletStatusExpr, "rejected"] },
+                    { $eq: [fundsFlowExpr, "direct_split"] },
+                  ],
+                },
+                creatorShareExpr,
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ]),
+    Payout.aggregate([
+      { $match: payoutQuery },
+      {
+        $group: {
+          _id: null,
+          totalPaidOut: { $sum: { $ifNull: ["$amount", 0] } },
+        },
+      },
+    ]),
+    creatorId
+      ? []
+      : PlatformWithdrawal.aggregate([
+          { $match: { status: { $ne: "failed" } } },
+          {
+            $group: {
+              _id: null,
+              totalPlatformWithdrawn: { $sum: { $ifNull: ["$amount", 0] } },
+            },
+          },
+        ]),
   ])
 
-  const grossRevenue = donations.reduce((sum, donation) => {
-    if ((donation.walletStatus || "available") === "rejected") {
-      return sum
-    }
+  const donationSummary = donationTotals[0] || {}
+  const payoutSummary = payoutTotals[0] || {}
+  const platformSummary = platformWithdrawalTotals[0] || {}
+  const grossRevenue = Number(donationSummary.grossRevenue || 0)
+  const pendingCreatorRevenue = Number(donationSummary.pendingCreatorRevenue || 0)
+  const platformRevenue = Number(donationSummary.platformRevenue || 0)
+  const creatorRevenue = Number(donationSummary.creatorRevenue || 0)
+  const directSplitCreatorRevenue = Number(donationSummary.directSplitCreatorRevenue || 0)
+  const totalPaidOut = Number(payoutSummary.totalPaidOut || 0)
+  const totalPlatformWithdrawn = Number(platformSummary.totalPlatformWithdrawn || 0)
 
-    return sum + (Number(donation.amount) || 0)
-  }, 0)
-  const pendingCreatorRevenue = donations.reduce((sum, donation) => {
-    if ((donation.walletStatus || "available") !== "pending_review") {
-      return sum
-    }
-    if (String(donation.fundsFlow || "wallet") !== "wallet") {
-      return sum
-    }
-
-    if (typeof donation.creatorShare === "number") {
-      return sum + donation.creatorShare
-    }
-
-    return sum + calculateRevenueSplit(donation.amount).creatorShare
-  }, 0)
-  const platformRevenue = donations.reduce((sum, donation) => {
-    if ((donation.walletStatus || "available") !== "available") {
-      return sum
-    }
-
-    if (typeof donation.platformFee === "number") {
-      return sum + donation.platformFee
-    }
-
-    return sum + calculateRevenueSplit(donation.amount).platformFee
-  }, 0)
-  const creatorRevenue = donations.reduce((sum, donation) => {
-    if ((donation.walletStatus || "available") !== "available") {
-      return sum
-    }
-    if (String(donation.fundsFlow || "wallet") !== "wallet") {
-      return sum
-    }
-
-    if (typeof donation.creatorShare === "number") {
-      return sum + donation.creatorShare
-    }
-
-    return sum + calculateRevenueSplit(donation.amount).creatorShare
-  }, 0)
-  const directSplitCreatorRevenue = donations.reduce((sum, donation) => {
-    if ((donation.walletStatus || "available") === "rejected") {
-      return sum
-    }
-    if (String(donation.fundsFlow || "wallet") !== "direct_split") {
-      return sum
-    }
-
-    if (typeof donation.creatorShare === "number") {
-      return sum + donation.creatorShare
-    }
-
-    return sum + calculateRevenueSplit(donation.amount).creatorShare
-  }, 0)
-  const totalPaidOut = payouts.reduce((sum, payout) => sum + (Number(payout.amount) || 0), 0)
-  const totalPlatformWithdrawn = platformWithdrawals.reduce(
-    (sum, withdrawal) => sum + (Number(withdrawal.amount) || 0),
-    0,
-  )
   const creatorWalletSnapshot = creatorId
     ? await User.findById(creatorId).select({ wallet: 1 }).lean()
     : null
@@ -7905,9 +8219,35 @@ function emitDonationAlert(creatorId, donation) {
       ? "pending_review"
       : "available"
 
+  const transactionReference =
+    donation.transactionReference ||
+    donation.paystackReference ||
+    donation.monnifyTransactionReference ||
+    donation.monnifyPaymentReference ||
+    ""
   const payload = {
-    ...(donation.toObject ? donation.toObject() : donation),
+    _id: donation._id,
+    id: donation._id,
+    creatorId: donation.creatorId,
+    amount: Number(donation.amount) || 0,
+    platformFee:
+      typeof donation.platformFee === "number"
+        ? donation.platformFee
+        : calculateRevenueSplit(donation.amount).platformFee,
+    creatorShare:
+      typeof donation.creatorShare === "number"
+        ? donation.creatorShare
+        : calculateRevenueSplit(donation.amount).creatorShare,
+    provider: donation.provider || "monnify",
+    walletStatus: donation.walletStatus || "available",
+    fundsFlow: donation.fundsFlow || "wallet",
+    paymentStatus: donation.paymentStatus || "",
+    transactionReference,
+    date: donation.date || donation.createdAt,
+    createdAt: donation.date || donation.createdAt,
     senderName: donation.alertDisplayName || donation.sender || "Someone sent you a tip",
+    sender: donation.sender || donation.alertDisplayName || "Someone sent you a tip",
+    senderNameSource: donation.senderNameSource || "",
     message: donation.alertMessage || donation.narration || donation.message || "",
     status: alertStatus,
   }
@@ -7992,6 +8332,11 @@ app.get("/health", (_req, res) => {
     mongodbHost: getMongoUriHost(),
     lastDatabaseError,
     environment: getMonnifyEnvironment(),
+    socketAdapterMode,
+    socketAdapterError,
+    socketRedisConnected: Boolean(socketRedisPubClient?.isOpen && socketRedisSubClient?.isOpen),
+    webhookQueueMode,
+    webhookQueueError,
     uptime: Math.round(process.uptime()),
   })
 })
@@ -8977,7 +9322,7 @@ app.post("/api/webhooks/paystack", async (req, res) => {
 
     emitDonationAlert(creator._id, donation)
 
-    await createAuditLog({
+    createAuditLogAsync({
       actorType: "system",
       eventType: "webhook.paystack.charge_success",
       message: `Paystack DVA donation processed as ${donation.walletStatus || risk.status}.`,
@@ -9003,42 +9348,17 @@ app.post("/api/webhooks/paystack", async (req, res) => {
   }
 })
 
-app.post("/webhook/monnify", async (req, res) => {
-  try {
-    if (!isWebhookIpAllowed(req)) {
-      await createAuditLog({
-        actorType: "system",
-        eventType: "webhook.monnify.rejected_ip",
-        message: "Rejected Monnify webhook from a non-allowlisted IP.",
-        metadata: {
-          ipAddresses: getRequestIpAddresses(req),
-        },
-      })
-
-      return res.status(403).json({ error: "Webhook source IP is not allowed." })
-    }
-
-    if (!verifyMonnifySignature(req)) {
-      await createAuditLog({
-        actorType: "system",
-        eventType: "webhook.monnify.invalid_signature",
-        message: "Rejected Monnify webhook with invalid signature.",
-        metadata: {
-          ip: req.ip,
-        },
-      })
-
-      return res.status(401).json({ error: "Invalid Monnify signature." })
-    }
-
-    const data = req.body || {}
+async function processMonnifyWebhookPayload({ data = {}, source = "http" }) {
   const eventData =
-    (data.eventData && typeof data.eventData === "object" ? data.eventData : data.responseBody) ||
-    data
-    const eventType = String(data.eventType || eventData.eventType || "monnify.webhook")
-    const disbursementReference = extractMonnifyDisbursementReference(eventData, data)
+    (data.eventData && typeof data.eventData === "object"
+      ? data.eventData
+      : data.responseBody) || data
+  const eventType = String(data.eventType || eventData.eventType || "monnify.webhook")
+  const disbursementReference = extractMonnifyDisbursementReference(eventData, data)
+  const { transactionReference, paymentReference } = getMonnifyPaymentReferences(eventData, data)
 
-    if (/disbursement|transfer/i.test(eventType) && disbursementReference) {
+  if (/disbursement|transfer/i.test(eventType) && disbursementReference) {
+    await withWebhookReferenceLock(disbursementReference, async () => {
       const payout = await Payout.findOne({
         $or: [
           { transferReference: disbursementReference },
@@ -9052,175 +9372,176 @@ app.post("/webhook/monnify", async (req, res) => {
           eventType: "webhook.monnify.unmatched_payout",
           message: "Monnify disbursement webhook could not be matched to a payout.",
           metadata: {
+            source,
             eventType,
             disbursementReference,
           },
         })
-
-        return res.sendStatus(200)
+        return
       }
 
       await updatePayoutFromProviderStatus(payout, { ...eventData, eventType }, "system")
-      return res.sendStatus(200)
-    }
+    })
 
-    const creator = await findCreatorForMonnifyEvent(eventData)
-    const paymentStatus = String(
-      eventData.paymentStatus || eventData.status || data.paymentStatus || "PENDING",
-    ).toUpperCase()
-    const { transactionReference, paymentReference } = getMonnifyPaymentReferences(eventData, data)
-    const destinationDetails = getDonationDestinationDetails(eventData, data)
-    const destinationAccountNumber = destinationDetails.destinationAccountNumber
-    const destinationBankName = destinationDetails.destinationBankName
-    const sourceDetails = getDonationSourceDetails(eventData, data)
-    const paymentMethod = compactString(eventData.paymentMethod || data.paymentMethod)
-    const currency = compactString(eventData.currency || data.currency || "NGN")
-    const paidOn = parseProviderDate(eventData.paidOn || eventData.paidAt || data.paidOn || data.paidAt)
-    const grossAmount = firstValidMoneyAmount(
-      eventData.amountPaid,
-      eventData.amount,
-      eventData.settlementAmount,
-      eventData.totalPayable,
-      data.amount,
-      data.amountPaid,
-    )
-    const split = calculateRevenueSplit(grossAmount)
+    return { status: "payout_processed" }
+  }
 
-    if (paymentStatus && paymentStatus !== "PAID") {
-      await upsertComplianceInflowFromMonnify({
-        eventType,
-        eventData,
-        data,
+  const creator = await findCreatorForMonnifyEvent(eventData)
+  const paymentStatus = String(
+    eventData.paymentStatus || eventData.status || data.paymentStatus || "PENDING",
+  ).toUpperCase()
+  const destinationDetails = getDonationDestinationDetails(eventData, data)
+  const destinationAccountNumber = destinationDetails.destinationAccountNumber
+  const destinationBankName = destinationDetails.destinationBankName
+  const sourceDetails = getDonationSourceDetails(eventData, data)
+  const paymentMethod = compactString(eventData.paymentMethod || data.paymentMethod)
+  const currency = compactString(eventData.currency || data.currency || "NGN")
+  const paidOn = parseProviderDate(eventData.paidOn || eventData.paidAt || data.paidOn || data.paidAt)
+  const grossAmount = firstValidMoneyAmount(
+    eventData.amountPaid,
+    eventData.amount,
+    eventData.settlementAmount,
+    eventData.totalPayable,
+    data.amount,
+    data.amountPaid,
+  )
+  const split = calculateRevenueSplit(grossAmount)
+
+  if (paymentStatus && paymentStatus !== "PAID") {
+    await upsertComplianceInflowFromMonnify({
+      eventType,
+      eventData,
+      data,
+      creator,
+      status: normalizeComplianceInflowStatus({
+        paymentStatus,
         creator,
-        status: normalizeComplianceInflowStatus({
-          paymentStatus,
-          creator,
-          destinationAccountNumber,
-          amount: grossAmount,
-        }),
-      })
+        destinationAccountNumber,
+        amount: grossAmount,
+      }),
+    })
 
-      await createAuditLog({
-        actorType: "system",
-        eventType: "webhook.monnify.ignored",
-        message: `Ignored Monnify webhook with payment status ${paymentStatus}.`,
-        metadata: {
-          eventType,
-          paymentStatus,
-          transactionReference,
-          paymentReference,
-        },
-      })
-
-      return res.sendStatus(200)
-    }
-
-    if (transactionReference) {
-      const existingByTransactionRef = await Donation.findOne({
-        monnifyTransactionReference: transactionReference,
-      })
-
-      if (existingByTransactionRef) {
-        await upsertComplianceInflowFromMonnify({
-          eventType,
-          eventData,
-          data,
-          existingDonation: existingByTransactionRef,
-          status: "resolved",
-        })
-        return res.sendStatus(200)
-      }
-    }
-
-    if (paymentReference) {
-      const existingByPaymentRef = await Donation.findOne({
-        monnifyPaymentReference: paymentReference,
-      })
-
-      if (existingByPaymentRef) {
-        await upsertComplianceInflowFromMonnify({
-          eventType,
-          eventData,
-          data,
-          existingDonation: existingByPaymentRef,
-          status: "resolved",
-        })
-        return res.sendStatus(200)
-      }
-    }
-
-    if (split.gross <= 0) {
-      await upsertComplianceInflowFromMonnify({
+    await createAuditLog({
+      actorType: "system",
+      eventType: "webhook.monnify.ignored",
+      message: `Ignored Monnify webhook with payment status ${paymentStatus}.`,
+      metadata: {
+        source,
         eventType,
-        eventData,
-        data,
-        creator,
-        status: "unmatched",
-      })
+        paymentStatus,
+        transactionReference,
+        paymentReference,
+      },
+    })
 
-      await createAuditLog({
-        actorType: "system",
-        eventType: "webhook.monnify.invalid_amount",
-        message: "Monnify webhook had a paid status but no valid donation amount.",
-        metadata: {
-          eventType,
-          transactionReference,
-          paymentReference,
-          amountPaid: eventData.amountPaid,
-          amount: eventData.amount || data.amount,
-          dataAmountPaid: data.amountPaid,
-        },
-      })
+    return { status: "ignored_payment_status" }
+  }
 
-      return res.sendStatus(200)
-    }
+  if (split.gross <= 0) {
+    await upsertComplianceInflowFromMonnify({
+      eventType,
+      eventData,
+      data,
+      creator,
+      status: "unmatched",
+    })
 
-    if (!creator) {
-      await upsertComplianceInflowFromMonnify({
+    await createAuditLog({
+      actorType: "system",
+      eventType: "webhook.monnify.invalid_amount",
+      message: "Monnify webhook had a paid status but no valid donation amount.",
+      metadata: {
+        source,
         eventType,
-        eventData,
-        data,
-        status: "unmatched",
-      })
+        transactionReference,
+        paymentReference,
+        amountPaid: eventData.amountPaid,
+        amount: eventData.amount || data.amount,
+        dataAmountPaid: data.amountPaid,
+      },
+    })
 
-      await createAuditLog({
-        actorType: "system",
-        eventType: "webhook.monnify.unmatched_creator",
-        message: "Monnify webhook could not be matched to a registered creator.",
-        metadata: {
-          eventType,
-          destinationAccountNumber,
-          transactionReference,
-          paymentReference,
-          accountReference: String(eventData?.product?.reference || ""),
-        },
-      })
+    return { status: "invalid_amount" }
+  }
 
-      return res.sendStatus(200)
-    }
+  if (!creator) {
+    await upsertComplianceInflowFromMonnify({
+      eventType,
+      eventData,
+      data,
+      status: "unmatched",
+    })
 
-    const senderDisplay = getDonationSenderName(eventData, data, creator)
-    const resolvedSenderDisplay =
-      senderDisplay.name === "Anonymous" && sourceDetails.sourceAccountName
-        ? {
-            ...senderDisplay,
-            name: getFirstNameOnly(sourceDetails.sourceAccountName),
-            source: "source_account_first_name",
-          }
-        : senderDisplay
-    const senderNameResolutionMetadata = {
-      sender: resolvedSenderDisplay.name,
-      senderNameSource: resolvedSenderDisplay.source,
-      checkedNarrations: resolvedSenderDisplay.checkedNarrations || [],
-      checkedNarrationFields: (resolvedSenderDisplay.checkedNarrationFields || []).map((entry) => ({
-        ...entry,
-        rejectedAsSystem: isSystemNarration(entry.value, []),
-      })),
-      creatorId: creator._id.toString(),
-      transactionReference,
-      paymentReference,
-    }
+    await createAuditLog({
+      actorType: "system",
+      eventType: "webhook.monnify.unmatched_creator",
+      message: "Monnify webhook could not be matched to a registered creator.",
+      metadata: {
+        source,
+        eventType,
+        destinationAccountNumber,
+        transactionReference,
+        paymentReference,
+        accountReference: String(eventData?.product?.reference || ""),
+      },
+    })
+
+    return { status: "unmatched_creator" }
+  }
+
+  const senderDisplay = getDonationSenderName(eventData, data, creator)
+  const resolvedSenderDisplay =
+    senderDisplay.name === "Anonymous" && sourceDetails.sourceAccountName
+      ? {
+          ...senderDisplay,
+          name: getFirstNameOnly(sourceDetails.sourceAccountName),
+          source: "source_account_first_name",
+        }
+      : senderDisplay
+  const senderNameResolutionMetadata = {
+    sender: resolvedSenderDisplay.name,
+    senderNameSource: resolvedSenderDisplay.source,
+    checkedNarrations: resolvedSenderDisplay.checkedNarrations || [],
+    checkedNarrationFields: (resolvedSenderDisplay.checkedNarrationFields || []).map((entry) => ({
+      ...entry,
+      rejectedAsSystem: isSystemNarration(entry.value, []),
+    })),
+    creatorId: creator._id.toString(),
+    transactionReference,
+    paymentReference,
+    source,
+  }
+
+  if (DONATION_PIPELINE_DEBUG) {
     console.info("donation.sender_name_resolution", senderNameResolutionMetadata)
+  }
+
+  const lockReference = transactionReference || paymentReference
+  let processed = false
+  await withWebhookReferenceLock(lockReference, async () => {
+    if (transactionReference || paymentReference) {
+      const referenceFilters = []
+      if (transactionReference) {
+        referenceFilters.push({ monnifyTransactionReference: transactionReference })
+      }
+      if (paymentReference) {
+        referenceFilters.push({ monnifyPaymentReference: paymentReference })
+      }
+
+      if (referenceFilters.length) {
+        const existingDonation = await Donation.findOne({ $or: referenceFilters })
+        if (existingDonation) {
+          await upsertComplianceInflowFromMonnify({
+            eventType,
+            eventData,
+            data,
+            existingDonation,
+            status: "resolved",
+          })
+          return
+        }
+      }
+    }
 
     const donationFundsFlow = getIncomingDonationFundsFlow()
     const donation = await Donation.create({
@@ -9259,18 +9580,19 @@ app.post("/webhook/monnify", async (req, res) => {
 
     emitDonationAlert(creator._id, donation)
 
-    await createAuditLog({
+    createAuditLogAsync({
       actorType: "system",
       eventType: "donation.sender_name_resolution",
       message: `Donation sender display resolved as ${resolvedSenderDisplay.source}.`,
       metadata: senderNameResolutionMetadata,
     })
 
-    await createAuditLog({
+    createAuditLogAsync({
       actorType: "system",
       eventType: "donation.received",
       message: `Donation received from ${resolvedSenderDisplay.name}.`,
       metadata: {
+        source,
         sender: resolvedSenderDisplay.name,
         senderNameSource: resolvedSenderDisplay.source,
         checkedNarrations: resolvedSenderDisplay.checkedNarrations || [],
@@ -9296,9 +9618,232 @@ app.post("/webhook/monnify", async (req, res) => {
       },
     })
 
+    processed = true
+  })
+
+  return { status: processed ? "processed" : "deduped" }
+}
+
+async function initializeWebhookQueue() {
+  if (!WEBHOOK_ASYNC_QUEUE_ENABLED) {
+    webhookQueueMode = "inline"
+    webhookQueueError = ""
+    return
+  }
+
+  if (!WEBHOOK_REDIS_URL) {
+    webhookQueueMode = "inline"
+    webhookQueueError =
+      "WEBHOOK_ASYNC_QUEUE_ENABLED=true but WEBHOOK_REDIS_URL is empty. Falling back to inline processing."
+    console.warn(webhookQueueError)
+    return
+  }
+
+  try {
+    const connection = createWebhookRedisConnection()
+    if (!connection) {
+      throw new Error("Failed to create webhook Redis connection.")
+    }
+
+    const idempotencyConnection = createWebhookRedisConnection()
+    if (!idempotencyConnection) {
+      throw new Error("Failed to create webhook idempotency connection.")
+    }
+
+    webhookQueueConnection = connection
+    webhookQueueIdempotencyConnection = idempotencyConnection
+    monnifyWebhookQueue = new Queue("monnify-webhooks", {
+      prefix: WEBHOOK_QUEUE_PREFIX,
+      connection,
+      defaultJobOptions: {
+        attempts: WEBHOOK_QUEUE_ATTEMPTS,
+        backoff: {
+          type: "exponential",
+          delay: WEBHOOK_QUEUE_BACKOFF_MS,
+        },
+        removeOnComplete: {
+          age: WEBHOOK_IDEMPOTENCY_TTL_SECONDS,
+          count: 5000,
+        },
+        removeOnFail: {
+          age: WEBHOOK_IDEMPOTENCY_TTL_SECONDS * 6,
+          count: 5000,
+        },
+      },
+    })
+
+    monnifyWebhookWorker = new Worker(
+      "monnify-webhooks",
+      async (job) => {
+        const startedAt = Date.now()
+        try {
+          const result = await processMonnifyWebhookPayload({
+            data: job.data?.payload || {},
+            source: "queue",
+          })
+
+          webhookPipelineMetrics.monnifyProcessed += 1
+          if (result?.status === "deduped") {
+            webhookPipelineMetrics.monnifyDeduped += 1
+          }
+          webhookPipelineMetrics.lastProcessedAt = new Date().toISOString()
+          webhookPipelineMetrics.lastDurationMs = Date.now() - startedAt
+          return result
+        } catch (error) {
+          webhookPipelineMetrics.monnifyFailed += 1
+          webhookPipelineMetrics.lastError =
+            error instanceof Error ? error.message : String(error)
+          throw error
+        }
+      },
+      {
+        prefix: WEBHOOK_QUEUE_PREFIX,
+        connection,
+        concurrency: WEBHOOK_QUEUE_CONCURRENCY,
+      },
+    )
+
+    monnifyWebhookWorker.on("failed", (job, error) => {
+      console.error(
+        "webhook.queue.monnify.failed",
+        job?.id,
+        error instanceof Error ? error.message : String(error),
+      )
+    })
+
+    webhookQueueMode = "bullmq"
+    webhookQueueError = ""
+    console.log(
+      `[WebhookQueue] Enabled with BullMQ (concurrency=${WEBHOOK_QUEUE_CONCURRENCY}).`,
+    )
+  } catch (error) {
+    webhookQueueMode = "inline"
+    webhookQueueError =
+      error instanceof Error ? error.message : "Failed to initialize webhook queue."
+    webhookPipelineMetrics.lastError = webhookQueueError
+    console.error("webhook.queue.init_failed", webhookQueueError)
+  }
+}
+
+async function enqueueMonnifyWebhookPayload(data = {}) {
+  if (!monnifyWebhookQueue || webhookQueueMode !== "bullmq") {
+    throw new Error("Monnify webhook queue is not ready.")
+  }
+
+  const eventData =
+    (data.eventData && typeof data.eventData === "object"
+      ? data.eventData
+      : data.responseBody) || data
+  const idempotencyKey = buildMonnifyWebhookIdempotencyKey(data, eventData)
+  const claimed = await claimWebhookIdempotencyKey(idempotencyKey)
+
+  if (!claimed) {
+    webhookPipelineMetrics.monnifyDeduped += 1
+    return { deduped: true, idempotencyKey }
+  }
+
+  await monnifyWebhookQueue.add(
+    "incoming",
+    {
+      payload: data,
+      idempotencyKey,
+      queuedAt: new Date().toISOString(),
+    },
+    {
+      jobId: idempotencyKey,
+    },
+  )
+
+  webhookPipelineMetrics.monnifyEnqueued += 1
+  return { deduped: false, idempotencyKey }
+}
+
+async function closeWebhookQueue() {
+  if (monnifyWebhookWorker) {
+    await monnifyWebhookWorker.close().catch(() => undefined)
+  }
+  if (monnifyWebhookQueue) {
+    await monnifyWebhookQueue.close().catch(() => undefined)
+  }
+  if (webhookQueueIdempotencyConnection) {
+    await webhookQueueIdempotencyConnection.quit().catch(() => undefined)
+  }
+  if (webhookQueueConnection) {
+    await webhookQueueConnection.quit().catch(() => undefined)
+  }
+
+  monnifyWebhookWorker = null
+  monnifyWebhookQueue = null
+  webhookQueueIdempotencyConnection = null
+  webhookQueueConnection = null
+}
+
+app.post("/webhook/monnify", async (req, res) => {
+  try {
+    if (!isWebhookIpAllowed(req)) {
+      await createAuditLog({
+        actorType: "system",
+        eventType: "webhook.monnify.rejected_ip",
+        message: "Rejected Monnify webhook from a non-allowlisted IP.",
+        metadata: {
+          ipAddresses: getRequestIpAddresses(req),
+        },
+      })
+
+      return res.status(403).json({ error: "Webhook source IP is not allowed." })
+    }
+
+    if (!verifyMonnifySignature(req)) {
+      await createAuditLog({
+        actorType: "system",
+        eventType: "webhook.monnify.invalid_signature",
+        message: "Rejected Monnify webhook with invalid signature.",
+        metadata: {
+          ip: req.ip,
+        },
+      })
+
+      return res.status(401).json({ error: "Invalid Monnify signature." })
+    }
+
+    const data = req.body || {}
+    const eventData =
+      (data.eventData && typeof data.eventData === "object"
+        ? data.eventData
+        : data.responseBody) || data
+
+    let enqueueFailed = false
+    if (webhookQueueMode === "bullmq" && monnifyWebhookQueue) {
+      try {
+        await enqueueMonnifyWebhookPayload(data)
+        return res.sendStatus(200)
+      } catch (enqueueError) {
+        enqueueFailed = true
+        webhookPipelineMetrics.monnifyQueueFallback += 1
+        webhookPipelineMetrics.lastError =
+          enqueueError instanceof Error ? enqueueError.message : String(enqueueError)
+      }
+    }
+
+    if (!enqueueFailed) {
+      const idempotencyKey = buildMonnifyWebhookIdempotencyKey(data, eventData)
+      const claimed = await claimWebhookIdempotencyKey(idempotencyKey)
+      if (!claimed) {
+        webhookPipelineMetrics.monnifyDeduped += 1
+        return res.sendStatus(200)
+      }
+    }
+
+    const startedAt = Date.now()
+    await processMonnifyWebhookPayload({ data, source: "inline" })
+    webhookPipelineMetrics.monnifyInlineProcessed += 1
+    webhookPipelineMetrics.lastProcessedAt = new Date().toISOString()
+    webhookPipelineMetrics.lastDurationMs = Date.now() - startedAt
     return res.sendStatus(200)
   } catch (error) {
     console.error(error)
+    webhookPipelineMetrics.monnifyFailed += 1
+    webhookPipelineMetrics.lastError = error instanceof Error ? error.message : String(error)
     return res.status(500).json({ error: "Failed to process Monnify webhook." })
   }
 })
@@ -9548,9 +10093,75 @@ app.get("/public/overlay/:creatorId", async (req, res) => {
         ? { date: { $gte: leaderboardResetAt } }
         : {}),
     }
-    const donations = await Donation.find(donationQuery).sort({ date: -1 }).limit(100)
+    const latestDonation = await Donation.findOne(donationQuery)
+      .select({ _id: 1, date: 1, createdAt: 1 })
+      .sort({ date: -1 })
+      .lean()
 
-    res.set("Cache-Control", "no-store, max-age=0")
+    const overlayUpdatedAtMs = user?.overlayState?.updatedAt
+      ? new Date(user.overlayState.updatedAt).getTime()
+      : 0
+    const latestDonationTimestamp = latestDonation
+      ? new Date(latestDonation.date || latestDonation.createdAt || 0).getTime()
+      : 0
+    const overlayVersion = [
+      "overlay",
+      creatorId,
+      Number.isFinite(overlayUpdatedAtMs) ? overlayUpdatedAtMs : 0,
+      Number.isFinite(latestDonationTimestamp) ? latestDonationTimestamp : 0,
+      latestDonation?._id ? String(latestDonation._id) : "none",
+    ].join(":")
+    const overlayEtag = `W/"${overlayVersion}"`
+    const ifNoneMatch = String(req.headers["if-none-match"] || "").trim()
+    const ifModifiedSince = String(req.headers["if-modified-since"] || "").trim()
+    const lastModifiedMs = Math.max(overlayUpdatedAtMs || 0, latestDonationTimestamp || 0)
+    const lastModifiedHeader =
+      lastModifiedMs > 0 ? new Date(lastModifiedMs).toUTCString() : new Date(0).toUTCString()
+
+    res.set("ETag", overlayEtag)
+    res.set("Last-Modified", lastModifiedHeader)
+    res.set(
+      "Cache-Control",
+      `public, max-age=${OVERLAY_PUBLIC_CACHE_SECONDS}, stale-while-revalidate=${
+        OVERLAY_PUBLIC_CACHE_SECONDS * 4
+      }`,
+    )
+
+    if (
+      (ifNoneMatch && ifNoneMatch === overlayEtag) ||
+      (ifModifiedSince && new Date(ifModifiedSince).getTime() >= lastModifiedMs)
+    ) {
+      return res.status(304).end()
+    }
+
+    const donations = await Donation.find(donationQuery)
+      .select({
+        _id: 1,
+        creatorId: 1,
+        sender: 1,
+        alertDisplayName: 1,
+        senderNameSource: 1,
+        amount: 1,
+        creatorShare: 1,
+        platformFee: 1,
+        alertMessage: 1,
+        narration: 1,
+        provider: 1,
+        paymentStatus: 1,
+        walletStatus: 1,
+        fundsFlow: 1,
+        riskFlags: 1,
+        transactionReference: 1,
+        paystackReference: 1,
+        monnifyTransactionReference: 1,
+        monnifyPaymentReference: 1,
+        date: 1,
+        createdAt: 1,
+      })
+      .sort({ date: -1 })
+      .limit(100)
+      .lean()
+
     return res.json({
       ...overlayState,
       user: sanitizePublicOverlayUser(user),
@@ -9792,7 +10403,32 @@ app.get("/donations", requireSessionUser, async (req, res) => {
       }
     }
 
-    const donations = await Donation.find(filter).sort({ date: -1 })
+    const donations = await Donation.find(filter)
+      .select({
+        _id: 1,
+        creatorId: 1,
+        sender: 1,
+        alertDisplayName: 1,
+        senderNameSource: 1,
+        amount: 1,
+        creatorShare: 1,
+        platformFee: 1,
+        alertMessage: 1,
+        narration: 1,
+        provider: 1,
+        paymentStatus: 1,
+        walletStatus: 1,
+        fundsFlow: 1,
+        riskFlags: 1,
+        transactionReference: 1,
+        paystackReference: 1,
+        monnifyTransactionReference: 1,
+        monnifyPaymentReference: 1,
+        date: 1,
+        createdAt: 1,
+      })
+      .sort({ date: -1 })
+      .lean()
     res.json(donations.map(sanitizeCreatorDonation))
   } catch (error) {
     console.error(error)
@@ -10329,26 +10965,60 @@ app.post("/kyc/upgrade-submission", requireSessionUser, async (req, res) => {
 
 app.get("/admin/overview", requireAdminSession, async (req, res) => {
   try {
-    const [users, donations, payouts, logs, platformWithdrawals, revenueTotals] = await Promise.all([
-      User.find().sort({ createdAt: -1 }),
-      Donation.find().sort({ date: -1 }),
-      Payout.find().sort({ createdAt: -1 }),
-      AuditLog.find().sort({ createdAt: -1 }).limit(100),
-      PlatformWithdrawal.find().sort({ createdAt: -1 }),
-      getRevenueTotals(),
-    ])
-
-    const topGiftersMap = new Map()
-    for (const donation of donations) {
-      const sender = donation.sender || "Anonymous"
-      topGiftersMap.set(sender, (topGiftersMap.get(sender) || 0) + (Number(donation.amount) || 0))
-    }
+    const [totalUsers, totalDonations, totalPayouts, recentUsers, recentDonations, recentPayouts, logs, recentPlatformWithdrawals, topGifters, revenueTotals] =
+      await Promise.all([
+        User.countDocuments({}),
+        Donation.countDocuments({}),
+        Payout.countDocuments({}),
+        User.find().sort({ createdAt: -1 }).limit(10).lean(),
+        Donation.find()
+          .select({
+            _id: 1,
+            creatorId: 1,
+            sender: 1,
+            alertDisplayName: 1,
+            senderNameSource: 1,
+            amount: 1,
+            creatorShare: 1,
+            platformFee: 1,
+            alertMessage: 1,
+            narration: 1,
+            provider: 1,
+            paymentStatus: 1,
+            walletStatus: 1,
+            fundsFlow: 1,
+            riskFlags: 1,
+            transactionReference: 1,
+            paystackReference: 1,
+            monnifyTransactionReference: 1,
+            monnifyPaymentReference: 1,
+            date: 1,
+            createdAt: 1,
+          })
+          .sort({ date: -1 })
+          .limit(15)
+          .lean(),
+        Payout.find().sort({ createdAt: -1 }).limit(15).lean(),
+        AuditLog.find().sort({ createdAt: -1 }).limit(100).lean(),
+        PlatformWithdrawal.find().sort({ createdAt: -1 }).limit(15).lean(),
+        Donation.aggregate([
+          {
+            $group: {
+              _id: { $ifNull: ["$sender", "Anonymous"] },
+              amount: { $sum: { $ifNull: ["$amount", 0] } },
+            },
+          },
+          { $sort: { amount: -1 } },
+          { $limit: 8 },
+        ]),
+        getRevenueTotals(),
+      ])
 
     res.json({
       metrics: {
-        totalUsers: users.length,
-        totalDonations: donations.length,
-        totalPayouts: payouts.length,
+        totalUsers,
+        totalDonations,
+        totalPayouts,
         grossRevenue: revenueTotals.grossRevenue,
         platformRevenue: revenueTotals.platformRevenue,
         creatorRevenue: revenueTotals.creatorRevenue,
@@ -10357,19 +11027,52 @@ app.get("/admin/overview", requireAdminSession, async (req, res) => {
         pendingPlatformRevenue: revenueTotals.pendingPlatformRevenue,
         totalPlatformWithdrawn: revenueTotals.totalPlatformWithdrawn,
       },
-      recentUsers: users.slice(0, 10).map(sanitizeUser),
-      recentDonations: donations.slice(0, 15),
-      recentPayouts: payouts.slice(0, 15),
-      recentPlatformWithdrawals: platformWithdrawals.slice(0, 15),
-      topGifters: Array.from(topGiftersMap.entries())
-        .map(([name, amount]) => ({ name, amount }))
-        .sort((a, b) => b.amount - a.amount)
-        .slice(0, 8),
+      recentUsers: recentUsers.map(sanitizeUser),
+      recentDonations: recentDonations.map(sanitizeCreatorDonation),
+      recentPayouts,
+      recentPlatformWithdrawals,
+      topGifters: topGifters.map((item) => ({
+        name: String(item?._id || "Anonymous"),
+        amount: Number(item?.amount || 0),
+      })),
       logs,
     })
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to load admin overview." })
+  }
+})
+
+app.get("/admin/pipeline/health", requireAdminSession, async (_req, res) => {
+  try {
+    let queueCounts = null
+
+    if (monnifyWebhookQueue && webhookQueueMode === "bullmq") {
+      queueCounts = await monnifyWebhookQueue.getJobCounts(
+        "active",
+        "completed",
+        "delayed",
+        "failed",
+        "paused",
+        "waiting",
+      )
+    }
+
+    return res.json({
+      webhookQueueMode,
+      webhookQueueError,
+      queueCounts,
+      metrics: webhookPipelineMetrics,
+      socket: {
+        adapterMode: socketAdapterMode,
+        adapterError: socketAdapterError,
+        redisConnected: Boolean(socketRedisPubClient?.isOpen && socketRedisSubClient?.isOpen),
+      },
+      checkedAt: new Date().toISOString(),
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to load pipeline health." })
   }
 })
 
@@ -12975,19 +13678,97 @@ app.post("/admin/platform-withdrawals", requireAdminSession, async (req, res) =>
 
 const PORT = Number(process.env.PORT || 5000)
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on http://0.0.0.0:${PORT}`)
-  // Log outbound IP so we can confirm what external APIs (e.g. Paystack) see
-  const https = require("https")
-  https.get("https://ifconfig.me", (res) => {
-    let ip = ""
-    res.on("data", (chunk) => { ip += chunk })
-    res.on("end", () => { console.log(`[Server] Outbound public IP: ${ip.trim()}`) })
-  }).on("error", () => {})
+async function startServer() {
+  await configureSocketAdapter()
+  await initializeWebhookQueue()
+
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`)
+    console.log(`[Socket] Adapter mode: ${socketAdapterMode}`)
+    if (SOCKET_CLUSTER_MODE && socketAdapterMode !== "redis") {
+      console.warn(
+        "[Socket] Cluster mode is enabled without Redis adapter. Cross-instance realtime emits may be inconsistent.",
+      )
+    }
+    if (socketAdapterError) {
+      console.warn(`[Socket] Adapter warning: ${socketAdapterError}`)
+    }
+    console.log(`[WebhookQueue] Mode: ${webhookQueueMode}`)
+    if (webhookQueueError) {
+      console.warn(`[WebhookQueue] Warning: ${webhookQueueError}`)
+    }
+
+    // Log outbound IP so we can confirm what external APIs (e.g. Paystack) see
+    const https = require("https")
+    https
+      .get("https://ifconfig.me", (res) => {
+        let ip = ""
+        res.on("data", (chunk) => {
+          ip += chunk
+        })
+        res.on("end", () => {
+          console.log(`[Server] Outbound public IP: ${ip.trim()}`)
+        })
+      })
+      .on("error", () => {})
+  })
+}
+
+void startServer()
+
+let shutdownInProgress = false
+async function shutdownServer(signal) {
+  if (shutdownInProgress) {
+    return
+  }
+
+  shutdownInProgress = true
+  console.log(`[Server] Received ${signal}. Shutting down...`)
+
+  try {
+    await closeWebhookQueue()
+  } catch (error) {
+    console.error(
+      "webhook.queue_shutdown_failed",
+      error instanceof Error ? error.message : String(error),
+    )
+  }
+
+  try {
+    await closeSocketAdapter()
+  } catch (error) {
+    console.error(
+      "socket.adapter_shutdown_failed",
+      error instanceof Error ? error.message : String(error),
+    )
+  }
+
+  server.close(() => {
+    process.exit(0)
+  })
+
+  setTimeout(() => process.exit(0), 5000).unref()
+}
+
+process.on("SIGINT", () => {
+  void shutdownServer("SIGINT")
+})
+process.on("SIGTERM", () => {
+  void shutdownServer("SIGTERM")
 })
 
+let payoutReconciliationRunning = false
 setInterval(() => {
-  void reconcilePendingPayouts().catch((error) => {
-    console.error("payout.reconciliation.interval_failed", error)
-  })
+  if (payoutReconciliationRunning) {
+    return
+  }
+
+  payoutReconciliationRunning = true
+  void reconcilePendingPayouts()
+    .catch((error) => {
+      console.error("payout.reconciliation.interval_failed", error)
+    })
+    .finally(() => {
+      payoutReconciliationRunning = false
+    })
 }, 5 * 60 * 1000)
