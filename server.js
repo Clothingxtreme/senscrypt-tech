@@ -166,6 +166,24 @@ const MONGO_SLOW_QUERY_ALERT_THRESHOLD = Math.max(
   1,
   Number(readEnv("MONGO_SLOW_QUERY_ALERT_THRESHOLD") || 20),
 )
+const MONNIFY_SETTLEMENT_RECONCILE_ENABLED = !/^(0|false|no)$/i.test(
+  readEnv("MONNIFY_SETTLEMENT_RECONCILE_ENABLED"),
+)
+const MONNIFY_SETTLEMENT_RECONCILE_INTERVAL_MS = Math.max(
+  60_000,
+  Math.min(3_600_000, Number(readEnv("MONNIFY_SETTLEMENT_RECONCILE_INTERVAL_MS") || 300_000)),
+)
+const MONNIFY_SETTLEMENT_RECONCILE_BATCH_SIZE = Math.max(
+  1,
+  Math.min(200, Number(readEnv("MONNIFY_SETTLEMENT_RECONCILE_BATCH_SIZE") || 50)),
+)
+const MONNIFY_SETTLEMENT_RECONCILE_LOOKBACK_DAYS = Math.max(
+  1,
+  Math.min(180, Number(readEnv("MONNIFY_SETTLEMENT_RECONCILE_LOOKBACK_DAYS") || 30)),
+)
+const MONNIFY_SETTLEMENT_SYNC_ON_PAID_WEBHOOK = !/^(0|false|no)$/i.test(
+  readEnv("MONNIFY_SETTLEMENT_SYNC_ON_PAID_WEBHOOK"),
+)
 const MONITORING_HEARTBEAT_SECONDS = Math.max(
   15,
   Math.min(3600, Number(readEnv("MONITORING_HEARTBEAT_SECONDS") || 60)),
@@ -1025,6 +1043,22 @@ const donationSchema = new mongoose.Schema({
   destinationBankCode: String,
   monnifyTransactionReference: { type: String, index: true, sparse: true },
   monnifyPaymentReference: { type: String, index: true, sparse: true },
+  creatorSubAccountCode: { type: String, index: true, sparse: true },
+  platformSubAccountCode: { type: String, index: true, sparse: true },
+  creatorSettledAmount: { type: Number, default: 0 },
+  platformSettledAmount: { type: Number, default: 0 },
+  settlementPendingAmount: { type: Number, default: 0 },
+  settlementStatus: {
+    type: String,
+    enum: ["pending", "partial", "settled", "failed", "unknown"],
+    default: "pending",
+    index: true,
+  },
+  settlementSyncedAt: Date,
+  settlementConfirmedAt: Date,
+  settlementLastError: String,
+  settlementReferences: { type: [String], default: undefined },
+  settlementPayload: { type: mongoose.Schema.Types.Mixed, default: undefined },
   providerPayload: { type: mongoose.Schema.Types.Mixed, default: undefined },
   fundsFlow: { type: String, enum: ["wallet", "direct_split"], default: "wallet", index: true },
   date: { type: Date, default: Date.now },
@@ -1044,7 +1078,11 @@ const Donation = mongoose.model("Donation", donationSchema)
 const walletTransactionSchema = new mongoose.Schema({
   creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
   donationId: { type: mongoose.Schema.Types.ObjectId, ref: "Donation", index: true },
-  type: { type: String, enum: ["credit", "pending_credit", "release", "reject"], index: true },
+  type: {
+    type: String,
+    enum: ["credit", "pending_credit", "release", "reject", "settlement_credit", "settlement_adjustment"],
+    index: true,
+  },
   amount: Number,
   grossAmount: Number,
   platformFee: Number,
@@ -4279,6 +4317,11 @@ function sanitizePortalDonation(donation, options = {}) {
     alertMessage: donation.alertMessage || donation.narration || "",
     walletStatus: donation.walletStatus || "available",
     fundsFlow: donation.fundsFlow || "wallet",
+    settlementStatus: donation.settlementStatus || "pending",
+    creatorSettledAmount: Number(donation.creatorSettledAmount) || 0,
+    settlementPendingAmount: Number(donation.settlementPendingAmount) || 0,
+    settlementSyncedAt: donation.settlementSyncedAt || "",
+    settlementReferences: Array.isArray(donation.settlementReferences) ? donation.settlementReferences : [],
     riskFlags: donation.riskFlags || [],
     riskScore: donation.riskScore || 0,
     riskReason: donation.riskReason || "",
@@ -4298,6 +4341,29 @@ function sanitizePortalDonation(donation, options = {}) {
 function sanitizeCreatorDonation(donation) {
   if (!donation) return null
 
+  const creatorShare =
+    typeof donation.creatorShare === "number"
+      ? donation.creatorShare
+      : calculateRevenueSplit(donation.amount).creatorShare
+  const creatorSettledAmount = Math.max(0, Number(donation.creatorSettledAmount) || 0)
+  const pendingSettlementAmount = Math.max(0, Number(donation.settlementPendingAmount) || creatorShare - creatorSettledAmount)
+  const provider = String(donation.provider || "monnify").toLowerCase()
+  const fundsFlow = String(donation.fundsFlow || "wallet").toLowerCase()
+  const settlementStatus = String(donation.settlementStatus || "pending").toLowerCase()
+  const walletStatus = String(donation.walletStatus || "available").toLowerCase()
+  const status =
+    provider === "monnify" && fundsFlow === "wallet"
+      ? settlementStatus === "settled"
+        ? "completed"
+        : settlementStatus === "failed"
+          ? "failed"
+          : "pending"
+      : walletStatus === "pending_review" || walletStatus === "migration_hold"
+        ? "pending"
+        : walletStatus === "rejected"
+          ? "failed"
+          : "completed"
+
   return {
     _id: donation._id,
     id: donation._id,
@@ -4306,25 +4372,16 @@ function sanitizeCreatorDonation(donation) {
     senderName: donation.alertDisplayName || donation.sender || "Anonymous",
     senderNameSource: donation.senderNameSource || "",
     amount: donation.amount || 0,
-    creatorShare:
-      typeof donation.creatorShare === "number"
-        ? donation.creatorShare
-        : calculateRevenueSplit(donation.amount).creatorShare,
-    platformFee:
-      typeof donation.platformFee === "number"
-        ? donation.platformFee
-        : calculateRevenueSplit(donation.amount).platformFee,
+    creatorShare,
+    creatorSettledAmount,
+    pendingSettlementAmount,
+    settlementStatus,
     message: donation.alertMessage || donation.narration || "",
     provider: donation.provider || "monnify",
     paymentStatus: donation.paymentStatus || "",
     walletStatus: donation.walletStatus || "available",
     fundsFlow: donation.fundsFlow || "wallet",
-    status:
-      donation.walletStatus === "pending_review" || donation.walletStatus === "migration_hold"
-        ? "pending"
-        : donation.walletStatus === "rejected"
-          ? "failed"
-          : "completed",
+    status,
     riskFlags: donation.riskFlags || [],
     transactionReference:
       donation.transactionReference ||
@@ -5103,6 +5160,148 @@ function calculateRevenueSplit(amount) {
     gross,
     platformFee,
     creatorShare,
+  }
+}
+
+function normalizeSettlementStatus({ settledAmount, targetAmount, failed = false }) {
+  if (failed) {
+    return "failed"
+  }
+
+  const settled = parseMoneyAmount(settledAmount)
+  const target = parseMoneyAmount(targetAmount)
+
+  if (settled <= 0) {
+    return "pending"
+  }
+  if (target > 0 && settled + 0.01 >= target) {
+    return "settled"
+  }
+  return "partial"
+}
+
+function parseMonnifyBeneficiaryRows(payload) {
+  const candidates = [
+    payload?.transactionBeneficiaries,
+    payload?.beneficiaries,
+    payload?.settlementBeneficiaries,
+    payload?.splitBeneficiaries,
+    payload?.settlementDetails,
+    payload?.responseBody?.transactionBeneficiaries,
+    payload?.responseBody?.beneficiaries,
+    payload?.eventData?.transactionBeneficiaries,
+    payload?.eventData?.beneficiaries,
+  ]
+
+  return candidates.find((item) => Array.isArray(item) && item.length > 0) || []
+}
+
+function isMonnifySettledStatus(value) {
+  const status = String(value || "").trim().toUpperCase()
+  if (!status) return false
+  return ["SETTLED", "PAID", "SUCCESS", "SUCCESSFUL", "COMPLETED", "BENEFICIARY_SETTLED"].includes(
+    status,
+  )
+}
+
+function isMonnifyFailedStatus(value) {
+  const status = String(value || "").trim().toUpperCase()
+  if (!status) return false
+  return ["FAILED", "CANCELLED", "REVERSED", "REJECTED", "ABANDONED"].includes(status)
+}
+
+function isMonnifySettlementSignal({ eventType, payload = {} }) {
+  const normalizedEventType = String(eventType || "").toLowerCase()
+  if (/(settlement|beneficiar|wallet\.credit|split)/i.test(normalizedEventType)) {
+    return true
+  }
+
+  const settlementStatus = String(payload?.settlementStatus || payload?.status || "").toLowerCase()
+  if (/(settled|beneficiary settled|partial|in progress)/i.test(settlementStatus)) {
+    return true
+  }
+
+  const rows = parseMonnifyBeneficiaryRows(payload)
+  return rows.length > 0
+}
+
+function getMonnifySettlementReferences(payload = {}, fallbackReference = "") {
+  const refs = new Set()
+  const push = (value) => {
+    const normalized = compactString(value)
+    if (normalized) refs.add(normalized)
+  }
+
+  push(payload?.settlementReference)
+  push(payload?.reference)
+  push(payload?.transactionReference)
+  push(payload?.paymentReference)
+  push(fallbackReference)
+
+  const rows = parseMonnifyBeneficiaryRows(payload)
+  rows.forEach((row) => {
+    push(row?.settlementReference)
+    push(row?.reference)
+    push(row?.beneficiaryReference)
+    push(row?.transactionReference)
+  })
+
+  return Array.from(refs)
+}
+
+function pickMonnifySettlementAmounts({
+  rows = [],
+  creatorSubAccountCode = "",
+  platformSubAccountCode = "",
+  creatorShare = 0,
+}) {
+  const normalizedCreatorCode = compactString(creatorSubAccountCode).toUpperCase()
+  const normalizedPlatformCode = compactString(platformSubAccountCode).toUpperCase()
+
+  const mappedRows = rows.map((row) => {
+    const amount = firstValidMoneyAmount(
+      row?.settlementAmount,
+      row?.amountSettled,
+      row?.amount,
+      row?.netAmount,
+      row?.totalAmount,
+      row?.beneficiaryAmount,
+    )
+    return {
+      amount,
+      status: String(row?.settlementStatus || row?.status || row?.beneficiaryStatus || "").trim().toUpperCase(),
+      beneficiaryType: String(row?.beneficiaryType || row?.type || "").trim().toUpperCase(),
+      subAccountCode: compactString(
+        row?.subAccountCode || row?.subaccountCode || row?.beneficiarySubAccountCode || row?.beneficiaryCode,
+      ).toUpperCase(),
+    }
+  })
+
+  const settledRows = mappedRows.filter((row) => row.amount > 0 && isMonnifySettledStatus(row.status))
+  const usableRows = settledRows.length ? settledRows : mappedRows.filter((row) => row.amount > 0)
+
+  const creatorRows = usableRows.filter((row) => normalizedCreatorCode && row.subAccountCode === normalizedCreatorCode)
+  const platformRows = usableRows.filter(
+    (row) => normalizedPlatformCode && row.subAccountCode === normalizedPlatformCode,
+  )
+
+  let creatorSettledAmount = creatorRows.reduce((sum, row) => sum + row.amount, 0)
+  let platformSettledAmount = platformRows.reduce((sum, row) => sum + row.amount, 0)
+
+  if (creatorSettledAmount <= 0 && usableRows.length >= 2) {
+    const sorted = usableRows.slice().sort((a, b) => b.amount - a.amount)
+    creatorSettledAmount = sorted[0]?.amount || 0
+    platformSettledAmount = sorted[1]?.amount || platformSettledAmount
+  } else if (creatorSettledAmount <= 0 && usableRows.length === 1) {
+    creatorSettledAmount = Math.min(usableRows[0].amount, parseMoneyAmount(creatorShare) || usableRows[0].amount)
+  }
+
+  const hasFailure = mappedRows.some((row) => isMonnifyFailedStatus(row.status))
+  return {
+    creatorSettledAmount: Math.max(0, parseMoneyAmount(creatorSettledAmount)),
+    platformSettledAmount: Math.max(0, parseMoneyAmount(platformSettledAmount)),
+    hasFailure,
+    usedBeneficiaryRows: usableRows.length > 0,
   }
 }
 
@@ -6422,8 +6621,157 @@ async function syncDonationFromMonnifyTransaction(donation) {
 
   donation.providerPayload = providerPayload
   await donation.save()
+  await applyMonnifySettlementForDonation({
+    donation,
+    payload: providerPayload,
+    eventType: "monnify.transaction.sync",
+    source: "manual_sync",
+  })
 
   return donation
+}
+
+async function getDonationCreatorSubAccountCode(donation) {
+  const donationCode = compactString(donation?.creatorSubAccountCode || "")
+  if (donationCode) {
+    return donationCode
+  }
+
+  const creator = await User.findById(donation.creatorId).select({ payoutProfile: 1 }).lean()
+  const creatorCode = compactString(creator?.payoutProfile?.monnifySubAccountCode || "")
+  return creatorCode
+}
+
+async function applyMonnifySettlementForDonation({
+  donation,
+  payload = {},
+  eventType = "",
+  source = "webhook",
+}) {
+  if (!donation || String(donation.provider || "").toLowerCase() !== "monnify") {
+    return { updated: false, reason: "not_monnify" }
+  }
+
+  const creatorShare = Math.max(0, Number(donation.creatorShare) || 0)
+  const platformFee = Math.max(0, Number(donation.platformFee) || 0)
+  const creatorSubAccountCode = await getDonationCreatorSubAccountCode(donation)
+  const platformSubAccountCode = compactString(
+    donation?.platformSubAccountCode || MONNIFY_PLATFORM_SUBACCOUNT_CODE || "",
+  )
+  const hasSettlementSignal = isMonnifySettlementSignal({ eventType, payload })
+  const rows = parseMonnifyBeneficiaryRows(payload)
+  const picked = pickMonnifySettlementAmounts({
+    rows,
+    creatorSubAccountCode,
+    platformSubAccountCode,
+    creatorShare,
+  })
+
+  let creatorSettledAmount = picked.creatorSettledAmount
+  let platformSettledAmount = picked.platformSettledAmount
+
+  if (!picked.usedBeneficiaryRows && hasSettlementSignal) {
+    const settlementAmount = firstValidMoneyAmount(payload?.settlementAmount)
+    if (settlementAmount > 0 && creatorShare > 0 && Number(donation.amount) > 0) {
+      const ratio = creatorShare / Math.max(1, Number(donation.amount))
+      creatorSettledAmount = Math.min(creatorShare, settlementAmount * ratio)
+      if (platformFee > 0) {
+        platformSettledAmount = Math.min(platformFee, Math.max(0, settlementAmount - creatorSettledAmount))
+      }
+    }
+  }
+
+  creatorSettledAmount = roundWalletAmount(Math.max(0, creatorSettledAmount))
+  platformSettledAmount = roundWalletAmount(Math.max(0, platformSettledAmount))
+  const existingCreatorSettled = roundWalletAmount(Math.max(0, Number(donation.creatorSettledAmount) || 0))
+  const existingPlatformSettled = roundWalletAmount(Math.max(0, Number(donation.platformSettledAmount) || 0))
+
+  const clampedCreatorSettled = Math.min(creatorShare || creatorSettledAmount, creatorSettledAmount)
+  const creatorPendingAmount = roundWalletAmount(Math.max(0, creatorShare - clampedCreatorSettled))
+  const settlementStatus = normalizeSettlementStatus({
+    settledAmount: clampedCreatorSettled,
+    targetAmount: creatorShare,
+    failed:
+      picked.hasFailure ||
+      isMonnifyFailedStatus(payload?.settlementStatus) ||
+      isMonnifyFailedStatus(payload?.status),
+  })
+
+  const defaultReference =
+    compactString(payload?.transactionReference) ||
+    compactString(payload?.paymentReference) ||
+    compactString(donation?.monnifyTransactionReference) ||
+    compactString(donation?.monnifyPaymentReference)
+  const settlementReferences = getMonnifySettlementReferences(payload, defaultReference)
+  const existingReferences = Array.isArray(donation.settlementReferences) ? donation.settlementReferences : []
+  const mergedReferences = Array.from(new Set([...existingReferences, ...settlementReferences])).slice(0, 50)
+
+  const changed =
+    existingCreatorSettled !== clampedCreatorSettled ||
+    existingPlatformSettled !== platformSettledAmount ||
+    roundWalletAmount(Number(donation.settlementPendingAmount) || 0) !== creatorPendingAmount ||
+    String(donation.settlementStatus || "") !== settlementStatus ||
+    mergedReferences.length !== existingReferences.length
+
+  if (!changed) {
+    return { updated: false, reason: "no_change" }
+  }
+
+  donation.creatorSettledAmount = clampedCreatorSettled
+  donation.platformSettledAmount = platformSettledAmount
+  donation.settlementPendingAmount = creatorPendingAmount
+  donation.settlementStatus = settlementStatus
+  donation.settlementSyncedAt = new Date()
+  donation.settlementConfirmedAt = settlementStatus === "settled" ? new Date() : donation.settlementConfirmedAt
+  donation.settlementLastError = ""
+  donation.settlementReferences = mergedReferences
+  donation.settlementPayload = payload
+  if (creatorSubAccountCode && !donation.creatorSubAccountCode) {
+    donation.creatorSubAccountCode = creatorSubAccountCode
+  }
+  if (platformSubAccountCode && !donation.platformSubAccountCode) {
+    donation.platformSubAccountCode = platformSubAccountCode
+  }
+  await donation.save()
+
+  if (String(donation.fundsFlow || "").toLowerCase() === "wallet") {
+    await syncCreatorWalletFromLedger(donation.creatorId)
+  }
+
+  const settlementDelta = roundWalletAmount(clampedCreatorSettled - existingCreatorSettled)
+  if (String(donation.fundsFlow || "").toLowerCase() === "wallet" && Math.abs(settlementDelta) > 0) {
+    await WalletTransaction.create({
+      creatorId: donation.creatorId,
+      donationId: donation._id,
+      type: settlementDelta > 0 ? "settlement_credit" : "settlement_adjustment",
+      amount: settlementDelta,
+      grossAmount: Number(donation.amount) || 0,
+      platformFee: Number(donation.platformFee) || 0,
+      provider: "monnify",
+      providerReference:
+        compactString(payload?.transactionReference) ||
+        compactString(payload?.paymentReference) ||
+        donation.monnifyTransactionReference ||
+        donation.monnifyPaymentReference ||
+        "",
+      status: settlementStatus,
+      metadata: {
+        source,
+        eventType,
+        creatorSettledAmount: clampedCreatorSettled,
+        previousCreatorSettledAmount: existingCreatorSettled,
+        creatorPendingAmount,
+        settlementReferences: mergedReferences,
+      },
+    })
+  }
+
+  return {
+    updated: true,
+    settlementStatus,
+    creatorSettledAmount: clampedCreatorSettled,
+    creatorPendingAmount,
+  }
 }
 
 function getPayoutBankProvider() {
@@ -7394,6 +7742,152 @@ async function reconcilePendingPayouts() {
   return { checked: pendingPayouts.length, updated }
 }
 
+async function backfillMonnifySettlementStateBatch(limit = 200) {
+  if (!isDatabaseConnected()) {
+    return 0
+  }
+
+  const docs = await Donation.find({
+    provider: "monnify",
+    fundsFlow: "wallet",
+    $or: [
+      { creatorSettledAmount: { $exists: false } },
+      { settlementStatus: { $exists: false } },
+      { settlementPendingAmount: { $exists: false } },
+    ],
+  })
+    .select({
+      _id: 1,
+      walletStatus: 1,
+      creatorShare: 1,
+      creatorSettledAmount: 1,
+      settlementStatus: 1,
+      settlementPendingAmount: 1,
+      settlementSyncedAt: 1,
+    })
+    .sort({ date: 1 })
+    .limit(Math.max(1, Math.min(1000, Number(limit) || 200)))
+
+  if (!docs.length) {
+    return 0
+  }
+
+  for (const donation of docs) {
+    const creatorShare = Math.max(0, Number(donation.creatorShare) || 0)
+    const walletStatus = String(donation.walletStatus || "").toLowerCase()
+    const isRejected = walletStatus === "rejected"
+    const isAvailable = walletStatus === "available"
+    const creatorSettledAmount = isRejected ? 0 : isAvailable ? creatorShare : 0
+    const settlementPendingAmount = isRejected ? 0 : Math.max(0, creatorShare - creatorSettledAmount)
+    const settlementStatus = normalizeSettlementStatus({
+      settledAmount: creatorSettledAmount,
+      targetAmount: creatorShare,
+      failed: isRejected,
+    })
+
+    await Donation.updateOne(
+      { _id: donation._id },
+      {
+        $set: {
+          creatorSettledAmount,
+          settlementPendingAmount,
+          settlementStatus,
+          settlementSyncedAt: donation.settlementSyncedAt || new Date(),
+        },
+      },
+    )
+  }
+
+  return docs.length
+}
+
+async function reconcileMonnifyDonationSettlements() {
+  if (!MONNIFY_SETTLEMENT_RECONCILE_ENABLED || !isDatabaseConnected() || !isMonnifyConfigured()) {
+    return { checked: 0, updated: 0, failed: 0, backfilled: 0 }
+  }
+
+  const backfilled = await backfillMonnifySettlementStateBatch()
+  const cutoffDate = new Date(Date.now() - MONNIFY_SETTLEMENT_RECONCILE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
+  const staleSyncThreshold = new Date(Date.now() - 15 * 60 * 1000)
+  const candidates = await Donation.find({
+    provider: "monnify",
+    fundsFlow: "wallet",
+    walletStatus: { $ne: "rejected" },
+    date: { $gte: cutoffDate },
+    $or: [
+      { paymentStatus: "PAID" },
+      { paymentStatus: "paid" },
+      { settlementStatus: { $in: ["pending", "partial", "unknown"] } },
+    ],
+    $and: [
+      {
+        $or: [
+          { monnifyTransactionReference: { $exists: true, $ne: "" } },
+          { monnifyPaymentReference: { $exists: true, $ne: "" } },
+        ],
+      },
+      {
+        $or: [
+          { settlementStatus: { $in: ["pending", "partial", "unknown"] } },
+          {
+            $expr: {
+              $lt: [{ $ifNull: ["$creatorSettledAmount", 0] }, { $ifNull: ["$creatorShare", 0] }],
+            },
+          },
+          { settlementSyncedAt: { $exists: false } },
+          { settlementSyncedAt: { $lt: staleSyncThreshold } },
+        ],
+      },
+    ],
+  })
+    .sort({ date: 1 })
+    .limit(MONNIFY_SETTLEMENT_RECONCILE_BATCH_SIZE)
+
+  let checked = 0
+  let updated = 0
+  let failed = 0
+
+  for (const donation of candidates) {
+    const reference = String(
+      donation.monnifyTransactionReference || donation.monnifyPaymentReference || donation.transactionReference || "",
+    ).trim()
+    if (!reference) {
+      continue
+    }
+    checked += 1
+
+    try {
+      await withWebhookReferenceLock(reference, async () => {
+        const freshDonation = await Donation.findById(donation._id)
+        if (!freshDonation) return
+        const payload = await getMonnifyTransactionStatus(reference)
+        const result = await applyMonnifySettlementForDonation({
+          donation: freshDonation,
+          payload,
+          eventType: "monnify.reconcile",
+          source: "reconcile_job",
+        })
+        if (result.updated) {
+          updated += 1
+        }
+      })
+    } catch (error) {
+      failed += 1
+      await Donation.updateOne(
+        { _id: donation._id },
+        {
+          $set: {
+            settlementLastError: error instanceof Error ? error.message : String(error),
+            settlementSyncedAt: new Date(),
+          },
+        },
+      )
+    }
+  }
+
+  return { checked, updated, failed, backfilled }
+}
+
 async function failPayoutAndReleaseBalance({
   payout,
   actorId,
@@ -7694,8 +8188,68 @@ async function getRevenueTotals({ creatorId } = {}) {
       },
     ],
   }
+  const providerExpr = {
+    $toLower: {
+      $ifNull: ["$provider", ""],
+    },
+  }
   const walletStatusExpr = { $ifNull: ["$walletStatus", "available"] }
   const fundsFlowExpr = { $ifNull: ["$fundsFlow", "wallet"] }
+  const isWalletFlowExpr = { $eq: [fundsFlowExpr, "wallet"] }
+  const isMonnifyWalletExpr = {
+    $and: [isWalletFlowExpr, { $eq: [providerExpr, "monnify"] }],
+  }
+  const creatorSettledExpr = {
+    $cond: [
+      isMonnifyWalletExpr,
+      {
+        $ifNull: [
+          "$creatorSettledAmount",
+          {
+            $cond: [{ $eq: [walletStatusExpr, "available"] }, creatorShareExpr, 0],
+          },
+        ],
+      },
+      {
+        $cond: [{ $and: [{ $eq: [walletStatusExpr, "available"] }, isWalletFlowExpr] }, creatorShareExpr, 0],
+      },
+    ],
+  }
+  const platformSettledExpr = {
+    $cond: [
+      isMonnifyWalletExpr,
+      {
+        $ifNull: [
+          "$platformSettledAmount",
+          {
+            $cond: [{ $eq: [walletStatusExpr, "available"] }, platformFeeExpr, 0],
+          },
+        ],
+      },
+      {
+        $cond: [{ $and: [{ $eq: [walletStatusExpr, "available"] }, isWalletFlowExpr] }, platformFeeExpr, 0],
+      },
+    ],
+  }
+  const creatorPendingSettlementExpr = {
+    $cond: [
+      {
+        $and: [isMonnifyWalletExpr, { $ne: [walletStatusExpr, "rejected"] }],
+      },
+      {
+        $max: [0, { $subtract: [creatorShareExpr, creatorSettledExpr] }],
+      },
+      {
+        $cond: [
+          {
+            $and: [{ $eq: [walletStatusExpr, "pending_review"] }, isWalletFlowExpr],
+          },
+          creatorShareExpr,
+          0,
+        ],
+      },
+    ],
+  }
 
   const [donationTotals, payoutTotals, platformWithdrawalTotals] = await Promise.all([
     Donation.aggregate([
@@ -7710,35 +8264,17 @@ async function getRevenueTotals({ creatorId } = {}) {
           },
           pendingCreatorRevenue: {
             $sum: {
-              $cond: [
-                {
-                  $and: [
-                    { $eq: [walletStatusExpr, "pending_review"] },
-                    { $eq: [fundsFlowExpr, "wallet"] },
-                  ],
-                },
-                creatorShareExpr,
-                0,
-              ],
+              $cond: [{ $ne: [walletStatusExpr, "rejected"] }, creatorPendingSettlementExpr, 0],
             },
           },
           platformRevenue: {
             $sum: {
-              $cond: [{ $eq: [walletStatusExpr, "available"] }, platformFeeExpr, 0],
+              $cond: [{ $ne: [walletStatusExpr, "rejected"] }, platformSettledExpr, 0],
             },
           },
           creatorRevenue: {
             $sum: {
-              $cond: [
-                {
-                  $and: [
-                    { $eq: [walletStatusExpr, "available"] },
-                    { $eq: [fundsFlowExpr, "wallet"] },
-                  ],
-                },
-                creatorShareExpr,
-                0,
-              ],
+              $cond: [{ $ne: [walletStatusExpr, "rejected"] }, creatorSettledExpr, 0],
             },
           },
           directSplitCreatorRevenue: {
@@ -7791,11 +8327,6 @@ async function getRevenueTotals({ creatorId } = {}) {
   const totalPaidOut = Number(payoutSummary.totalPaidOut || 0)
   const totalPlatformWithdrawn = Number(platformSummary.totalPlatformWithdrawn || 0)
 
-  const creatorWalletSnapshot = creatorId
-    ? await User.findById(creatorId).select({ wallet: 1 }).lean()
-    : null
-  const walletAvailableBalance = Number(creatorWalletSnapshot?.wallet?.availableBalance || 0)
-
   return {
     grossRevenue,
     platformRevenue,
@@ -7804,9 +8335,7 @@ async function getRevenueTotals({ creatorId } = {}) {
     pendingCreatorRevenue,
     totalPaidOut,
     totalPlatformWithdrawn,
-    creatorAvailableBalance: creatorId
-      ? Math.max(0, walletAvailableBalance)
-      : Math.max(0, creatorRevenue - totalPaidOut),
+    creatorAvailableBalance: Math.max(0, creatorRevenue - totalPaidOut),
     pendingPlatformRevenue: Math.max(0, platformRevenue - totalPlatformWithdrawn),
   }
 }
@@ -7833,7 +8362,7 @@ async function syncCreatorWalletFromLedger(userOrId) {
   const currentWallet = user.wallet?.toObject?.() || user.wallet || {}
   const nextWallet = {
     ...currentWallet,
-    availableBalance: roundWalletAmount(totals.creatorRevenue),
+    availableBalance: roundWalletAmount(totals.creatorAvailableBalance),
     pendingBalance: roundWalletAmount(totals.pendingCreatorRevenue),
     totalReceived: roundWalletAmount(totals.grossRevenue),
   }
@@ -8706,10 +9235,6 @@ function emitDonationAlert(creatorId, donation) {
     id: donation._id,
     creatorId: donation.creatorId,
     amount: Number(donation.amount) || 0,
-    platformFee:
-      typeof donation.platformFee === "number"
-        ? donation.platformFee
-        : calculateRevenueSplit(donation.amount).platformFee,
     creatorShare:
       typeof donation.creatorShare === "number"
         ? donation.creatorShare
@@ -9833,6 +10358,10 @@ async function processMonnifyWebhookPayload({ data = {}, source = "http" }) {
   const eventType = String(data.eventType || eventData.eventType || "monnify.webhook")
   const disbursementReference = extractMonnifyDisbursementReference(eventData, data)
   const { transactionReference, paymentReference } = getMonnifyPaymentReferences(eventData, data)
+  const settlementSignal = isMonnifySettlementSignal({
+    eventType,
+    payload: eventData,
+  })
 
   if (/disbursement|transfer/i.test(eventType) && disbursementReference) {
     await withWebhookReferenceLock(disbursementReference, async () => {
@@ -10008,6 +10537,25 @@ async function processMonnifyWebhookPayload({ data = {}, source = "http" }) {
       if (referenceFilters.length) {
         const existingDonation = await Donation.findOne({ $or: referenceFilters })
         if (existingDonation) {
+          if (
+            settlementSignal ||
+            MONNIFY_SETTLEMENT_SYNC_ON_PAID_WEBHOOK ||
+            String(existingDonation.settlementStatus || "pending") !== "settled"
+          ) {
+            const referenceForSync =
+              transactionReference || paymentReference || existingDonation.monnifyTransactionReference
+            const providerPayload =
+              MONNIFY_SETTLEMENT_SYNC_ON_PAID_WEBHOOK && referenceForSync
+                ? await getMonnifyTransactionStatus(referenceForSync).catch(() => eventData)
+                : eventData
+            await applyMonnifySettlementForDonation({
+              donation: existingDonation,
+              payload: providerPayload,
+              eventType,
+              source: `${source}:dedupe`,
+            })
+          }
+
           await upsertComplianceInflowFromMonnify({
             eventType,
             eventData,
@@ -10042,9 +10590,30 @@ async function processMonnifyWebhookPayload({ data = {}, source = "http" }) {
       destinationBankCode: destinationDetails.destinationBankCode || undefined,
       monnifyTransactionReference: transactionReference || undefined,
       monnifyPaymentReference: paymentReference || undefined,
+      creatorSubAccountCode: compactString(creator?.payoutProfile?.monnifySubAccountCode || "") || undefined,
+      platformSubAccountCode: compactString(MONNIFY_PLATFORM_SUBACCOUNT_CODE || "") || undefined,
+      creatorSettledAmount: 0,
+      platformSettledAmount: 0,
+      settlementPendingAmount: split.creatorShare,
+      settlementStatus: "pending",
+      settlementReferences: getMonnifySettlementReferences(eventData, transactionReference || paymentReference),
       fundsFlow: donationFundsFlow,
       providerPayload: data,
     })
+
+    if (settlementSignal || MONNIFY_SETTLEMENT_SYNC_ON_PAID_WEBHOOK) {
+      const referenceForSync = transactionReference || paymentReference
+      const providerPayload =
+        MONNIFY_SETTLEMENT_SYNC_ON_PAID_WEBHOOK && referenceForSync
+          ? await getMonnifyTransactionStatus(referenceForSync).catch(() => eventData)
+          : eventData
+      await applyMonnifySettlementForDonation({
+        donation,
+        payload: providerPayload,
+        eventType,
+        source,
+      })
+    }
 
     await upsertComplianceInflowFromMonnify({
       eventType,
@@ -10810,7 +11379,6 @@ app.post("/payouts", requireSessionUser, async (req, res) => {
         error: "Creators can only withdraw up to their 80% share of earnings.",
         availableCreatorBalance,
         creatorRevenue: creatorTotals.creatorRevenue,
-        platformRevenue: creatorTotals.platformRevenue,
       })
     }
 
@@ -13178,6 +13746,28 @@ app.post("/portal/payouts/reconcile", requireAdminSession, async (req, res) => {
   }
 })
 
+app.post("/portal/donations/reconcile-settlements", requireAdminSession, async (req, res) => {
+  try {
+    const result = await reconcileMonnifyDonationSettlements()
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.donations.settlement_reconciled",
+      message: "Admin triggered Monnify donation settlement reconciliation.",
+      metadata: result,
+    })
+
+    return res.json({
+      message: "Monnify settlement reconciliation completed.",
+      result,
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to reconcile Monnify settlements." })
+  }
+})
+
 app.post("/portal/payouts/release-stuck-pending", requireAdminSession, async (req, res) => {
   try {
     const reason =
@@ -14323,3 +14913,19 @@ setInterval(() => {
       payoutReconciliationRunning = false
     })
 }, 5 * 60 * 1000)
+
+let monnifySettlementReconciliationRunning = false
+setInterval(() => {
+  if (monnifySettlementReconciliationRunning || !MONNIFY_SETTLEMENT_RECONCILE_ENABLED) {
+    return
+  }
+
+  monnifySettlementReconciliationRunning = true
+  void reconcileMonnifyDonationSettlements()
+    .catch((error) => {
+      console.error("monnify.settlement_reconciliation.interval_failed", error)
+    })
+    .finally(() => {
+      monnifySettlementReconciliationRunning = false
+    })
+}, MONNIFY_SETTLEMENT_RECONCILE_INTERVAL_MS)
