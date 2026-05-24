@@ -97,6 +97,11 @@ function createMonnifyService({
     })
   }
 
+  function isProviderValidationHttpError(error) {
+    const status = Number(error?.response?.status || 0)
+    return (status === 400 || status === 422) && error?.response?.data && typeof error.response.data === "object"
+  }
+
   return {
     isConfigured() {
       return Boolean(normalizedApiKey && normalizedSecretKey && normalizedBaseUrl)
@@ -117,8 +122,15 @@ function createMonnifyService({
     getAccessToken,
 
     async verifyBvnDetails(payload) {
-      const response = await request("post", "/api/v1/vas/bvn-details-match", { data: payload })
-      return response.data
+      try {
+        const response = await request("post", "/api/v1/vas/bvn-details-match", { data: payload })
+        return response.data
+      } catch (error) {
+        if (isProviderValidationHttpError(error)) {
+          return error.response.data
+        }
+        throw error
+      }
     },
 
     async verifyNin(payload) {
@@ -130,12 +142,23 @@ function createMonnifyService({
           error?.response?.status === 404 &&
           normalizedNinVerificationPath !== LEGACY_NIN_VERIFICATION_PATH
 
+        if (!shouldRetryLegacyPath && isProviderValidationHttpError(error)) {
+          return error.response.data
+        }
+
         if (!shouldRetryLegacyPath) {
           throw error
         }
 
-        const response = await request("post", LEGACY_NIN_VERIFICATION_PATH, { data: payload })
-        return response.data
+        try {
+          const response = await request("post", LEGACY_NIN_VERIFICATION_PATH, { data: payload })
+          return response.data
+        } catch (legacyError) {
+          if (isProviderValidationHttpError(legacyError)) {
+            return legacyError.response.data
+          }
+          throw legacyError
+        }
       }
     },
 

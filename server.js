@@ -6733,6 +6733,7 @@ async function applyMonnifySettlementForDonation({
     donation.platformSubAccountCode = platformSubAccountCode
   }
   await donation.save()
+  emitDonationSettlementUpdated(donation.creatorId, donation)
 
   if (String(donation.fundsFlow || "").toLowerCase() === "wallet") {
     await syncCreatorWalletFromLedger(donation.creatorId)
@@ -9257,6 +9258,43 @@ function emitDonationAlert(creatorId, donation) {
   invalidateOverlayPublicCache(creatorId)
   io.to(getCreatorRoom(creatorId)).emit("newDonation", payload)
   io.to(getCreatorRoom(creatorId)).emit("overlayAlert", alertPayload)
+}
+
+function emitDonationSettlementUpdated(creatorId, donation) {
+  const transactionReference =
+    donation.transactionReference ||
+    donation.paystackReference ||
+    donation.monnifyTransactionReference ||
+    donation.monnifyPaymentReference ||
+    ""
+  const payload = {
+    _id: donation._id,
+    id: donation._id,
+    creatorId: donation.creatorId,
+    amount: Number(donation.amount) || 0,
+    creatorShare:
+      typeof donation.creatorShare === "number"
+        ? donation.creatorShare
+        : calculateRevenueSplit(donation.amount).creatorShare,
+    provider: donation.provider || "monnify",
+    walletStatus: donation.walletStatus || "available",
+    fundsFlow: donation.fundsFlow || "wallet",
+    paymentStatus: donation.paymentStatus || "",
+    transactionReference,
+    date: donation.date || donation.createdAt,
+    createdAt: donation.date || donation.createdAt,
+    senderName: donation.alertDisplayName || donation.sender || "Someone sent you a tip",
+    sender: donation.sender || donation.alertDisplayName || "Someone sent you a tip",
+    senderNameSource: donation.senderNameSource || "",
+    message: donation.alertMessage || donation.narration || donation.message || "",
+    status: donation.status || "",
+    settlementStatus: donation.settlementStatus || "pending",
+    creatorSettledAmount: Number(donation.creatorSettledAmount) || 0,
+    settlementPendingAmount: Number(donation.settlementPendingAmount) || 0,
+    settlementSyncedAt: donation.settlementSyncedAt || "",
+  }
+
+  io.to(getCreatorRoom(creatorId)).emit("donationSettlementUpdated", payload)
 }
 
 async function requireAdminSession(req, res, next) {
