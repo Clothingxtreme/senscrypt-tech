@@ -2132,6 +2132,9 @@ function inferMonnifyFailureReason(type, providerMessage, mismatches = [], provi
   if (message.includes("invalid bvn") || message.includes("invalid nin") || message.includes("invalid")) {
     return "INVALID_FORMAT"
   }
+  if (message.includes("11 digits") || message.includes("must be 11")) {
+    return "INVALID_FORMAT"
+  }
   if (
     message.includes("not found") ||
     message.includes("does not exist") ||
@@ -2516,20 +2519,22 @@ function applyIdentityVerificationSnapshots(user, snapshots = {}) {
 
 function buildIdentityFailureSnapshot(type, message, requestHash = "") {
   const upperType = String(type || "").toUpperCase()
+  const failureReason = inferMonnifyFailureReason(upperType, message, [], undefined)
+  const responseMessage = String(message || `${upperType} verification failed.`).trim()
   const now = new Date()
   return {
     status: "failed",
     matchStatus: "NO_MATCH",
     matchPercentage: 0,
     responseCode: "",
-    responseMessage: String(message || `${upperType} verification failed.`).trim(),
-    validationError: String(message || `${upperType} verification failed.`).trim(),
-    failureReason: "PROVIDER_SERVER_ERROR",
+    responseMessage,
+    validationError: buildFailureMessageFromReason(upperType, failureReason) || responseMessage,
+    failureReason,
     mismatches: [],
     lastValidationResponse: {
       type: upperType,
       requestSuccessful: false,
-      responseMessage: String(message || `${upperType} verification failed.`).trim(),
+      responseMessage,
     },
     requestHash,
     checkedAt: now,
@@ -2611,16 +2616,46 @@ async function verifyIdentityWithMonnify(subject, options = {}) {
   const snapshots = {}
 
   if (types.includes("bvn")) {
-    snapshots.bvn = await runMonnifyBvnVerification(subject, existing.bvn, options)
-    if (snapshots.bvn.status !== "verified" && options.throwOnFailed !== false) {
-      throw createStatusCodeError(`BVN verification failed: ${snapshots.bvn.responseMessage}`, 400)
+    try {
+      snapshots.bvn = await runMonnifyBvnVerification(subject, existing.bvn, options)
+      if (snapshots.bvn.status !== "verified" && options.throwOnFailed !== false) {
+        throw createStatusCodeError(`BVN verification failed: ${snapshots.bvn.responseMessage}`, 400)
+      }
+    } catch (error) {
+      if (options.throwOnFailed !== false) {
+        throw error
+      }
+      const message = getAxiosErrorMessage(
+        error,
+        error instanceof Error ? error.message : "BVN verification failed.",
+      )
+      snapshots.bvn = buildIdentityFailureSnapshot(
+        "bvn",
+        message,
+        buildIdentityVerificationHash("bvn", subject),
+      )
     }
   }
 
   if (types.includes("nin")) {
-    snapshots.nin = await runMonnifyNinVerification(subject, existing.nin, options)
-    if (snapshots.nin.status !== "verified" && options.throwOnFailed !== false) {
-      throw createStatusCodeError(`NIN verification failed: ${snapshots.nin.responseMessage}`, 400)
+    try {
+      snapshots.nin = await runMonnifyNinVerification(subject, existing.nin, options)
+      if (snapshots.nin.status !== "verified" && options.throwOnFailed !== false) {
+        throw createStatusCodeError(`NIN verification failed: ${snapshots.nin.responseMessage}`, 400)
+      }
+    } catch (error) {
+      if (options.throwOnFailed !== false) {
+        throw error
+      }
+      const message = getAxiosErrorMessage(
+        error,
+        error instanceof Error ? error.message : "NIN verification failed.",
+      )
+      snapshots.nin = buildIdentityFailureSnapshot(
+        "nin",
+        message,
+        buildIdentityVerificationHash("nin", subject),
+      )
     }
   }
 
@@ -13332,7 +13367,7 @@ app.post("/portal/users/:id/identity-verification", requireAdminSession, async (
             type: "BOTH",
             verified: false,
             status: "failed",
-            message: "Identity verification could not be completed.",
+            message: message || "Identity verification could not be completed.",
             mismatches: [],
             providerMessage: message || "Could not verify this user's identity with Monnify.",
             checkedAt: new Date().toISOString(),
@@ -13343,9 +13378,10 @@ app.post("/portal/users/:id/identity-verification", requireAdminSession, async (
             verified: false,
             status: "failed",
             message:
-              requestedType === "bvn"
+              message ||
+              (requestedType === "bvn"
                 ? "BVN validation failed due to provider/server error."
-                : "NIN validation failed due to provider/server error.",
+                : "NIN validation failed due to provider/server error."),
             mismatches: [],
             providerMessage: message || "Could not verify this user's identity with Monnify.",
             checkedAt: new Date().toISOString(),
@@ -14258,7 +14294,7 @@ app.post("/admin/users/:id/identity-verification", requireAdminSession, async (r
             type: "BOTH",
             verified: false,
             status: "failed",
-            message: "Identity verification could not be completed.",
+            message: message || "Identity verification could not be completed.",
             mismatches: [],
             providerMessage: message || "Could not verify this user's identity with Monnify.",
             checkedAt: new Date().toISOString(),
@@ -14269,9 +14305,10 @@ app.post("/admin/users/:id/identity-verification", requireAdminSession, async (r
             verified: false,
             status: "failed",
             message:
-              requestedType === "bvn"
+              message ||
+              (requestedType === "bvn"
                 ? "BVN validation failed due to provider/server error."
-                : "NIN validation failed due to provider/server error.",
+                : "NIN validation failed due to provider/server error."),
             mismatches: [],
             providerMessage: message || "Could not verify this user's identity with Monnify.",
             checkedAt: new Date().toISOString(),
