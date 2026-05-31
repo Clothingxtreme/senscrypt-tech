@@ -9334,7 +9334,7 @@ function emitDonationSettlementUpdated(creatorId, donation) {
 
 async function requireAdminSession(req, res, next) {
   try {
-    const adminToken = String(req.headers["x-admin-token"] || "").trim()
+    const adminToken = String(req.headers["x-admin-token"] || req.query?.adminToken || "").trim()
 
     if (!adminToken) {
       return res.status(401).json({ error: "Admin authentication required." })
@@ -12137,12 +12137,24 @@ app.post("/kyc/upgrade-submission", requireSessionUser, async (req, res) => {
 
 app.get("/admin/overview", requireAdminSession, async (req, res) => {
   try {
-    const [totalUsers, totalDonations, totalPayouts, recentUsers, recentDonations, recentPayouts, logs, recentPlatformWithdrawals, topGifters, revenueTotals] =
+    const [totalUsers, totalDonations, totalPayouts, recentUsers, recentDonations, recentPayouts, recentPlatformWithdrawals, topGifters, revenueTotals] =
       await Promise.all([
         User.countDocuments({}),
         Donation.countDocuments({}),
         Payout.countDocuments({}),
-        User.find().sort({ createdAt: -1 }).limit(10).lean(),
+        User.find()
+          .select({
+            _id: 1,
+            name: 1,
+            firstName: 1,
+            middleName: 1,
+            lastName: 1,
+            email: 1,
+            createdAt: 1,
+          })
+          .sort({ createdAt: -1 })
+          .limit(10)
+          .lean(),
         Donation.find()
           .select({
             _id: 1,
@@ -12170,9 +12182,16 @@ app.get("/admin/overview", requireAdminSession, async (req, res) => {
           .sort({ date: -1 })
           .limit(15)
           .lean(),
-        Payout.find().sort({ createdAt: -1 }).limit(15).lean(),
-        AuditLog.find().sort({ createdAt: -1 }).limit(100).lean(),
-        PlatformWithdrawal.find().sort({ createdAt: -1 }).limit(15).lean(),
+        Payout.find()
+          .select({ _id: 1, amount: 1, bankName: 1, accountNumber: 1, status: 1, createdAt: 1 })
+          .sort({ createdAt: -1 })
+          .limit(15)
+          .lean(),
+        PlatformWithdrawal.find()
+          .select({ _id: 1, amount: 1, bankName: 1, accountNumber: 1, accountName: 1, status: 1, createdAt: 1 })
+          .sort({ createdAt: -1 })
+          .limit(15)
+          .lean(),
         Donation.aggregate([
           {
             $group: {
@@ -12199,7 +12218,12 @@ app.get("/admin/overview", requireAdminSession, async (req, res) => {
         pendingPlatformRevenue: revenueTotals.pendingPlatformRevenue,
         totalPlatformWithdrawn: revenueTotals.totalPlatformWithdrawn,
       },
-      recentUsers: recentUsers.map(sanitizeUser),
+      recentUsers: recentUsers.map((user) => ({
+        id: String(user?._id || ""),
+        name: buildFullNameFromParts(getUserNameParts(user), user?.name || user?.email || "Creator"),
+        email: user?.email || "",
+        createdAt: user?.createdAt || "",
+      })),
       recentDonations: recentDonations.map(sanitizeCreatorDonation),
       recentPayouts,
       recentPlatformWithdrawals,
@@ -12207,7 +12231,7 @@ app.get("/admin/overview", requireAdminSession, async (req, res) => {
         name: String(item?._id || "Anonymous"),
         amount: Number(item?.amount || 0),
       })),
-      logs,
+      logs: [],
     })
   } catch (error) {
     console.error(error)
@@ -13952,8 +13976,58 @@ app.post("/portal/payouts/:id/cancel", requireAdminSession, async (req, res) => 
 
 app.get("/admin/users", requireAdminSession, async (req, res) => {
   try {
-    const users = await User.find().sort({ createdAt: -1 })
-    res.json({ users: users.map(sanitizePrivilegedUser) })
+    const page = parsePositiveInteger(req.query.page, 1)
+    const limit = Math.min(parsePositiveInteger(req.query.limit, 25), 100)
+    const skip = (page - 1) * limit
+    const queryText = String(req.query.q || "").trim()
+    const searchQuery = queryText
+      ? {
+          $or: [
+            { email: { $regex: escapeRegex(queryText), $options: "i" } },
+            { name: { $regex: escapeRegex(queryText), $options: "i" } },
+            { firstName: { $regex: escapeRegex(queryText), $options: "i" } },
+            { middleName: { $regex: escapeRegex(queryText), $options: "i" } },
+            { lastName: { $regex: escapeRegex(queryText), $options: "i" } },
+          ],
+        }
+      : {}
+
+    const [total, users] = await Promise.all([
+      User.countDocuments(searchQuery),
+      User.find(searchQuery)
+        .select({
+          _id: 1,
+          name: 1,
+          firstName: 1,
+          middleName: 1,
+          lastName: 1,
+          email: 1,
+          role: 1,
+          status: 1,
+          profileImage: 1,
+          phoneNumber: 1,
+          phoneVerified: 1,
+          onboardingTourCompleted: 1,
+          onboardingTourCompletedAt: 1,
+          kycTier: 1,
+          kycStatus: 1,
+          wallet: 1,
+          identity: 1,
+          identityVerification: 1,
+          payoutProfile: 1,
+          virtualAccount: 1,
+          createdAt: 1,
+        })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+    ])
+
+    res.json({
+      users: users.map(sanitizePrivilegedUser),
+      pagination: getPaginationMeta({ page, limit, total }),
+    })
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to load users." })
