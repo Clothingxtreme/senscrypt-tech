@@ -325,6 +325,20 @@ function isOriginAllowed(origin) {
     return true
   }
 
+  try {
+    const parsedOrigin = new URL(origin)
+    const hostname = String(parsedOrigin.hostname || "").toLowerCase()
+    const isTrustedStreamtipsOrigin =
+      parsedOrigin.protocol === "https:" &&
+      (hostname === "streamtips.live" || hostname.endsWith(".streamtips.live"))
+
+    if (isTrustedStreamtipsOrigin) {
+      return true
+    }
+  } catch (_error) {
+    // Fall back to explicit allow-list checks below.
+  }
+
   return allowedOrigins.some((allowedOrigin) => {
     if (allowedOrigin === origin) {
       return true
