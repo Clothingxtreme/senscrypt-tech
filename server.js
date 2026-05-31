@@ -1156,6 +1156,8 @@ complianceInflowSchema.index({ sourceSessionId: 1 }, { sparse: true })
 complianceInflowSchema.index({ sourceAccountNumber: 1 }, { sparse: true })
 complianceInflowSchema.index({ destinationAccountNumber: 1 }, { sparse: true })
 complianceInflowSchema.index({ reservedAccountReference: 1 }, { sparse: true })
+complianceInflowSchema.index({ status: 1, date: -1 })
+complianceInflowSchema.index({ linkedCreatorId: 1, date: -1 })
 
 const ComplianceInflow = mongoose.model("ComplianceInflow", complianceInflowSchema)
 
@@ -1206,6 +1208,8 @@ const payoutProfileChangeRequestSchema = new mongoose.Schema(
   },
   { timestamps: false },
 )
+payoutProfileChangeRequestSchema.index({ status: 1, createdAt: -1 })
+payoutProfileChangeRequestSchema.index({ creatorId: 1, createdAt: -1 })
 
 const PayoutProfileChangeRequest = mongoose.model(
   "PayoutProfileChangeRequest",
@@ -1260,6 +1264,8 @@ const kycUpgradeSubmissionSchema = new mongoose.Schema(
   },
   { timestamps: false },
 )
+kycUpgradeSubmissionSchema.index({ status: 1, submittedAt: -1 })
+kycUpgradeSubmissionSchema.index({ creatorId: 1, submittedAt: -1 })
 
 const KycUpgradeSubmission = mongoose.model("KycUpgradeSubmission", kycUpgradeSubmissionSchema)
 
