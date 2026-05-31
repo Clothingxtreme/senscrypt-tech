@@ -4214,6 +4214,36 @@ function sanitizeAdminUserListItem(user) {
   }
 }
 
+function sanitizePortalUserListItem(user) {
+  if (!user) return null
+
+  const nameParts = getUserNameParts(user)
+  const displayName = buildFullNameFromParts(nameParts, user.name || user.email || "Creator")
+  const identity = user?.identity && typeof user.identity === "object" ? user.identity : {}
+  const bvn = String(identity?.bvn || identity?.submittedBvn || user?.submittedBvn || "").trim()
+  const nin = String(identity?.nin || identity?.submittedNin || user?.submittedNin || "").trim()
+
+  return {
+    id: user._id,
+    name: displayName,
+    firstName: nameParts.firstName,
+    middleName: nameParts.middleName,
+    lastName: nameParts.lastName,
+    email: user.email || "",
+    role: user.role || "creator",
+    status: user.status || "active",
+    identity: {
+      hasBvn: Boolean(bvn),
+      hasNin: Boolean(nin),
+      bvnLast4: bvn ? bvn.slice(-4) : "",
+      ninLast4: nin ? nin.slice(-4) : "",
+      bvn,
+      nin,
+    },
+    createdAt: user.createdAt || "",
+  }
+}
+
 function escapeRegex(value) {
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
@@ -13458,16 +13488,38 @@ app.get("/portal/users", requireAdminSession, async (req, res) => {
     const filter = {}
 
     if (search) {
-      filter.email = { $regex: escapeRegex(search), $options: "i" }
+      filter.$or = [
+        { email: { $regex: escapeRegex(search), $options: "i" } },
+        { name: { $regex: escapeRegex(search), $options: "i" } },
+        { firstName: { $regex: escapeRegex(search), $options: "i" } },
+        { middleName: { $regex: escapeRegex(search), $options: "i" } },
+        { lastName: { $regex: escapeRegex(search), $options: "i" } },
+      ]
     }
 
     const [users, total] = await Promise.all([
-      User.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+      User.find(filter)
+        .select({
+          _id: 1,
+          name: 1,
+          firstName: 1,
+          middleName: 1,
+          lastName: 1,
+          email: 1,
+          role: 1,
+          status: 1,
+          identity: 1,
+          createdAt: 1,
+        })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
       User.countDocuments(filter),
     ])
 
     res.json({
-      users: users.map(sanitizePrivilegedUser),
+      users: users.map(sanitizePortalUserListItem),
       pagination: getPaginationMeta({ page, limit, total }),
       search,
     })
@@ -13490,9 +13542,73 @@ app.get("/portal/users/:id", requireAdminSession, async (req, res) => {
     }
 
     const [payouts, changeRequests, donations, balance] = await Promise.all([
-      Payout.find({ creatorId: user._id }).sort({ createdAt: -1 }).limit(25),
-      PayoutProfileChangeRequest.find({ creatorId: user._id }).sort({ createdAt: -1 }).limit(10),
-      Donation.find({ creatorId: user._id }).sort({ date: -1 }).limit(50),
+      Payout.find({ creatorId: user._id })
+        .select({
+          _id: 1,
+          amount: 1,
+          status: 1,
+          reviewStatus: 1,
+          createdAt: 1,
+          completedAt: 1,
+          reviewedAt: 1,
+          bankName: 1,
+          accountNumber: 1,
+          accountName: 1,
+          transferReference: 1,
+          providerReference: 1,
+          providerMessage: 1,
+          provider: 1,
+          authorizationCodeRequired: 1,
+          otpExpiresAt: 1,
+          otpResendCount: 1,
+          otpResendLastAt: 1,
+          reviewReason: 1,
+          reviewNotes: 1,
+          rejectionReason: 1,
+          requiresReview: 1,
+          requiredReviewReasons: 1,
+        })
+        .sort({ createdAt: -1 })
+        .limit(25)
+        .lean(),
+      PayoutProfileChangeRequest.find({ creatorId: user._id })
+        .select({
+          _id: 1,
+          creatorId: 1,
+          currentProfile: 1,
+          requestedProfile: 1,
+          supportNote: 1,
+          proofSummary: 1,
+          status: 1,
+          reviewedAt: 1,
+          createdAt: 1,
+        })
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .lean(),
+      Donation.find({ creatorId: user._id })
+        .select({
+          _id: 1,
+          amount: 1,
+          sender: 1,
+          alertDisplayName: 1,
+          sourceAccountName: 1,
+          sourceAccountNumber: 1,
+          sourceBankName: 1,
+          sourceSessionId: 1,
+          transactionReference: 1,
+          paystackReference: 1,
+          monnifyTransactionReference: 1,
+          monnifyPaymentReference: 1,
+          walletStatus: 1,
+          settlementStatus: 1,
+          creatorShare: 1,
+          date: 1,
+          createdAt: 1,
+        })
+        .sort({ date: -1 })
+        .limit(50)
+        .lean(),
       getRevenueTotals({ creatorId: user._id }),
     ])
 
