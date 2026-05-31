@@ -1482,6 +1482,8 @@ const userSchema = new mongoose.Schema(
   },
 )
 
+userSchema.index({ createdAt: -1 })
+
 const User = mongoose.model("User", userSchema)
 
 function splitNamePartsFromFullName(name) {
@@ -4167,6 +4169,34 @@ function sanitizePrivilegedUser(user) {
       bvn: resolveIdentityNumber("bvn"),
       nin: resolveIdentityNumber("nin"),
     },
+  }
+}
+
+function sanitizeAdminUserListItem(user) {
+  if (!user) return null
+
+  const nameParts = getUserNameParts(user)
+  const displayName = buildFullNameFromParts(nameParts, user.name || user.email || "Creator")
+  const identity = user?.identity && typeof user.identity === "object" ? user.identity : {}
+  const bvn = String(identity?.bvn || identity?.submittedBvn || user?.submittedBvn || "").trim()
+  const nin = String(identity?.nin || identity?.submittedNin || user?.submittedNin || "").trim()
+
+  return {
+    id: user._id,
+    name: displayName,
+    firstName: nameParts.firstName,
+    middleName: nameParts.middleName,
+    lastName: nameParts.lastName,
+    email: user.email || "",
+    role: user.role || "creator",
+    status: user.status || "active",
+    identity: {
+      hasBvn: Boolean(bvn),
+      hasNin: Boolean(nin),
+      bvnLast4: bvn ? bvn.slice(-4) : "",
+      ninLast4: nin ? nin.slice(-4) : "",
+    },
+    createdAt: user.createdAt || "",
   }
 }
 
@@ -8308,6 +8338,11 @@ async function getRevenueTotals({ creatorId } = {}) {
               $cond: [{ $ne: [walletStatusExpr, "rejected"] }, platformSettledExpr, 0],
             },
           },
+          platformRevenueAllTime: {
+            $sum: {
+              $cond: [{ $ne: [walletStatusExpr, "rejected"] }, platformFeeExpr, 0],
+            },
+          },
           creatorRevenue: {
             $sum: {
               $cond: [{ $ne: [walletStatusExpr, "rejected"] }, creatorSettledExpr, 0],
@@ -8358,6 +8393,7 @@ async function getRevenueTotals({ creatorId } = {}) {
   const grossRevenue = Number(donationSummary.grossRevenue || 0)
   const pendingCreatorRevenue = Number(donationSummary.pendingCreatorRevenue || 0)
   const platformRevenue = Number(donationSummary.platformRevenue || 0)
+  const platformRevenueAllTime = Number(donationSummary.platformRevenueAllTime || 0)
   const creatorRevenue = Number(donationSummary.creatorRevenue || 0)
   const directSplitCreatorRevenue = Number(donationSummary.directSplitCreatorRevenue || 0)
   const totalPaidOut = Number(payoutSummary.totalPaidOut || 0)
@@ -8366,6 +8402,7 @@ async function getRevenueTotals({ creatorId } = {}) {
   return {
     grossRevenue,
     platformRevenue,
+    platformRevenueAllTime,
     creatorRevenue,
     directSplitCreatorRevenue,
     pendingCreatorRevenue,
@@ -12211,7 +12248,8 @@ app.get("/admin/overview", requireAdminSession, async (req, res) => {
         totalDonations,
         totalPayouts,
         grossRevenue: revenueTotals.grossRevenue,
-        platformRevenue: revenueTotals.platformRevenue,
+        platformRevenue: revenueTotals.platformRevenueAllTime,
+        settledPlatformRevenue: revenueTotals.platformRevenue,
         creatorRevenue: revenueTotals.creatorRevenue,
         creatorAvailableBalance: revenueTotals.creatorAvailableBalance,
         totalPaidOut: revenueTotals.totalPaidOut,
@@ -12236,6 +12274,211 @@ app.get("/admin/overview", requireAdminSession, async (req, res) => {
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to load admin overview." })
+  }
+})
+
+app.get("/admin/platform-revenue", requireAdminSession, async (req, res) => {
+  try {
+    const page = parsePositiveInteger(req.query.page, 1)
+    const limit = Math.min(parsePositiveInteger(req.query.limit, 25), 100)
+    const skip = (page - 1) * limit
+    const queryText = String(req.query.q || "").trim()
+    const dateFromRaw = String(req.query.dateFrom || "").trim()
+    const dateToRaw = String(req.query.dateTo || "").trim()
+
+    const normalizedDateFrom = dateFromRaw ? normalizeDateOnly(dateFromRaw) : ""
+    const normalizedDateTo = dateToRaw ? normalizeDateOnly(dateToRaw) : ""
+
+    if (dateFromRaw && !normalizedDateFrom) {
+      return res.status(400).json({ error: "dateFrom must use YYYY-MM-DD format." })
+    }
+    if (dateToRaw && !normalizedDateTo) {
+      return res.status(400).json({ error: "dateTo must use YYYY-MM-DD format." })
+    }
+
+    const fromDate = normalizedDateFrom ? new Date(`${normalizedDateFrom}T00:00:00.000Z`) : null
+    const toDate = normalizedDateTo ? new Date(`${normalizedDateTo}T23:59:59.999Z`) : null
+
+    if (fromDate && toDate && fromDate.getTime() > toDate.getTime()) {
+      return res.status(400).json({ error: "dateFrom cannot be later than dateTo." })
+    }
+
+    const andFilters = [{ walletStatus: { $ne: "rejected" } }]
+    if (fromDate || toDate) {
+      const range = {}
+      if (fromDate) range.$gte = fromDate
+      if (toDate) range.$lte = toDate
+      andFilters.push({
+        $or: [
+          { date: range },
+          { $and: [{ $or: [{ date: null }, { date: { $exists: false } }] }, { createdAt: range }] },
+        ],
+      })
+    }
+
+    if (queryText) {
+      const queryRegex = new RegExp(escapeRegex(queryText), "i")
+      const matchingCreators = await User.find({
+        $or: [
+          { email: { $regex: queryRegex } },
+          { name: { $regex: queryRegex } },
+          { firstName: { $regex: queryRegex } },
+          { middleName: { $regex: queryRegex } },
+          { lastName: { $regex: queryRegex } },
+        ],
+      })
+        .select({ _id: 1 })
+        .limit(3000)
+        .lean()
+      const creatorIds = matchingCreators.map((item) => item._id)
+
+      andFilters.push({
+        $or: [
+          { sender: { $regex: queryRegex } },
+          { alertDisplayName: { $regex: queryRegex } },
+          { transactionReference: { $regex: queryRegex } },
+          { paystackReference: { $regex: queryRegex } },
+          { monnifyTransactionReference: { $regex: queryRegex } },
+          { monnifyPaymentReference: { $regex: queryRegex } },
+          ...(creatorIds.length ? [{ creatorId: { $in: creatorIds } }] : []),
+        ],
+      })
+    }
+
+    const donationFilter = andFilters.length === 1 ? andFilters[0] : { $and: andFilters }
+    const amountExpr = { $ifNull: ["$amount", 0] }
+    const roundedPlatformFeeExpr = {
+      $floor: {
+        $add: [{ $multiply: [amountExpr, PLATFORM_FEE_RATE] }, 0.5],
+      },
+    }
+    const platformFeeExpr = {
+      $ifNull: ["$platformFee", roundedPlatformFeeExpr],
+    }
+
+    const [total, donations, filteredTotalsResult, revenueTotals] = await Promise.all([
+      Donation.countDocuments(donationFilter),
+      Donation.find(donationFilter)
+        .select({
+          _id: 1,
+          creatorId: 1,
+          sender: 1,
+          alertDisplayName: 1,
+          amount: 1,
+          platformFee: 1,
+          transactionReference: 1,
+          paystackReference: 1,
+          monnifyTransactionReference: 1,
+          monnifyPaymentReference: 1,
+          provider: 1,
+          paymentStatus: 1,
+          walletStatus: 1,
+          settlementStatus: 1,
+          date: 1,
+          createdAt: 1,
+        })
+        .sort({ date: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Donation.aggregate([
+        { $match: donationFilter },
+        {
+          $group: {
+            _id: null,
+            grossRevenue: { $sum: amountExpr },
+            platformRevenue: { $sum: platformFeeExpr },
+          },
+        },
+      ]),
+      getRevenueTotals(),
+    ])
+
+    const creatorIds = Array.from(
+      new Set(
+        donations
+          .map((donation) => String(donation?.creatorId || "").trim())
+          .filter((value) => value && mongoose.Types.ObjectId.isValid(value)),
+      ),
+    ).map((id) => new mongoose.Types.ObjectId(id))
+    const creators = creatorIds.length
+      ? await User.find({ _id: { $in: creatorIds } })
+          .select({ _id: 1, name: 1, firstName: 1, middleName: 1, lastName: 1, email: 1 })
+          .lean()
+      : []
+    const creatorsById = new Map(
+      creators.map((creator) => {
+        const nameParts = getUserNameParts(creator)
+        return [
+          String(creator._id),
+          {
+            name: buildFullNameFromParts(nameParts, creator.name || creator.email || "Creator"),
+            email: creator.email || "",
+          },
+        ]
+      }),
+    )
+
+    const records = donations.map((donation) => {
+      const creator = creatorsById.get(String(donation.creatorId || "")) || { name: "Creator", email: "" }
+      const amount = Number(donation?.amount || 0)
+      const platformFee =
+        typeof donation?.platformFee === "number"
+          ? donation.platformFee
+          : Math.max(0, Math.floor(amount * PLATFORM_FEE_RATE + 0.5))
+
+      return {
+        id: String(donation?._id || ""),
+        donationId: String(donation?._id || ""),
+        creatorId: String(donation?.creatorId || ""),
+        creatorName: creator.name,
+        creatorEmail: creator.email,
+        sender: donation?.sender || donation?.alertDisplayName || "Anonymous",
+        amount,
+        platformFee,
+        provider:
+          donation?.provider ||
+          (String(donation?.monnifyTransactionReference || donation?.monnifyPaymentReference || "").trim()
+            ? "monnify"
+            : String(donation?.paystackReference || "").trim()
+              ? "paystack"
+              : ""),
+        paymentStatus: donation?.paymentStatus || "",
+        walletStatus: donation?.walletStatus || "available",
+        settlementStatus: donation?.settlementStatus || "",
+        transactionReference:
+          donation?.transactionReference ||
+          donation?.paystackReference ||
+          donation?.monnifyTransactionReference ||
+          donation?.monnifyPaymentReference ||
+          "",
+        date: donation?.date || donation?.createdAt || "",
+        createdAt: donation?.date || donation?.createdAt || "",
+      }
+    })
+
+    const filteredTotals = filteredTotalsResult[0] || {}
+
+    res.json({
+      records,
+      pagination: getPaginationMeta({ page, limit, total }),
+      filters: {
+        q: queryText,
+        dateFrom: normalizedDateFrom || "",
+        dateTo: normalizedDateTo || "",
+      },
+      totals: {
+        filteredGrossRevenue: Number(filteredTotals.grossRevenue || 0),
+        filteredPlatformRevenue: Number(filteredTotals.platformRevenue || 0),
+        allTimePlatformRevenue: Number(revenueTotals.platformRevenueAllTime || 0),
+        settledPlatformRevenue: Number(revenueTotals.platformRevenue || 0),
+        pendingPlatformRevenue: Number(revenueTotals.pendingPlatformRevenue || 0),
+        totalPlatformWithdrawn: Number(revenueTotals.totalPlatformWithdrawn || 0),
+      },
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load platform revenue." })
   }
 })
 
@@ -14004,18 +14247,7 @@ app.get("/admin/users", requireAdminSession, async (req, res) => {
           email: 1,
           role: 1,
           status: 1,
-          profileImage: 1,
-          phoneNumber: 1,
-          phoneVerified: 1,
-          onboardingTourCompleted: 1,
-          onboardingTourCompletedAt: 1,
-          kycTier: 1,
-          kycStatus: 1,
-          wallet: 1,
           identity: 1,
-          identityVerification: 1,
-          payoutProfile: 1,
-          virtualAccount: 1,
           createdAt: 1,
         })
         .sort({ createdAt: -1 })
@@ -14025,12 +14257,50 @@ app.get("/admin/users", requireAdminSession, async (req, res) => {
     ])
 
     res.json({
-      users: users.map(sanitizePrivilegedUser),
+      users: users.map(sanitizeAdminUserListItem),
       pagination: getPaginationMeta({ page, limit, total }),
     })
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to load users." })
+  }
+})
+
+app.get("/admin/users/:id", requireAdminSession, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id).select({
+      _id: 1,
+      name: 1,
+      firstName: 1,
+      middleName: 1,
+      lastName: 1,
+      email: 1,
+      role: 1,
+      status: 1,
+      profileImage: 1,
+      phoneNumber: 1,
+      phoneVerified: 1,
+      onboardingTourCompleted: 1,
+      onboardingTourCompletedAt: 1,
+      kycTier: 1,
+      kycStatus: 1,
+      wallet: 1,
+      identity: 1,
+      identityVerification: 1,
+      payoutProfile: 1,
+      virtualAccount: 1,
+      accountNotifications: 1,
+      createdAt: 1,
+    })
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found." })
+    }
+
+    res.json({ user: sanitizePrivilegedUser(user) })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load user." })
   }
 })
 
