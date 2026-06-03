@@ -9325,6 +9325,8 @@ function buildOverlayAlertPayload(donation) {
       : "available"
 
   return {
+    id: donation._id?.toString?.() || String(donation._id || donation.transactionReference || ""),
+    _id: donation._id?.toString?.() || String(donation._id || donation.transactionReference || ""),
     streamerId: donation.creatorId?.toString?.() || String(donation.creatorId || ""),
     amount: Number(donation.amount) || 0,
     displayName: donation.alertDisplayName || donation.sender || "Someone sent you a tip",
@@ -9337,6 +9339,8 @@ function buildOverlayAlertPayload(donation) {
       donation.monnifyPaymentReference ||
       "",
     status: alertStatus,
+    date: donation.date || donation.createdAt || new Date(),
+    createdAt: donation.date || donation.createdAt || new Date(),
   }
 }
 
@@ -14350,6 +14354,93 @@ app.post("/portal/payouts/:id/cancel", requireAdminSession, async (req, res) => 
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to cancel payout." })
+  }
+})
+
+app.post("/admin/send-animation", requireAdminSession, async (req, res) => {
+  try {
+    const creatorId = String(req.body?.creatorId || "").trim()
+    const displayName = String(req.body?.displayName || "").trim()
+    const amount = Number(String(req.body?.amount || "").replace(/,/g, ""))
+    const message = String(req.body?.message || "").trim()
+
+    if (!mongoose.Types.ObjectId.isValid(creatorId)) {
+      return res.status(400).json({ error: "Select a valid streamer account." })
+    }
+
+    if (!displayName) {
+      return res.status(400).json({ error: "Enter the name to show on the animation." })
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: "Enter a valid animation amount." })
+    }
+
+    const creator = await User.findById(creatorId).select({
+      _id: 1,
+      name: 1,
+      firstName: 1,
+      middleName: 1,
+      lastName: 1,
+      email: 1,
+      status: 1,
+      role: 1,
+    })
+
+    if (!creator) {
+      return res.status(404).json({ error: "Streamer account not found." })
+    }
+
+    if (String(creator.status || "active") !== "active") {
+      return res.status(409).json({ error: "Animations can only be sent to active streamer accounts." })
+    }
+
+    const now = new Date()
+    const reference = `ADMIN-ANIMATION-${crypto.randomUUID()}`
+    const alertPayload = buildOverlayAlertPayload({
+      _id: reference,
+      creatorId: creator._id,
+      amount,
+      alertDisplayName: displayName.slice(0, 80),
+      sender: displayName.slice(0, 80),
+      alertMessage: message.slice(0, 240),
+      narration: message.slice(0, 240),
+      transactionReference: reference,
+      walletStatus: "available",
+      date: now,
+      createdAt: now,
+    })
+    const roomName = getCreatorRoom(creator._id)
+    const connectedClients = Number(io.sockets.adapter.rooms.get(roomName)?.size || 0)
+
+    io.to(roomName).emit("overlayAlert", {
+      ...alertPayload,
+      manual: true,
+    })
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "admin.overlay_animation.sent",
+      message: `Admin sent a manual overlay animation to ${creator.email}.`,
+      metadata: {
+        creatorId: creator._id.toString(),
+        creatorEmail: creator.email,
+        displayName: displayName.slice(0, 80),
+        amount,
+        connectedClients,
+      },
+    })
+
+    res.json({
+      success: true,
+      connectedClients,
+      animation: alertPayload,
+      creator: sanitizeAdminUserListItem(creator),
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to send overlay animation." })
   }
 })
 
