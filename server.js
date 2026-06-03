@@ -1502,6 +1502,18 @@ const userSchema = new mongoose.Schema(
       settings: { type: mongoose.Schema.Types.Mixed, default: defaultOverlaySettings },
       customization: { type: mongoose.Schema.Types.Mixed, default: defaultOverlayCustomization },
       customGifts: { type: mongoose.Schema.Types.Mixed, default: defaultCustomGifts },
+      manualLeaderboardEntries: {
+        type: [
+          {
+            id: String,
+            name: String,
+            amount: Number,
+            message: String,
+            createdAt: Date,
+          },
+        ],
+        default: [],
+      },
       leaderboardResetAt: Date,
       updatedAt: Date,
     },
@@ -3294,6 +3306,48 @@ function sanitizeOverlayCustomizationForServer(value) {
   }
 }
 
+function sanitizeManualLeaderboardEntry(value) {
+  if (!value || typeof value !== "object") {
+    return null
+  }
+
+  const id = String(value.id || value._id || "").trim()
+  const name = String(value.name || value.senderName || value.sender || "").trim().slice(0, 80)
+  const amount = Number(value.amount)
+  const message = String(value.message || "").trim().slice(0, 240)
+  const createdAt = value.createdAt ? new Date(value.createdAt) : new Date()
+
+  if (!name || !Number.isFinite(amount) || amount <= 0 || Number.isNaN(createdAt.getTime())) {
+    return null
+  }
+
+  return {
+    id: id || `manual-${createdAt.getTime()}-${name}`,
+    name,
+    amount,
+    message,
+    createdAt,
+  }
+}
+
+function getManualLeaderboardEntriesForOverlay(overlayState) {
+  const leaderboardResetAt = normalizeLeaderboardResetAt(overlayState?.leaderboardResetAt)
+
+  return (Array.isArray(overlayState?.manualLeaderboardEntries)
+    ? overlayState.manualLeaderboardEntries
+    : []
+  )
+    .map(sanitizeManualLeaderboardEntry)
+    .filter(Boolean)
+    .filter((entry) => !leaderboardResetAt || entry.createdAt >= leaderboardResetAt)
+    .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())
+    .slice(0, 100)
+    .map((entry) => ({
+      ...entry,
+      createdAt: entry.createdAt.toISOString(),
+    }))
+}
+
 function getOverlayStateForUser(user) {
   const overlayState = user?.overlayState || {}
 
@@ -3303,6 +3357,7 @@ function getOverlayStateForUser(user) {
     customGifts: Array.isArray(overlayState.customGifts) && overlayState.customGifts.length
       ? overlayState.customGifts
       : defaultCustomGifts,
+    manualLeaderboardEntries: getManualLeaderboardEntriesForOverlay(overlayState),
     leaderboardResetAt: overlayState.leaderboardResetAt
       ? new Date(overlayState.leaderboardResetAt).toISOString()
       : "",
@@ -11435,6 +11490,7 @@ app.put("/overlay-state", requireSessionUser, async (req, res) => {
         ? sanitizeOverlayCustomizationForServer(req.body.customization)
         : currentState.customization,
       customGifts: nextCustomGifts,
+      manualLeaderboardEntries: currentState.manualLeaderboardEntries,
       leaderboardResetAt: normalizeLeaderboardResetAt(
         typeof req.body?.leaderboardResetAt === "string" && req.body.leaderboardResetAt
           ? req.body.leaderboardResetAt
@@ -14468,6 +14524,7 @@ app.post("/admin/send-animation", requireAdminSession, async (req, res) => {
       email: 1,
       status: 1,
       role: 1,
+      overlayState: 1,
     })
 
     if (!creator) {
@@ -14479,59 +14536,86 @@ app.post("/admin/send-animation", requireAdminSession, async (req, res) => {
     }
 
     const now = new Date()
-    const reference = `ADMIN-ANIMATION-${crypto.randomUUID()}`
-    const alertPayload = buildOverlayAlertPayload({
-      _id: reference,
+    const reference = `ADMIN-DONATION-${crypto.randomUUID()}`
+    const donation = await Donation.create({
       creatorId: creator._id,
-      amount,
-      alertDisplayName: displayName.slice(0, 80),
+      creatorEmail: creator.email,
       sender: displayName.slice(0, 80),
+      senderNameSource: "admin_manual_donation",
+      amount,
+      platformFee: 0,
+      creatorShare: amount,
+      eventType: "admin.manual_donation",
+      paymentStatus: "MANUAL_ADMIN",
+      paymentMethod: "admin_manual",
+      currency: "NGN",
+      paidOn: now,
+      provider: "manual_admin",
+      transactionReference: reference,
+      alertDisplayName: displayName.slice(0, 80),
       alertMessage: message.slice(0, 240),
       narration: message.slice(0, 240),
-      transactionReference: reference,
       walletStatus: "available",
+      fundsFlow: "wallet",
+      creatorSettledAmount: amount,
+      platformSettledAmount: 0,
+      settlementPendingAmount: 0,
+      settlementStatus: "settled",
+      creditedToWalletAt: now,
       date: now,
-      createdAt: now,
     })
+
+    await User.updateOne(
+      { _id: creator._id },
+      {
+        $inc: {
+          "wallet.availableBalance": amount,
+          "wallet.totalReceived": amount,
+        },
+        $set: { "wallet.updatedAt": now },
+      },
+    )
+    await WalletTransaction.create({
+      creatorId: creator._id,
+      donationId: donation._id,
+      type: "credit",
+      amount,
+      grossAmount: amount,
+      platformFee: 0,
+      provider: "manual_admin",
+      providerReference: reference,
+      status: "available",
+      metadata: {
+        paymentStatus: "MANUAL_ADMIN",
+        source: "admin_send_animation",
+        displayName: displayName.slice(0, 80),
+        message: message.slice(0, 240),
+      },
+    })
+
+    donation.creditedToWalletAt = now
+    await donation.save()
+
     const roomName = getCreatorRoom(creator._id)
     const connectedClients = Number(io.sockets.adapter.rooms.get(roomName)?.size || 0)
-    const manualDonationPayload = {
-      _id: reference,
-      id: reference,
-      creatorId: creator._id,
-      amount,
-      creatorShare: amount,
-      provider: "manual_admin",
-      walletStatus: "available",
-      fundsFlow: "manual_animation",
-      paymentStatus: "COMPLETED",
-      transactionReference: reference,
-      date: now,
-      createdAt: now,
-      senderName: displayName.slice(0, 80),
-      sender: displayName.slice(0, 80),
-      senderNameSource: "admin_manual_animation",
-      message: message.slice(0, 240),
-      status: "available",
-      manual: true,
-    }
+    const alertPayload = buildOverlayAlertPayload(donation)
 
-    io.to(roomName).emit("newDonation", manualDonationPayload)
-    io.to(roomName).emit("overlayAlert", {
-      ...alertPayload,
-      manual: true,
-    })
+    emitDonationAlert(creator._id, donation)
 
     await createAuditLog({
       actorType: "admin",
       actorId: req.adminSession._id.toString(),
-      eventType: "admin.overlay_animation.sent",
-      message: `Admin sent a manual overlay animation to ${creator.email}.`,
+      eventType: "admin.manual_donation.created",
+      message: `Admin created a manual donation credit for ${creator.email}.`,
       metadata: {
         creatorId: creator._id.toString(),
         creatorEmail: creator.email,
         displayName: displayName.slice(0, 80),
         amount,
+        creditedAmount: amount,
+        platformFee: 0,
+        donationId: donation._id.toString(),
+        transactionReference: reference,
         connectedClients,
       },
     })
@@ -14540,6 +14624,7 @@ app.post("/admin/send-animation", requireAdminSession, async (req, res) => {
       success: true,
       connectedClients,
       animation: alertPayload,
+      donation: sanitizeCreatorDonation(donation),
       creator: sanitizeAdminUserListItem(creator),
     })
   } catch (error) {
