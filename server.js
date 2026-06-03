@@ -1360,6 +1360,15 @@ const userSchema = new mongoose.Schema(
       ],
       default: [],
     },
+    globalNotificationAcknowledgements: {
+      type: [
+        {
+          id: { type: String, default: "" },
+          readAt: { type: Date, default: Date.now },
+        },
+      ],
+      default: [],
+    },
     manualReviewStatus: {
       type: String,
       enum: ["not_required", "pending", "approved", "rejected"],
@@ -4120,7 +4129,7 @@ function sanitizeUser(user) {
 
   const nameParts = getUserNameParts(user)
   const displayName = buildFullNameFromParts(nameParts, user.name || user.email || "Creator")
-  const accountNotifications = Array.isArray(user.accountNotifications) ? user.accountNotifications : []
+  const accountNotifications = getAccountNotificationsForUser(user)
   const unreadNotifications = accountNotifications.filter((item) => !item?.readAt).length
 
   return {
@@ -5457,6 +5466,77 @@ function appendUserNotification(user, notification) {
   const next = createAccountNotification(notification)
   const existing = Array.isArray(user.accountNotifications) ? user.accountNotifications : []
   user.accountNotifications = [next, ...existing].slice(0, 150)
+}
+
+const GLOBAL_ACCOUNT_NOTIFICATIONS = [
+  {
+    id: "platform-update-creator-settlement-provider-fee-2026-06-03",
+    type: "platform_update",
+    title: "Important Update on Creator Settlements",
+    message:
+      "Creator settlements are processed automatically through our payment provider. Please note that a payment provider processing/transfer charge may be deducted during settlement before funds reflect in your bank account. This is a third-party payment processing charge and not an extra platform commission.",
+    metadata: {
+      global: true,
+      requiresPopup: true,
+      announcementKey: "creator-settlement-provider-fee",
+    },
+    createdAt: new Date("2026-06-03T00:00:00.000Z"),
+  },
+]
+
+function getGlobalNotificationAcknowledgement(user, notificationId) {
+  const acknowledgements = Array.isArray(user?.globalNotificationAcknowledgements)
+    ? user.globalNotificationAcknowledgements
+    : []
+
+  return acknowledgements.find((item) => String(item?.id || "") === notificationId) || null
+}
+
+function getGlobalAccountNotificationsForUser(user) {
+  return GLOBAL_ACCOUNT_NOTIFICATIONS.map((notification) => {
+    const acknowledgement = getGlobalNotificationAcknowledgement(user, notification.id)
+
+    return {
+      ...notification,
+      readAt: acknowledgement?.readAt || "",
+    }
+  })
+}
+
+function getAccountNotificationsForUser(user) {
+  return [
+    ...getGlobalAccountNotificationsForUser(user),
+    ...(Array.isArray(user?.accountNotifications) ? user.accountNotifications : []),
+  ]
+    .slice()
+    .sort((left, right) => {
+      const leftTime = new Date(left?.createdAt || 0).getTime()
+      const rightTime = new Date(right?.createdAt || 0).getTime()
+      return rightTime - leftTime
+    })
+}
+
+function markGlobalNotificationAcknowledged(user, notificationId, readAt = new Date()) {
+  if (!user || !GLOBAL_ACCOUNT_NOTIFICATIONS.some((item) => item.id === notificationId)) {
+    return false
+  }
+
+  const acknowledgements = Array.isArray(user.globalNotificationAcknowledgements)
+    ? user.globalNotificationAcknowledgements
+    : []
+  const existing = acknowledgements.find((item) => String(item?.id || "") === notificationId)
+
+  if (existing) {
+    existing.readAt = existing.readAt || readAt
+  } else {
+    acknowledgements.push({
+      id: notificationId,
+      readAt,
+    })
+  }
+
+  user.globalNotificationAcknowledgements = acknowledgements
+  return true
 }
 
 function sanitizeAccountNotification(notification) {
@@ -11710,13 +11790,7 @@ app.get("/user", requireSessionUser, async (req, res) => {
 
 app.get("/notifications", requireSessionUser, async (req, res) => {
   try {
-    const notifications = (Array.isArray(req.user.accountNotifications) ? req.user.accountNotifications : [])
-      .slice()
-      .sort((left, right) => {
-        const leftTime = new Date(left?.createdAt || 0).getTime()
-        const rightTime = new Date(right?.createdAt || 0).getTime()
-        return rightTime - leftTime
-      })
+    const notifications = getAccountNotificationsForUser(req.user)
       .slice(0, 100)
       .map(sanitizeAccountNotification)
 
@@ -11733,6 +11807,10 @@ app.get("/notifications", requireSessionUser, async (req, res) => {
 app.post("/notifications/read-all", requireSessionUser, async (req, res) => {
   try {
     const now = new Date()
+    GLOBAL_ACCOUNT_NOTIFICATIONS.forEach((notification) => {
+      markGlobalNotificationAcknowledged(req.user, notification.id, now)
+    })
+
     const notifications = Array.isArray(req.user.accountNotifications) ? req.user.accountNotifications : []
     req.user.accountNotifications = notifications.map((item) =>
       item?.readAt
@@ -11743,9 +11821,12 @@ app.post("/notifications/read-all", requireSessionUser, async (req, res) => {
           },
     )
     await req.user.save()
+    const serialized = getAccountNotificationsForUser(req.user)
+      .slice(0, 100)
+      .map(sanitizeAccountNotification)
 
     return res.json({
-      notifications: req.user.accountNotifications.map(sanitizeAccountNotification),
+      notifications: serialized,
       unreadCount: 0,
     })
   } catch (error) {
@@ -11762,7 +11843,7 @@ app.post("/notifications/:id/read", requireSessionUser, async (req, res) => {
     }
 
     const notifications = Array.isArray(req.user.accountNotifications) ? req.user.accountNotifications : []
-    let matched = false
+    let matched = markGlobalNotificationAcknowledged(req.user, notificationId)
 
     req.user.accountNotifications = notifications.map((item) => {
       if (String(item?.id || "") !== notificationId) {
@@ -11780,7 +11861,9 @@ app.post("/notifications/:id/read", requireSessionUser, async (req, res) => {
     }
 
     await req.user.save()
-    const serialized = req.user.accountNotifications.map(sanitizeAccountNotification)
+    const serialized = getAccountNotificationsForUser(req.user)
+      .slice(0, 100)
+      .map(sanitizeAccountNotification)
     return res.json({
       notifications: serialized,
       unreadCount: serialized.filter((item) => !item?.readAt).length,
