@@ -14495,7 +14495,28 @@ app.post("/admin/send-animation", requireAdminSession, async (req, res) => {
     })
     const roomName = getCreatorRoom(creator._id)
     const connectedClients = Number(io.sockets.adapter.rooms.get(roomName)?.size || 0)
+    const manualDonationPayload = {
+      _id: reference,
+      id: reference,
+      creatorId: creator._id,
+      amount,
+      creatorShare: amount,
+      provider: "manual_admin",
+      walletStatus: "available",
+      fundsFlow: "manual_animation",
+      paymentStatus: "COMPLETED",
+      transactionReference: reference,
+      date: now,
+      createdAt: now,
+      senderName: displayName.slice(0, 80),
+      sender: displayName.slice(0, 80),
+      senderNameSource: "admin_manual_animation",
+      message: message.slice(0, 240),
+      status: "available",
+      manual: true,
+    }
 
+    io.to(roomName).emit("newDonation", manualDonationPayload)
     io.to(roomName).emit("overlayAlert", {
       ...alertPayload,
       manual: true,
