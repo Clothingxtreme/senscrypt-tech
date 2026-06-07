@@ -88,6 +88,13 @@ const TELEGRAM_BOT_TOKEN = readEnv("TELEGRAM_BOT_TOKEN")
 const TELEGRAM_WITHDRAWAL_CHAT_ID =
   readEnv("TELEGRAM_WITHDRAWAL_CHAT_ID") || readEnv("TELEGRAM_CHAT_ID")
 const PORTAL_URL = readEnv("PORTAL_URL") || "https://portal.streamtips.live"
+const API_PUBLIC_BASE_URL = readEnv("API_PUBLIC_BASE_URL") || "https://api.streamtips.live"
+const KYC_DOCUMENT_SIGNING_SECRET =
+  readEnv("KYC_DOCUMENT_SIGNING_SECRET") || IDENTITY_ENCRYPTION_KEY || ADMIN_PASSWORD
+const KYC_DOCUMENT_SIGNED_URL_TTL_SECONDS = Math.max(
+  60,
+  Math.min(3600, Number(readEnv("KYC_DOCUMENT_SIGNED_URL_TTL_SECONDS") || 15 * 60)),
+)
 const SMTP_HOST = readEnv("SMTP_HOST")
 const SMTP_PORT = Number(readEnv("SMTP_PORT") || 587)
 const SMTP_SECURE = /^(1|true|yes)$/i.test(readEnv("SMTP_SECURE"))
@@ -217,6 +224,11 @@ if (missingRequiredEnv.length > 0) {
 if (!IDENTITY_ENCRYPTION_KEY) {
   console.warn(
     "IDENTITY_ENCRYPTION_KEY is not set. BVN/NIN values can still be read, but new identity values will not be encrypted at rest.",
+  )
+}
+if (!readEnv("KYC_DOCUMENT_SIGNING_SECRET")) {
+  console.warn(
+    "KYC_DOCUMENT_SIGNING_SECRET is not set. KYC document links will fall back to another server secret; set a dedicated strong secret in production.",
   )
 }
 
@@ -482,37 +494,101 @@ function getPublicRequestBaseUrl(req) {
   return `${protocol}://${host}`
 }
 
-function getPortalRequestBaseUrl() {
-  const configuredPortalUrl = String(PORTAL_URL || "").trim()
-  if (configuredPortalUrl) {
-    return configuredPortalUrl.replace(/\/+$/, "")
-  }
-
-  return "https://portal.streamtips.live"
+function getApiPublicBaseUrl() {
+  return String(API_PUBLIC_BASE_URL || "https://api.streamtips.live").trim().replace(/\/+$/, "")
 }
 
-function getKycDocumentPortalUrl(fileName) {
+function safeDecodeUrlPathSegment(value) {
+  try {
+    return decodeURIComponent(String(value || ""))
+  } catch (_error) {
+    return String(value || "")
+  }
+}
+
+function getKycDocumentFileName(value) {
+  const rawValue = String(value || "").trim()
+  if (!rawValue) {
+    return ""
+  }
+
+  try {
+    const parsedUrl = new URL(rawValue)
+    return path.basename(safeDecodeUrlPathSegment(parsedUrl.pathname))
+  } catch (_error) {
+    const marker = "/uploads/kyc-docs/"
+    const markerIndex = rawValue.indexOf(marker)
+    const pathValue =
+      markerIndex >= 0 ? rawValue.slice(markerIndex + marker.length) : rawValue
+    return path.basename(safeDecodeUrlPathSegment(pathValue.split("?")[0] || ""))
+  }
+}
+
+function getKycDocumentApiUrl(fileName) {
   const safeFileName = path.basename(String(fileName || "").trim())
   if (!safeFileName) {
     return ""
   }
 
-  return `${getPortalRequestBaseUrl()}/uploads/kyc-docs/${encodeURIComponent(safeFileName)}`
+  return `${getApiPublicBaseUrl()}/uploads/kyc-docs/${encodeURIComponent(safeFileName)}`
 }
 
-function normalizeKycDocumentUrl(value) {
-  const url = String(value || "").trim()
-  if (!url) {
+function signKycDocumentUrl(fileName, expiresAt) {
+  const safeFileName = path.basename(String(fileName || "").trim())
+  const secret = String(KYC_DOCUMENT_SIGNING_SECRET || "").trim()
+  if (!safeFileName || !secret || !expiresAt) {
     return ""
   }
 
-  const marker = "/uploads/kyc-docs/"
-  const markerIndex = url.indexOf(marker)
-  if (markerIndex >= 0) {
-    return getKycDocumentPortalUrl(decodeURIComponent(url.slice(markerIndex + marker.length)))
+  return crypto
+    .createHmac("sha256", secret)
+    .update(`${safeFileName}.${expiresAt}`)
+    .digest("hex")
+}
+
+function getSignedKycDocumentUrl(value) {
+  const safeFileName = getKycDocumentFileName(value)
+  if (!safeFileName) {
+    return ""
   }
 
-  return getKycDocumentPortalUrl(url)
+  const expiresAt = Math.floor(Date.now() / 1000) + KYC_DOCUMENT_SIGNED_URL_TTL_SECONDS
+  const signature = signKycDocumentUrl(safeFileName, expiresAt)
+  if (!signature) {
+    return getKycDocumentApiUrl(safeFileName)
+  }
+
+  const params = new URLSearchParams({
+    exp: String(expiresAt),
+    sig: signature,
+  })
+
+  return `${getKycDocumentApiUrl(safeFileName)}?${params.toString()}`
+}
+
+function hasValidKycDocumentSignature(req, fileName) {
+  const safeFileName = path.basename(String(fileName || "").trim())
+  const expiresAt = Number(req.query.exp || 0)
+  const signature = String(req.query.sig || "").trim()
+  const expectedSignature = signKycDocumentUrl(safeFileName, expiresAt)
+
+  if (
+    !safeFileName ||
+    !expiresAt ||
+    !signature ||
+    !expectedSignature ||
+    expiresAt < Math.floor(Date.now() / 1000)
+  ) {
+    return false
+  }
+
+  const signatureBuffer = Buffer.from(signature, "hex")
+  const expectedBuffer = Buffer.from(expectedSignature, "hex")
+
+  return (
+    signatureBuffer.length === expectedBuffer.length &&
+    crypto.timingSafeEqual(signatureBuffer, expectedBuffer)
+  )
 }
 
 function getAudioUploadExtension(mimeType) {
@@ -647,7 +723,7 @@ function saveKycImageUpload({ req, dataUrl, filePrefix }) {
   const filePath = path.join(kycUploadsDir, fileName)
   fs.writeFileSync(filePath, parsed.buffer)
 
-  return getKycDocumentPortalUrl(fileName)
+  return getKycDocumentApiUrl(fileName)
 }
 
 async function normalizeCustomGiftSoundUploads(req, customGifts) {
@@ -713,17 +789,27 @@ app.use(
     threshold: 1024,
   }),
 )
-app.use("/uploads/gift-sounds", express.static(giftSoundsUploadDir))
-app.get("/uploads/kyc-docs/:fileName", requireAdminSession, (req, res) => {
-  const fileName = path.basename(String(req.params.fileName || ""))
-  const filePath = path.join(kycUploadsDir, fileName)
+function sendKycDocumentFile(res, fileName) {
+  const safeFileName = path.basename(String(fileName || ""))
+  const filePath = path.join(kycUploadsDir, safeFileName)
 
-  if (!fileName || !filePath.startsWith(kycUploadsDir) || !fs.existsSync(filePath)) {
+  if (!safeFileName || !filePath.startsWith(kycUploadsDir) || !fs.existsSync(filePath)) {
     return res.status(404).json({ error: "File not found." })
   }
 
   res.setHeader("Cache-Control", "private, no-store")
   return res.sendFile(filePath)
+}
+
+app.use("/uploads/gift-sounds", express.static(giftSoundsUploadDir))
+app.get("/uploads/kyc-docs/:fileName", (req, res, next) => {
+  const fileName = path.basename(String(req.params.fileName || ""))
+
+  if (hasValidKycDocumentSignature(req, fileName)) {
+    return sendKycDocumentFile(res, fileName)
+  }
+
+  return requireAdminSession(req, res, () => sendKycDocumentFile(res, fileName)).catch(next)
 })
 app.use(
   express.json({
@@ -3331,11 +3417,11 @@ function sanitizeKycUpgradeSubmission(request) {
     currentTier: Number(request.currentTier) || 1,
     targetTier: Number(request.targetTier) || 2,
     status: request.status || "awaiting_review",
-    governmentIdImageUrl: normalizeKycDocumentUrl(request.governmentIdImageUrl),
-    selfieImageUrl: normalizeKycDocumentUrl(request.selfieImageUrl),
+    governmentIdImageUrl: getSignedKycDocumentUrl(request.governmentIdImageUrl),
+    selfieImageUrl: getSignedKycDocumentUrl(request.selfieImageUrl),
     selfieEvidenceImageUrls: Array.isArray(request.selfieEvidenceImageUrls)
       ? request.selfieEvidenceImageUrls
-          .map(normalizeKycDocumentUrl)
+          .map(getSignedKycDocumentUrl)
           .filter(Boolean)
           .slice(0, 4)
       : [],
