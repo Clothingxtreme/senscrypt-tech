@@ -3,6 +3,9 @@ const http = require("http")
 const mongoose = require("mongoose")
 const cors = require("cors")
 const compression = require("compression")
+const helmet = require("helmet")
+const rateLimit = require("express-rate-limit")
+const hpp = require("hpp")
 const axios = require("axios")
 const crypto = require("crypto")
 const fs = require("fs")
@@ -63,6 +66,24 @@ const GOOGLE_CLIENT_ID = readEnv("GOOGLE_CLIENT_ID")
 const APPLE_CLIENT_ID = readEnv("APPLE_CLIENT_ID")
 const ADMIN_EMAIL = readEnv("ADMIN_EMAIL")
 const ADMIN_PASSWORD = readEnv("ADMIN_PASSWORD")
+const ADMIN_TOKEN_QUERY_FALLBACK_ENABLED = /^(1|true|yes)$/i.test(
+  readEnv("ADMIN_TOKEN_QUERY_FALLBACK_ENABLED"),
+)
+const SECURITY_RATE_LIMIT_ENABLED = !/^(0|false|no)$/i.test(readEnv("SECURITY_RATE_LIMIT_ENABLED"))
+const SECURITY_RATE_LIMIT_WINDOW_MS = Math.max(
+  60_000,
+  Number(readEnv("SECURITY_RATE_LIMIT_WINDOW_MS") || 15 * 60 * 1000),
+)
+const SECURITY_RATE_LIMIT_MAX = Math.max(100, Number(readEnv("SECURITY_RATE_LIMIT_MAX") || 1200))
+const AUTH_RATE_LIMIT_MAX = Math.max(3, Number(readEnv("AUTH_RATE_LIMIT_MAX") || 15))
+const ADMIN_AUTH_RATE_LIMIT_MAX = Math.max(3, Number(readEnv("ADMIN_AUTH_RATE_LIMIT_MAX") || 8))
+const SENSITIVE_ACTION_RATE_LIMIT_MAX = Math.max(
+  5,
+  Number(readEnv("SENSITIVE_ACTION_RATE_LIMIT_MAX") || 60),
+)
+const UPLOAD_RATE_LIMIT_MAX = Math.max(3, Number(readEnv("UPLOAD_RATE_LIMIT_MAX") || 25))
+const WEBHOOK_RATE_LIMIT_MAX = Math.max(60, Number(readEnv("WEBHOOK_RATE_LIMIT_MAX") || 600))
+const IDENTITY_ENCRYPTION_KEY = readEnv("IDENTITY_ENCRYPTION_KEY")
 const TELEGRAM_BOT_TOKEN = readEnv("TELEGRAM_BOT_TOKEN")
 const TELEGRAM_WITHDRAWAL_CHAT_ID =
   readEnv("TELEGRAM_WITHDRAWAL_CHAT_ID") || readEnv("TELEGRAM_CHAT_ID")
@@ -192,6 +213,11 @@ const MONITORING_HEARTBEAT_SECONDS = Math.max(
 const missingRequiredEnv = ["MONGODB_URI"].filter((key) => !process.env[key])
 if (missingRequiredEnv.length > 0) {
   console.error(`Missing required environment variables: ${missingRequiredEnv.join(", ")}`)
+}
+if (!IDENTITY_ENCRYPTION_KEY) {
+  console.warn(
+    "IDENTITY_ENCRYPTION_KEY is not set. BVN/NIN values can still be read, but new identity values will not be encrypted at rest.",
+  )
 }
 
 function parseAllowedOrigins(value) {
@@ -374,6 +400,61 @@ function getRequestIpAddresses(req) {
 
   return Array.from(new Set([...forwardedFor, ...directIps]))
 }
+
+function getPrimaryRequestIp(req) {
+  return getRequestIpAddresses(req)[0] || normalizeIpAddress(req.ip) || "unknown"
+}
+
+function createRateLimiter({ windowMs, max, message, skip } = {}) {
+  return rateLimit({
+    windowMs: Math.max(60_000, Number(windowMs || SECURITY_RATE_LIMIT_WINDOW_MS)),
+    max: Math.max(1, Number(max || SECURITY_RATE_LIMIT_MAX)),
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => rateLimit.ipKeyGenerator(getPrimaryRequestIp(req)),
+    skip: (req, res) => !SECURITY_RATE_LIMIT_ENABLED || Boolean(skip?.(req, res)),
+    handler: (_req, res) => {
+      res.status(429).json({
+        error: message || "Too many requests. Please slow down and try again shortly.",
+      })
+    },
+  })
+}
+
+const globalApiLimiter = createRateLimiter({
+  max: SECURITY_RATE_LIMIT_MAX,
+  message: "Too many requests from this network. Please try again shortly.",
+  skip: (req) =>
+    req.path === "/health" ||
+    req.path.startsWith("/uploads/gift-sounds/") ||
+    req.path.startsWith("/public/overlay/"),
+})
+
+const authLimiter = createRateLimiter({
+  max: AUTH_RATE_LIMIT_MAX,
+  message: "Too many login or registration attempts. Please wait before trying again.",
+})
+
+const adminAuthLimiter = createRateLimiter({
+  max: ADMIN_AUTH_RATE_LIMIT_MAX,
+  message: "Too many admin login attempts. Please wait before trying again.",
+})
+
+const sensitiveActionLimiter = createRateLimiter({
+  max: SENSITIVE_ACTION_RATE_LIMIT_MAX,
+  message: "Too many sensitive account actions. Please wait before trying again.",
+  skip: (req) => req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS",
+})
+
+const uploadLimiter = createRateLimiter({
+  max: UPLOAD_RATE_LIMIT_MAX,
+  message: "Too many uploads from this network. Please wait before trying again.",
+})
+
+const webhookLimiter = createRateLimiter({
+  max: WEBHOOK_RATE_LIMIT_MAX,
+  message: "Too many webhook requests from this network.",
+})
 
 function isWebhookIpAllowed(req) {
   if (monnifyWebhookIpAllowlist.length === 0) {
@@ -567,7 +648,15 @@ async function normalizeCustomGiftSoundUploads(req, customGifts) {
 }
 
 const app = express()
-app.set("trust proxy", true)
+app.set("trust proxy", Math.max(1, Number(readEnv("TRUST_PROXY_HOPS") || 1)))
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  }),
+)
+app.use(globalApiLimiter)
 
 const uploadsRoot = path.join(__dirname, "uploads")
 const giftSoundsUploadDir = path.join(uploadsRoot, "gift-sounds")
@@ -591,7 +680,18 @@ app.use(
     threshold: 1024,
   }),
 )
-app.use("/uploads", express.static(uploadsRoot))
+app.use("/uploads/gift-sounds", express.static(giftSoundsUploadDir))
+app.get("/uploads/kyc-docs/:fileName", requireAdminSession, (req, res) => {
+  const fileName = path.basename(String(req.params.fileName || ""))
+  const filePath = path.join(kycUploadsDir, fileName)
+
+  if (!fileName || !filePath.startsWith(kycUploadsDir) || !fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "File not found." })
+  }
+
+  res.setHeader("Cache-Control", "private, no-store")
+  return res.sendFile(filePath)
+})
 app.use(
   express.json({
     limit: "25mb",
@@ -599,6 +699,21 @@ app.use(
       req.rawBody = buffer.toString("utf8")
     },
   }),
+)
+app.use(hpp())
+app.use(
+  [
+    "/bank-account-name-enquiry",
+    "/admin/bank-account-name-enquiry",
+    "/payout-profile",
+    "/payout-profile/change-request",
+    "/payouts",
+    "/user",
+    "/kyc/upgrade-submission",
+    "/admin/users",
+    "/portal/users",
+  ],
+  sensitiveActionLimiter,
 )
 
 const server = http.createServer(app)
@@ -818,9 +933,54 @@ function clampMonitoringMessage(value, limit = 1600) {
   return text.length > limit ? `${text.slice(0, limit)}...` : text
 }
 
+function maskSensitiveDigits(value, visible = 4) {
+  const text = String(value || "").trim()
+  if (!text) return ""
+  const digits = text.replace(/\D/g, "")
+  if (digits.length <= visible) {
+    return "*".repeat(digits.length)
+  }
+  return `${"*".repeat(Math.max(4, digits.length - visible))}${digits.slice(-visible)}`
+}
+
+function redactSensitiveData(value, depth = 0) {
+  if (depth > 8) {
+    return "[REDACTED_DEPTH]"
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitiveData(item, depth + 1))
+  }
+
+  if (!value || typeof value !== "object") {
+    return value
+  }
+
+  return Object.entries(value).reduce((current, [key, item]) => {
+    const normalizedKey = String(key || "").toLowerCase()
+
+    if (
+      /(password|token|secret|authorization|credential|otp|bvn|nin|rawpayload|providerpayload)/i.test(
+        normalizedKey,
+      )
+    ) {
+      current[key] = "[REDACTED]"
+      return current
+    }
+
+    if (/(accountnumber|account_number|sessionid|session_id|reference)$/i.test(normalizedKey)) {
+      current[key] = maskSensitiveDigits(item)
+      return current
+    }
+
+    current[key] = redactSensitiveData(item, depth + 1)
+    return current
+  }, {})
+}
+
 function safeMonitoringJson(value, limit = 800) {
   try {
-    const serialized = JSON.stringify(value)
+    const serialized = JSON.stringify(redactSensitiveData(value))
     return clampMonitoringMessage(serialized, limit)
   } catch (_error) {
     return ""
@@ -2057,8 +2217,8 @@ function getIdentitySubjectFromUser(user, overrides = {}) {
   const parts = getUserNameParts(user)
 
   return getIdentitySubject({
-    bvn: overrides.bvn ?? user?.identity?.bvn,
-    nin: overrides.nin ?? user?.identity?.nin,
+    bvn: overrides.bvn ?? decryptIdentityValue(user?.identity?.bvn),
+    nin: overrides.nin ?? decryptIdentityValue(user?.identity?.nin),
     dateOfBirth: overrides.dateOfBirth ?? user?.identity?.dateOfBirth,
     phoneNumber: overrides.phoneNumber ?? user?.phoneNumber,
     firstName: overrides.firstName ?? parts.firstName,
@@ -2961,8 +3121,8 @@ function getDefaultWallet() {
 }
 
 function sanitizeIdentity(identity, fallbackParts = {}, options = {}) {
-  const bvn = String(identity?.bvn || "").trim()
-  const nin = String(identity?.nin || "").trim()
+  const bvn = decryptIdentityValue(identity?.bvn)
+  const nin = decryptIdentityValue(identity?.nin)
   const firstName = String(identity?.firstName || fallbackParts.firstName || "").trim()
   const middleName = String(identity?.middleName || fallbackParts.middleName || "").trim()
   const lastName = String(identity?.lastName || fallbackParts.lastName || "").trim()
@@ -2993,8 +3153,8 @@ function sanitizeIdentity(identity, fallbackParts = {}, options = {}) {
 
 function isDraftRegistrationUser(user) {
   return !(
-    String(user?.identity?.bvn || "").trim() &&
-    String(user?.identity?.nin || "").trim() &&
+    decryptIdentityValue(user?.identity?.bvn) &&
+    decryptIdentityValue(user?.identity?.nin) &&
     String(user?.identity?.dateOfBirth || "").trim() &&
     String(user?.identity?.firstName || user?.firstName || "").trim() &&
     String(user?.identity?.lastName || user?.lastName || "").trim() &&
@@ -4238,7 +4398,7 @@ function sanitizePrivilegedUser(user) {
     ]
 
     for (const candidate of candidates) {
-      const value = String(candidate || "").trim()
+      const value = decryptIdentityValue(candidate)
       if (value) return value
     }
 
@@ -4262,8 +4422,8 @@ function sanitizeAdminUserListItem(user) {
   const nameParts = getUserNameParts(user)
   const displayName = buildFullNameFromParts(nameParts, user.name || user.email || "Creator")
   const identity = user?.identity && typeof user.identity === "object" ? user.identity : {}
-  const bvn = String(identity?.bvn || identity?.submittedBvn || user?.submittedBvn || "").trim()
-  const nin = String(identity?.nin || identity?.submittedNin || user?.submittedNin || "").trim()
+  const bvn = decryptIdentityValue(identity?.bvn || identity?.submittedBvn || user?.submittedBvn || "")
+  const nin = decryptIdentityValue(identity?.nin || identity?.submittedNin || user?.submittedNin || "")
 
   return {
     id: user._id,
@@ -4290,8 +4450,8 @@ function sanitizePortalUserListItem(user) {
   const nameParts = getUserNameParts(user)
   const displayName = buildFullNameFromParts(nameParts, user.name || user.email || "Creator")
   const identity = user?.identity && typeof user.identity === "object" ? user.identity : {}
-  const bvn = String(identity?.bvn || identity?.submittedBvn || user?.submittedBvn || "").trim()
-  const nin = String(identity?.nin || identity?.submittedNin || user?.submittedNin || "").trim()
+  const bvn = decryptIdentityValue(identity?.bvn || identity?.submittedBvn || user?.submittedBvn || "")
+  const nin = decryptIdentityValue(identity?.nin || identity?.submittedNin || user?.submittedNin || "")
 
   return {
     id: user._id,
@@ -5253,6 +5413,79 @@ function generateSessionToken() {
   return crypto.randomBytes(32).toString("hex")
 }
 
+function getIdentityEncryptionKey() {
+  if (!IDENTITY_ENCRYPTION_KEY) {
+    return null
+  }
+
+  const raw = String(IDENTITY_ENCRYPTION_KEY).trim()
+  if (/^[a-f0-9]{64}$/i.test(raw)) {
+    return Buffer.from(raw, "hex")
+  }
+
+  return crypto.createHash("sha256").update(raw).digest()
+}
+
+function isEncryptedIdentityValue(value) {
+  return String(value || "").startsWith("enc:v1:")
+}
+
+function encryptIdentityValue(value) {
+  const plainText = String(value || "").trim()
+  if (!plainText || isEncryptedIdentityValue(plainText)) {
+    return plainText
+  }
+
+  const key = getIdentityEncryptionKey()
+  if (!key) {
+    return plainText
+  }
+
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv)
+  const encrypted = Buffer.concat([cipher.update(plainText, "utf8"), cipher.final()])
+  const tag = cipher.getAuthTag()
+
+  return [
+    "enc:v1",
+    iv.toString("base64url"),
+    tag.toString("base64url"),
+    encrypted.toString("base64url"),
+  ].join(":")
+}
+
+function decryptIdentityValue(value) {
+  const storedValue = String(value || "").trim()
+  if (!storedValue || !isEncryptedIdentityValue(storedValue)) {
+    return storedValue
+  }
+
+  const key = getIdentityEncryptionKey()
+  if (!key) {
+    return ""
+  }
+
+  try {
+    const [, version, ivText, tagText, encryptedText] = storedValue.split(":")
+    if (version !== "v1" || !ivText || !tagText || !encryptedText) {
+      return ""
+    }
+
+    const decipher = crypto.createDecipheriv(
+      "aes-256-gcm",
+      key,
+      Buffer.from(ivText, "base64url"),
+    )
+    decipher.setAuthTag(Buffer.from(tagText, "base64url"))
+    return Buffer.concat([
+      decipher.update(Buffer.from(encryptedText, "base64url")),
+      decipher.final(),
+    ]).toString("utf8")
+  } catch (_error) {
+    return ""
+  }
+}
+
 function safeTimingEqual(left, right) {
   const leftBuffer = Buffer.from(String(left || ""), "utf8")
   const rightBuffer = Buffer.from(String(right || ""), "utf8")
@@ -5491,7 +5724,7 @@ async function createAuditLog({ actorType, actorId = "", eventType, message, met
       actorId,
       eventType,
       message,
-      metadata,
+      metadata: redactSensitiveData(metadata),
       createdAt: new Date(),
     })
   } catch (error) {
@@ -9560,7 +9793,11 @@ function emitDonationSettlementUpdated(creatorId, donation) {
 
 async function requireAdminSession(req, res, next) {
   try {
-    const adminToken = String(req.headers["x-admin-token"] || req.query?.adminToken || "").trim()
+    const headerToken = String(req.headers["x-admin-token"] || "").trim()
+    const queryToken = ADMIN_TOKEN_QUERY_FALLBACK_ENABLED
+      ? String(req.query?.adminToken || "").trim()
+      : ""
+    const adminToken = headerToken || queryToken
 
     if (!adminToken) {
       return res.status(401).json({ error: "Admin authentication required." })
@@ -9644,7 +9881,7 @@ app.get("/health", (_req, res) => {
 
 app.use(requireDatabaseReady)
 
-app.post("/auth/register", async (req, res) => {
+app.post("/auth/register", authLimiter, async (req, res) => {
   try {
     const {
       email,
@@ -9809,8 +10046,8 @@ app.post("/auth/register", async (req, res) => {
         updatedAt: new Date(),
       },
       identity: {
-        bvn: trimmedBvn,
-        nin: trimmedNin,
+        bvn: encryptIdentityValue(trimmedBvn),
+        nin: encryptIdentityValue(trimmedNin),
         dateOfBirth: trimmedDateOfBirth,
         firstName: legal.first,
         middleName: legal.middle,
@@ -9882,7 +10119,7 @@ app.post("/auth/register", async (req, res) => {
   }
 })
 
-app.post("/auth/login", async (req, res) => {
+app.post("/auth/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body
 
@@ -9925,7 +10162,7 @@ app.post("/auth/login", async (req, res) => {
   }
 })
 
-app.post("/auth/oauth/google", async (req, res) => {
+app.post("/auth/oauth/google", authLimiter, async (req, res) => {
   try {
     const credential = String(req.body?.credential || "").trim()
 
@@ -9954,7 +10191,7 @@ app.post("/auth/oauth/google", async (req, res) => {
   }
 })
 
-app.post("/auth/oauth/apple", async (req, res) => {
+app.post("/auth/oauth/apple", authLimiter, async (req, res) => {
   try {
     const identityToken = String(req.body?.identityToken || "").trim()
 
@@ -10028,7 +10265,7 @@ app.post("/auth/logout", async (req, res) => {
   }
 })
 
-app.post("/admin/auth/login", async (req, res) => {
+app.post("/admin/auth/login", adminAuthLimiter, async (req, res) => {
   try {
     const { email, password } = req.body
 
@@ -10194,7 +10431,7 @@ app.post("/users/:id/virtual-account/requery", requireSessionUser, async (req, r
   }
 })
 
-app.post("/api/webhooks/paystack", async (req, res) => {
+app.post("/api/webhooks/paystack", webhookLimiter, async (req, res) => {
   try {
     if (!isPaystackConfigured()) {
       return res.status(410).json({ error: "Paystack webhook is disabled." })
@@ -11221,7 +11458,7 @@ async function closeWebhookQueue() {
   webhookQueueConnection = null
 }
 
-app.post("/webhook/monnify", async (req, res) => {
+app.post("/webhook/monnify", webhookLimiter, async (req, res) => {
   try {
     if (!isWebhookIpAllowed(req)) {
       await createAuditLog({
@@ -11430,6 +11667,7 @@ app.get("/uploads/gift-sounds/:soundId", async (req, res) => {
 
 app.post(
   "/overlay-sound-upload",
+  uploadLimiter,
   requireSessionUser,
   express.raw({ type: ["audio/*", "application/octet-stream"], limit: "3mb" }),
   async (req, res) => {
@@ -11453,7 +11691,7 @@ app.post(
   },
 )
 
-app.post("/overlay-sound-upload-json", requireSessionUser, async (req, res) => {
+app.post("/overlay-sound-upload-json", uploadLimiter, requireSessionUser, async (req, res) => {
   try {
     const dataUrl = String(req.body?.dataUrl || "")
     const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
@@ -11987,7 +12225,7 @@ app.put("/user", requireSessionUser, async (req, res) => {
         return res.status(400).json({ error: "BVN must be 11 digits." })
       }
 
-      user.identity.bvn = nextBvn
+      user.identity.bvn = encryptIdentityValue(nextBvn)
       verificationTypes.push("bvn")
     }
 
@@ -11996,7 +12234,7 @@ app.put("/user", requireSessionUser, async (req, res) => {
         return res.status(400).json({ error: "NIN must be 11 digits." })
       }
 
-      user.identity.nin = nextNin
+      user.identity.nin = encryptIdentityValue(nextNin)
       verificationTypes.push("nin")
     }
 
@@ -12176,7 +12414,7 @@ app.get("/kyc/upgrade-submissions", requireSessionUser, async (req, res) => {
   }
 })
 
-app.post("/kyc/upgrade-submission", requireSessionUser, async (req, res) => {
+app.post("/kyc/upgrade-submission", uploadLimiter, requireSessionUser, async (req, res) => {
   try {
     const user = req.user
     const currentTier = getTierLevel(user)
