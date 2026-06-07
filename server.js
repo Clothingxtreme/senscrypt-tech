@@ -87,7 +87,7 @@ const IDENTITY_ENCRYPTION_KEY = readEnv("IDENTITY_ENCRYPTION_KEY")
 const TELEGRAM_BOT_TOKEN = readEnv("TELEGRAM_BOT_TOKEN")
 const TELEGRAM_WITHDRAWAL_CHAT_ID =
   readEnv("TELEGRAM_WITHDRAWAL_CHAT_ID") || readEnv("TELEGRAM_CHAT_ID")
-const PORTAL_URL = readEnv("PORTAL_URL") || "https://api.streamtips.live"
+const PORTAL_URL = readEnv("PORTAL_URL") || "https://portal.streamtips.live"
 const SMTP_HOST = readEnv("SMTP_HOST")
 const SMTP_PORT = Number(readEnv("SMTP_PORT") || 587)
 const SMTP_SECURE = /^(1|true|yes)$/i.test(readEnv("SMTP_SECURE"))
@@ -482,6 +482,39 @@ function getPublicRequestBaseUrl(req) {
   return `${protocol}://${host}`
 }
 
+function getPortalRequestBaseUrl() {
+  const configuredPortalUrl = String(PORTAL_URL || "").trim()
+  if (configuredPortalUrl) {
+    return configuredPortalUrl.replace(/\/+$/, "")
+  }
+
+  return "https://portal.streamtips.live"
+}
+
+function getKycDocumentPortalUrl(fileName) {
+  const safeFileName = path.basename(String(fileName || "").trim())
+  if (!safeFileName) {
+    return ""
+  }
+
+  return `${getPortalRequestBaseUrl()}/uploads/kyc-docs/${encodeURIComponent(safeFileName)}`
+}
+
+function normalizeKycDocumentUrl(value) {
+  const url = String(value || "").trim()
+  if (!url) {
+    return ""
+  }
+
+  const marker = "/uploads/kyc-docs/"
+  const markerIndex = url.indexOf(marker)
+  if (markerIndex >= 0) {
+    return getKycDocumentPortalUrl(decodeURIComponent(url.slice(markerIndex + marker.length)))
+  }
+
+  return getKycDocumentPortalUrl(url)
+}
+
 function getAudioUploadExtension(mimeType) {
   const normalized = String(mimeType || "").toLowerCase().split(";")[0].trim()
 
@@ -614,7 +647,7 @@ function saveKycImageUpload({ req, dataUrl, filePrefix }) {
   const filePath = path.join(kycUploadsDir, fileName)
   fs.writeFileSync(filePath, parsed.buffer)
 
-  return `${getPublicRequestBaseUrl(req)}/uploads/kyc-docs/${fileName}`
+  return getKycDocumentPortalUrl(fileName)
 }
 
 async function normalizeCustomGiftSoundUploads(req, customGifts) {
@@ -3298,10 +3331,13 @@ function sanitizeKycUpgradeSubmission(request) {
     currentTier: Number(request.currentTier) || 1,
     targetTier: Number(request.targetTier) || 2,
     status: request.status || "awaiting_review",
-    governmentIdImageUrl: request.governmentIdImageUrl || "",
-    selfieImageUrl: request.selfieImageUrl || "",
+    governmentIdImageUrl: normalizeKycDocumentUrl(request.governmentIdImageUrl),
+    selfieImageUrl: normalizeKycDocumentUrl(request.selfieImageUrl),
     selfieEvidenceImageUrls: Array.isArray(request.selfieEvidenceImageUrls)
-      ? request.selfieEvidenceImageUrls.filter((item) => typeof item === "string" && item.trim()).slice(0, 4)
+      ? request.selfieEvidenceImageUrls
+          .map(normalizeKycDocumentUrl)
+          .filter(Boolean)
+          .slice(0, 4)
       : [],
     transactionHistoryConfirmed: Boolean(request.transactionHistoryConfirmed),
     addressVerificationProvided: Boolean(request.addressVerificationProvided),
