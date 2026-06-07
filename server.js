@@ -1476,6 +1476,9 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     passwordHash: { type: String, required: true },
     sessionToken: { type: String, default: null },
+    passwordResetTokenHash: { type: String, default: "", index: true },
+    passwordResetExpiresAt: Date,
+    passwordResetRequestedAt: Date,
     googleSub: { type: String, default: "", index: true },
     appleSub: { type: String, default: "", index: true },
     role: { type: String, enum: ["creator", "admin"], default: "creator" },
@@ -5413,6 +5416,25 @@ function generateSessionToken() {
   return crypto.randomBytes(32).toString("hex")
 }
 
+function hashPasswordResetToken(token) {
+  return crypto.createHash("sha256").update(String(token || "").trim()).digest("hex")
+}
+
+function getPasswordResetBaseUrl() {
+  const explicitUrl = readEnv("PASSWORD_RESET_BASE_URL") || readEnv("NEXT_PUBLIC_SITE_URL")
+  if (explicitUrl) {
+    return explicitUrl.replace(/\/+$/, "")
+  }
+
+  const origins = String(FRONTEND_ORIGIN || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+    .filter((origin) => !origin.includes("localhost") && !origin.includes("127.0.0.1"))
+
+  return (origins[0] || "https://streamtips.live").replace(/\/+$/, "")
+}
+
 function getIdentityEncryptionKey() {
   if (!IDENTITY_ENCRYPTION_KEY) {
     return null
@@ -5904,6 +5926,47 @@ async function sendTierSubmissionEmail({ user, fromTier, toTier }) {
     return { sent: true }
   } catch (error) {
     console.error("tier_submission_email_failed", error instanceof Error ? error.message : error)
+    return { skipped: true }
+  }
+}
+
+async function sendPasswordResetEmail({ user, resetUrl }) {
+  try {
+    const to = String(user?.email || "").trim().toLowerCase()
+    if (!to || !isEmailTransportConfigured()) {
+      return { skipped: true }
+    }
+
+    const transport = getMailTransporter()
+    if (!transport) {
+      return { skipped: true }
+    }
+
+    const name = user.name || "Creator"
+    const subject = "Reset your StreamTip password"
+    const text = [
+      `Hi ${name},`,
+      "",
+      "We received a request to reset your StreamTip password.",
+      "Use the secure link below to choose a new password. This link expires in 30 minutes.",
+      "",
+      resetUrl,
+      "",
+      "If you did not request this, you can safely ignore this email.",
+      "",
+      "StreamTip",
+    ].join("\n")
+
+    await transport.sendMail({
+      from: `"${SMTP_FROM_NAME}" <${SMTP_FROM}>`,
+      to,
+      subject,
+      text,
+    })
+
+    return { sent: true }
+  } catch (error) {
+    console.error("password_reset_email_failed", error instanceof Error ? error.message : error)
     return { skipped: true }
   }
 }
@@ -10159,6 +10222,110 @@ app.post("/auth/login", authLimiter, async (req, res) => {
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: "Failed to log in." })
+  }
+})
+
+app.post("/auth/forgot-password", authLimiter, async (req, res) => {
+  const genericMessage =
+    "If an account exists for that email, a password reset link has been sent."
+
+  try {
+    const email = String(req.body?.email || "").toLowerCase().trim()
+
+    if (!email) {
+      return res.status(400).json({ error: "Email address is required." })
+    }
+
+    const user = await User.findOne({ email })
+
+    if (!user || user.status === "banned") {
+      await createAuditLog({
+        actorType: "system",
+        eventType: "auth.password_reset.requested_unknown",
+        message: "Password reset requested for an unknown or unavailable account.",
+        metadata: { email },
+      })
+      return res.json({ message: genericMessage })
+    }
+
+    const token = generateSessionToken()
+    const tokenHash = hashPasswordResetToken(token)
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000)
+    const resetUrl = `${getPasswordResetBaseUrl()}/reset-password?token=${encodeURIComponent(token)}`
+
+    user.passwordResetTokenHash = tokenHash
+    user.passwordResetExpiresAt = expiresAt
+    user.passwordResetRequestedAt = new Date()
+    await user.save()
+
+    const emailResult = await sendPasswordResetEmail({ user, resetUrl })
+
+    await createAuditLog({
+      actorType: "user",
+      actorId: user._id.toString(),
+      eventType: "auth.password_reset.requested",
+      message: `Password reset requested for ${user.email}.`,
+      metadata: {
+        email: user.email,
+        emailSent: Boolean(emailResult?.sent),
+        emailSkipped: Boolean(emailResult?.skipped),
+        expiresAt,
+      },
+    })
+
+    return res.json({ message: genericMessage })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to process password reset request." })
+  }
+})
+
+app.post("/auth/reset-password", authLimiter, async (req, res) => {
+  try {
+    const token = String(req.body?.token || "").trim()
+    const password = String(req.body?.password || "")
+
+    if (!token) {
+      return res.status(400).json({ error: "Password reset token is required." })
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({ error: "New password must be at least 8 characters long." })
+    }
+
+    const tokenHash = hashPasswordResetToken(token)
+    const user = await User.findOne({
+      passwordResetTokenHash: tokenHash,
+      passwordResetExpiresAt: { $gt: new Date() },
+    })
+
+    if (!user) {
+      return res.status(400).json({ error: "This password reset link is invalid or has expired." })
+    }
+
+    if (user.status === "banned") {
+      return res.status(403).json({ error: "This account is not available." })
+    }
+
+    user.passwordHash = hashPassword(password)
+    user.sessionToken = null
+    user.passwordResetTokenHash = ""
+    user.passwordResetExpiresAt = undefined
+    user.passwordResetRequestedAt = undefined
+    await user.save()
+
+    await createAuditLog({
+      actorType: "user",
+      actorId: user._id.toString(),
+      eventType: "auth.password_reset.completed",
+      message: `${user.email} reset their password.`,
+      metadata: { email: user.email },
+    })
+
+    return res.json({ message: "Password reset successful. You can now log in." })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to reset password." })
   }
 })
 
