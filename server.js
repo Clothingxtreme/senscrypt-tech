@@ -10280,6 +10280,37 @@ app.post("/auth/forgot-password", authLimiter, async (req, res) => {
   }
 })
 
+app.get("/auth/reset-password/validate", authLimiter, async (req, res) => {
+  try {
+    const token = String(req.query?.token || "").trim()
+
+    if (!token) {
+      return res.status(400).json({
+        valid: false,
+        error: "This password reset link is missing a token.",
+      })
+    }
+
+    const tokenHash = hashPasswordResetToken(token)
+    const user = await User.findOne({
+      passwordResetTokenHash: tokenHash,
+      passwordResetExpiresAt: { $gt: new Date() },
+    }).select({ _id: 1 })
+
+    if (!user) {
+      return res.status(400).json({
+        valid: false,
+        error: "This password reset link has expired. Please request a new one.",
+      })
+    }
+
+    return res.json({ valid: true })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to validate password reset link." })
+  }
+})
+
 app.post("/auth/reset-password", authLimiter, async (req, res) => {
   try {
     const token = String(req.body?.token || "").trim()
@@ -10300,7 +10331,9 @@ app.post("/auth/reset-password", authLimiter, async (req, res) => {
     })
 
     if (!user) {
-      return res.status(400).json({ error: "This password reset link is invalid or has expired." })
+      return res.status(400).json({
+        error: "This password reset link has expired. Please request a new one.",
+      })
     }
 
     if (user.status === "banned") {
