@@ -7022,6 +7022,22 @@ function extractMonnifySubAccountEntry(data) {
   }
 }
 
+function getMonnifySubAccountBankCodeCandidates(bankCode, bankName = "") {
+  const normalizedCode = String(bankCode || "").trim()
+  const normalizedName = String(bankName || "").toLowerCase()
+  const candidates = []
+
+  if (normalizedCode) {
+    candidates.push(normalizedCode)
+  }
+
+  if (normalizedCode === "999992" || normalizedName.includes("opay")) {
+    candidates.push("305")
+  }
+
+  return Array.from(new Set(candidates.filter(Boolean)))
+}
+
 async function listMonnifySubAccounts(accessToken) {
   const response = await axios.get(`${MONNIFY_BASE_URL}/api/v1/sub-accounts`, {
     params: { page: 0, size: 500 },
@@ -7048,6 +7064,7 @@ async function listMonnifySubAccounts(accessToken) {
 async function createMonnifySubAccount({
   accessToken,
   bankCode,
+  bankCodes,
   accountNumber,
   email,
   defaultSplitPercentage,
@@ -7062,17 +7079,22 @@ async function createMonnifySubAccount({
     throw createStatusCodeError("Monnify streamer split percentage must be greater than 0.", 400)
   }
 
-  const basePayload = {
-    currencyCode: "NGN",
-    bankCode,
-    accountNumber,
-    email,
-  }
-  const payloadVariants = [
-    { ...basePayload, splitPercentage, defaultSplitPercentage: splitPercentage },
-    { ...basePayload, splitPercentage },
-    { ...basePayload, defaultSplitPercentage: splitPercentage },
-  ]
+  const bankCodeCandidates = Array.isArray(bankCodes) && bankCodes.length ? bankCodes : [bankCode]
+  const payloadVariants = bankCodeCandidates.flatMap((candidateBankCode) => {
+    const basePayload = {
+      currencyCode: "NGN",
+      bankCode: String(candidateBankCode || "").trim(),
+      accountNumber,
+      email,
+    }
+    const splitText = String(splitPercentage)
+
+    return [
+      { ...basePayload, defaultSplitPercentage: splitText },
+      { ...basePayload, splitPercentage: splitText, defaultSplitPercentage: splitText },
+      { ...basePayload, splitPercentage: splitText },
+    ]
+  })
 
   let response = null
   let lastError = null
@@ -7119,6 +7141,8 @@ async function ensureMonnifyStreamerSubAccount(user, accessToken) {
   const profile = getLockedPayoutProfile(user)
   const profileAccountNumber = String(profile.accountNumber || "").replace(/\D/g, "")
   const profileBankCode = String(profile.bankCode || "").trim()
+  const profileBankName = String(profile.bankName || "").trim()
+  const bankCodeCandidates = getMonnifySubAccountBankCodeCandidates(profileBankCode, profileBankName)
 
   if (!profileBankCode || profileAccountNumber.length !== 10) {
     throw new Error("A locked payout profile with a valid bank account is required.")
@@ -7127,7 +7151,7 @@ async function ensureMonnifyStreamerSubAccount(user, accessToken) {
   const existingCode = String(profile.monnifySubAccountCode || "").trim()
   const existingMatchesProfile =
     String(profile.monnifySubAccountAccountNumber || "").replace(/\D/g, "") === profileAccountNumber &&
-    String(profile.monnifySubAccountBankCode || "").trim() === profileBankCode
+    bankCodeCandidates.includes(String(profile.monnifySubAccountBankCode || "").trim())
 
   if (existingCode && existingMatchesProfile) {
     return {
@@ -7145,6 +7169,7 @@ async function ensureMonnifyStreamerSubAccount(user, accessToken) {
     const created = await createMonnifySubAccount({
       accessToken,
       bankCode: profileBankCode,
+      bankCodes: bankCodeCandidates,
       accountNumber: profileAccountNumber,
       email,
       defaultSplitPercentage,
@@ -7173,7 +7198,14 @@ async function ensureMonnifyStreamerSubAccount(user, accessToken) {
       const matched = existingSubAccounts.find((item) => {
         if (!item) return false
         if (item.accountNumber && item.accountNumber !== profileAccountNumber) return false
-        if (item.bankCode && profileBankCode && item.bankCode !== profileBankCode) return false
+        if (
+          item.bankCode &&
+          bankCodeCandidates.length > 0 &&
+          !bankCodeCandidates.includes(item.bankCode) &&
+          item.accountNumber !== profileAccountNumber
+        ) {
+          return false
+        }
         if (item.email && email && item.email !== email) return false
         return Boolean(item.subAccountCode)
       })
