@@ -6149,12 +6149,18 @@ function getAxiosErrorMessage(error, fallbackMessage) {
     return "Monnify rejected this withdrawal because the backend server IP is not authorized for live disbursement. Please contact support."
   }
 
+  const cleanProviderMessage = (value) =>
+    String(value || "")
+      .trim()
+      .replace(/^[.\s:;-]+/, "")
+      .trim()
+
   if (typeof monnifyMessage === "string" && monnifyMessage.trim()) {
-    return monnifyMessage.trim()
+    return cleanProviderMessage(monnifyMessage)
   }
 
   if (nestedErrors.length > 0) {
-    return nestedErrors.slice(0, 3).join(" ")
+    return cleanProviderMessage(nestedErrors.slice(0, 3).join(" "))
   }
 
   if (Number(error.response?.status || 0) === 422) {
@@ -7051,26 +7057,46 @@ async function createMonnifySubAccount({
     "Content-Type": "application/json",
     Accept: "application/json",
   }
-  const payload = {
+  const splitPercentage = normalizeMonnifySplitPercentage(defaultSplitPercentage, 0)
+  if (splitPercentage <= 0) {
+    throw createStatusCodeError("Monnify streamer split percentage must be greater than 0.", 400)
+  }
+
+  const basePayload = {
     currencyCode: "NGN",
     bankCode,
     accountNumber,
     email,
-    defaultSplitPercentage,
+  }
+  const payloadVariants = [
+    { ...basePayload, splitPercentage, defaultSplitPercentage: splitPercentage },
+    { ...basePayload, splitPercentage },
+    { ...basePayload, defaultSplitPercentage: splitPercentage },
+  ]
+
+  let response = null
+  let lastError = null
+
+  for (const payload of payloadVariants) {
+    try {
+      response = await axios.post(`${MONNIFY_BASE_URL}/api/v1/sub-accounts`, [payload], { headers })
+      break
+    } catch (arrayStyleError) {
+      lastError = arrayStyleError
+      try {
+        response = await axios.post(`${MONNIFY_BASE_URL}/api/v1/sub-accounts`, payload, { headers })
+        break
+      } catch (objectStyleError) {
+        lastError = objectStyleError
+      }
+    }
   }
 
-  let response
-
-  try {
-    response = await axios.post(`${MONNIFY_BASE_URL}/api/v1/sub-accounts`, [payload], { headers })
-  } catch (_arrayStyleError) {
-    try {
-      response = await axios.post(`${MONNIFY_BASE_URL}/api/v1/sub-accounts`, payload, { headers })
-    } catch {
-      const fallbackPayload = { ...payload }
-      delete fallbackPayload.defaultSplitPercentage
-      response = await axios.post(`${MONNIFY_BASE_URL}/api/v1/sub-accounts`, [fallbackPayload], { headers })
-    }
+  if (!response) {
+    throw createStatusCodeError(
+      getAxiosErrorMessage(lastError, "Failed to create Monnify subaccount for this streamer."),
+      lastError?.response?.status || lastError?.statusCode,
+    )
   }
 
   const entry =
@@ -7184,7 +7210,10 @@ async function ensureMonnifyStreamerSubAccount(user, accessToken) {
     }
     await user.save()
 
-    throw error
+    throw createStatusCodeError(
+      `Monnify streamer subaccount creation failed: ${user.payoutProfile.monnifySubAccountLastError}`,
+      error?.response?.status || error?.statusCode,
+    )
   }
 }
 
