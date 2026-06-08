@@ -6094,18 +6094,41 @@ async function sendPasswordResetEmail({ user, resetUrl }) {
 }
 
 function getAxiosErrorMessage(error, fallbackMessage) {
-  if (!(error instanceof AxiosError)) {
+  if (!axios.isAxiosError(error) && !(error instanceof AxiosError)) {
     return fallbackMessage
   }
 
+  const responseData = error.response?.data || {}
+  const responseBody =
+    responseData?.responseBody && typeof responseData.responseBody === "object"
+      ? responseData.responseBody
+      : {}
   const monnifyCode =
-    error.response?.data?.responseCode ||
-    error.response?.data?.responseBody?.responseCode ||
-    error.response?.data?.responseBody?.code
+    responseData?.responseCode ||
+    responseBody?.responseCode ||
+    responseBody?.code ||
+    responseData?.code
   const monnifyMessage =
-    error.response?.data?.responseMessage ||
-    error.response?.data?.responseBody?.message ||
-    error.response?.data?.message
+    responseData?.responseMessage ||
+    responseData?.message ||
+    responseData?.error ||
+    responseBody?.responseMessage ||
+    responseBody?.message ||
+    responseBody?.error
+
+  const nestedErrors = [
+    responseData?.errors,
+    responseBody?.errors,
+    responseData?.validationErrors,
+    responseBody?.validationErrors,
+  ]
+    .flatMap((value) => (Array.isArray(value) ? value : value ? [value] : []))
+    .map((value) => {
+      if (typeof value === "string") return value
+      if (!value || typeof value !== "object") return ""
+      return String(value.message || value.error || value.description || value.field || "").trim()
+    })
+    .filter(Boolean)
 
   if (
     String(monnifyCode || "").toUpperCase() === "D06" ||
@@ -6118,11 +6141,21 @@ function getAxiosErrorMessage(error, fallbackMessage) {
     return monnifyMessage.trim()
   }
 
-  return error.message || fallbackMessage
+  if (nestedErrors.length > 0) {
+    return nestedErrors.slice(0, 3).join(" ")
+  }
+
+  if (Number(error.response?.status || 0) === 422) {
+    return `${fallbackMessage} The payment provider rejected the submitted creator details. Please confirm the creator's BVN/NIN, legal name, phone number, and Monnify configuration, then try again.`
+  }
+
+  return error.message && !/^request failed with status code/i.test(error.message)
+    ? error.message
+    : fallbackMessage
 }
 
 function getAxiosErrorDetails(error) {
-  if (!(error instanceof AxiosError)) {
+  if (!axios.isAxiosError(error) && !(error instanceof AxiosError)) {
     return {}
   }
 
@@ -6552,7 +6585,7 @@ async function createOrUpdatePaystackCustomerForUser(user) {
 }
 
 async function validatePaystackCustomerForUser(user, customerCode) {
-  const bvn = String(user.identity?.bvn || "").trim()
+  const bvn = decryptIdentityValue(user.identity?.bvn)
   const nameParts = getUserNameParts(user)
 
   if (!bvn) {
@@ -7710,13 +7743,16 @@ async function createReservedAccountForUser(user) {
     }
   }
 
-  const bvn = String(user.identity?.bvn || "").trim()
-  const nin = String(user.identity?.nin || "").trim()
+  const bvn = decryptIdentityValue(user.identity?.bvn)
+  const nin = decryptIdentityValue(user.identity?.nin)
 
   if (requiresMonnifyCustomerVerification() && !bvn && !nin) {
-    throw new Error(
+    const identityRequiredError = createStatusCodeError(
       "Live Monnify setup requires the creator's BVN or NIN before a virtual account can be provisioned.",
+      400,
     )
+    identityRequiredError.errorCode = "BVN_VERIFICATION_REQUIRED"
+    throw identityRequiredError
   }
 
   const accountReference = `STIP-${user._id}-${Date.now()}`
@@ -7768,8 +7804,9 @@ async function createReservedAccountForUser(user) {
       try {
         response = await requestReservedAccount(fallbackCustomerEmail)
       } catch (retryError) {
-        throw new Error(
+        throw createStatusCodeError(
           getAxiosErrorMessage(retryError, "Could not create a Monnify reserved account."),
+          retryError?.response?.status || retryError?.statusCode,
         )
       }
     } else if (isTemporaryMonnifyError(error)) {
@@ -7788,13 +7825,15 @@ async function createReservedAccountForUser(user) {
       }
 
       if (!response && lastError) {
-        throw new Error(
+        throw createStatusCodeError(
           getAxiosErrorMessage(lastError, "Could not create a Monnify reserved account."),
+          lastError?.response?.status || lastError?.statusCode,
         )
       }
     } else {
-      throw new Error(
+      throw createStatusCodeError(
         getAxiosErrorMessage(error, "Could not create a Monnify reserved account."),
+        error?.response?.status || error?.statusCode,
       )
     }
   }
@@ -15668,11 +15707,14 @@ app.post("/admin/users/:id/virtual-account", requireAdminSession, async (req, re
     res.json({ user: sanitizePrivilegedUser(user), virtualAccount })
   } catch (error) {
     console.error(error)
-    res.status(502).json({
+    const statusCode = Number(error?.statusCode || error?.response?.status || 0)
+
+    res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
       error:
         error instanceof Error
           ? error.message
           : "Could not provision a virtual account.",
+      code: String(error?.errorCode || ""),
     })
   }
 })
