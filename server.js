@@ -2454,6 +2454,15 @@ function inferMonnifyFailureReason(type, providerMessage, mismatches = [], provi
   }
 
   const message = String(providerMessage || "").toLowerCase()
+  if (message.includes("valid phone") || message.includes("phone number is required")) {
+    return "PHONE_NUMBER_REQUIRED"
+  }
+  if (message.includes("date of birth is required")) {
+    return "DATE_OF_BIRTH_REQUIRED"
+  }
+  if (message.includes("legal name is required") || message.includes("name is required")) {
+    return "LEGAL_NAME_REQUIRED"
+  }
   if (message.includes("invalid bvn") || message.includes("invalid nin") || message.includes("invalid")) {
     return "INVALID_FORMAT"
   }
@@ -2485,6 +2494,9 @@ function buildFailureMessageFromReason(type, reason) {
     NAME_MISMATCH: `Submitted name does not match ${upperType} record.`,
     DATE_OF_BIRTH_MISMATCH: `Submitted date of birth does not match ${upperType} record.`,
     PHONE_NUMBER_MISMATCH: `Submitted phone number does not match ${upperType} record.`,
+    PHONE_NUMBER_REQUIRED: `A valid ${upperType}-linked phone number is required for verification.`,
+    DATE_OF_BIRTH_REQUIRED: `Date of birth is required for ${upperType} verification.`,
+    LEGAL_NAME_REQUIRED: `Legal first and last name are required for ${upperType} verification.`,
     INVALID_FORMAT: `${upperType} format is invalid.`,
     BVN_NOT_FOUND: "BVN record was not found.",
     NIN_NOT_FOUND: "NIN record was not found.",
@@ -12541,6 +12553,10 @@ app.put("/user", requireSessionUser, async (req, res) => {
     const newPassword = String(req.body?.newPassword || "")
     const nextBvn = typeof req.body?.bvn === "string" ? req.body.bvn.trim() : undefined
     const nextNin = typeof req.body?.nin === "string" ? req.body.nin.trim() : undefined
+    const nextDateOfBirth =
+      typeof req.body?.dateOfBirth === "string"
+        ? normalizeDateOnly(req.body.dateOfBirth)
+        : user.identity?.dateOfBirth || ""
     const currentNameParts = getUserNameParts(user)
     const nextNameParts = validateLegalNameParts({
       firstName:
@@ -12558,6 +12574,10 @@ app.put("/user", requireSessionUser, async (req, res) => {
 
     if (nextPhoneNumber && !/^\+?\d{7,15}$/.test(nextPhoneNumber)) {
       return res.status(400).json({ error: "Enter a valid phone number." })
+    }
+
+    if (typeof req.body?.dateOfBirth === "string" && !nextDateOfBirth) {
+      return res.status(400).json({ error: "Enter date of birth in YYYY-MM-DD format." })
     }
 
     const existingUser = await User.findOne({
@@ -12578,6 +12598,7 @@ app.put("/user", requireSessionUser, async (req, res) => {
     user.phoneNumber = nextPhoneNumber || ""
     user.profileImage = nextProfileImage
     user.identity = user.identity || { bvn: "", nin: "" }
+    user.identity.dateOfBirth = nextDateOfBirth
 
     const verificationTypes = []
 
@@ -12615,8 +12636,14 @@ app.put("/user", requireSessionUser, async (req, res) => {
           await user.save()
           const preferredType =
             failedTypes.length === 1 ? failedTypes[0] : normalizeIdentityVerificationType("both")
+          const failedSnapshot = snapshots[failedTypes[0]] || {}
+          const detailedMessage =
+            failedSnapshot.validationError ||
+            failedSnapshot.responseMessage ||
+            getUserFriendlyIdentityErrorMessage(preferredType)
           return res.status(400).json({
-            error: getUserFriendlyIdentityErrorMessage(preferredType),
+            error: detailedMessage,
+            verification: sanitizeIdentityVerification(user.identityVerification),
           })
         }
       } catch (error) {
@@ -12639,7 +12666,8 @@ app.put("/user", requireSessionUser, async (req, res) => {
         const statusCode = Number(error?.statusCode || 0)
 
         return res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 502).json({
-          error: getUserFriendlyIdentityErrorMessage(verificationTypes.length === 1 ? verificationTypes[0] : "both"),
+          error: message || getUserFriendlyIdentityErrorMessage(verificationTypes.length === 1 ? verificationTypes[0] : "both"),
+          verification: sanitizeIdentityVerification(user.identityVerification),
         })
       }
     } else {
@@ -12649,13 +12677,14 @@ app.put("/user", requireSessionUser, async (req, res) => {
         previousIdentitySubject.middleName !== nextIdentitySubject.middleName ||
         previousIdentitySubject.lastName !== nextIdentitySubject.lastName
       const phoneChanged = previousIdentitySubject.phoneNumber !== nextIdentitySubject.phoneNumber
+      const dateOfBirthChanged = previousIdentitySubject.dateOfBirth !== nextIdentitySubject.dateOfBirth
       const staleTypes = []
 
-      if ((legalNameChanged || phoneChanged) && user.identity.bvn) {
+      if ((legalNameChanged || phoneChanged || dateOfBirthChanged) && user.identity.bvn) {
         staleTypes.push("bvn")
       }
 
-      if (legalNameChanged && user.identity.nin) {
+      if ((legalNameChanged || dateOfBirthChanged) && user.identity.nin) {
         staleTypes.push("nin")
       }
 
