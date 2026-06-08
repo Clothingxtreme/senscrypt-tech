@@ -12620,6 +12620,35 @@ app.put("/user", requireSessionUser, async (req, res) => {
       verificationTypes.push("nin")
     }
 
+    const nextIdentitySubject = getIdentitySubjectFromUser(user)
+    const legalNameChanged =
+      previousIdentitySubject.firstName !== nextIdentitySubject.firstName ||
+      previousIdentitySubject.middleName !== nextIdentitySubject.middleName ||
+      previousIdentitySubject.lastName !== nextIdentitySubject.lastName
+    const phoneChanged = previousIdentitySubject.phoneNumber !== nextIdentitySubject.phoneNumber
+    const dateOfBirthChanged = previousIdentitySubject.dateOfBirth !== nextIdentitySubject.dateOfBirth
+
+    if (
+      !verificationTypes.includes("bvn") &&
+      decryptIdentityValue(user.identity?.bvn) &&
+      ((user.identityVerification?.bvn?.status || "unverified") !== "verified" ||
+        legalNameChanged ||
+        phoneChanged ||
+        dateOfBirthChanged)
+    ) {
+      verificationTypes.push("bvn")
+    }
+
+    if (
+      !verificationTypes.includes("nin") &&
+      decryptIdentityValue(user.identity?.nin) &&
+      ((user.identityVerification?.nin?.status || "unverified") !== "verified" ||
+        legalNameChanged ||
+        dateOfBirthChanged)
+    ) {
+      verificationTypes.push("nin")
+    }
+
     if (verificationTypes.length > 0) {
       try {
         const snapshots = await verifyIdentityWithMonnify(getIdentitySubjectFromUser(user), {
@@ -12669,27 +12698,6 @@ app.put("/user", requireSessionUser, async (req, res) => {
           error: message || getUserFriendlyIdentityErrorMessage(verificationTypes.length === 1 ? verificationTypes[0] : "both"),
           verification: sanitizeIdentityVerification(user.identityVerification),
         })
-      }
-    } else {
-      const nextIdentitySubject = getIdentitySubjectFromUser(user)
-      const legalNameChanged =
-        previousIdentitySubject.firstName !== nextIdentitySubject.firstName ||
-        previousIdentitySubject.middleName !== nextIdentitySubject.middleName ||
-        previousIdentitySubject.lastName !== nextIdentitySubject.lastName
-      const phoneChanged = previousIdentitySubject.phoneNumber !== nextIdentitySubject.phoneNumber
-      const dateOfBirthChanged = previousIdentitySubject.dateOfBirth !== nextIdentitySubject.dateOfBirth
-      const staleTypes = []
-
-      if ((legalNameChanged || phoneChanged || dateOfBirthChanged) && user.identity.bvn) {
-        staleTypes.push("bvn")
-      }
-
-      if ((legalNameChanged || dateOfBirthChanged) && user.identity.nin) {
-        staleTypes.push("nin")
-      }
-
-      if (staleTypes.length > 0) {
-        markIdentityVerificationStale(user, staleTypes)
       }
     }
 
