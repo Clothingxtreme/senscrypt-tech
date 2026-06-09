@@ -76,6 +76,7 @@ const SECURITY_RATE_LIMIT_WINDOW_MS = Math.max(
 )
 const SECURITY_RATE_LIMIT_MAX = Math.max(100, Number(readEnv("SECURITY_RATE_LIMIT_MAX") || 1200))
 const AUTH_RATE_LIMIT_MAX = Math.max(3, Number(readEnv("AUTH_RATE_LIMIT_MAX") || 15))
+const REGISTER_RATE_LIMIT_MAX = Math.max(5, Number(readEnv("REGISTER_RATE_LIMIT_MAX") || 45))
 const ADMIN_AUTH_RATE_LIMIT_MAX = Math.max(3, Number(readEnv("ADMIN_AUTH_RATE_LIMIT_MAX") || 8))
 const SENSITIVE_ACTION_RATE_LIMIT_MAX = Math.max(
   5,
@@ -445,6 +446,11 @@ const globalApiLimiter = createRateLimiter({
 const authLimiter = createRateLimiter({
   max: AUTH_RATE_LIMIT_MAX,
   message: "Too many login or registration attempts. Please wait before trying again.",
+})
+
+const registerLimiter = createRateLimiter({
+  max: REGISTER_RATE_LIMIT_MAX,
+  message: "Too many registration attempts from this network. Please wait before trying again.",
 })
 
 const adminAuthLimiter = createRateLimiter({
@@ -10178,7 +10184,7 @@ app.get("/health", (_req, res) => {
 
 app.use(requireDatabaseReady)
 
-app.post("/auth/register", authLimiter, async (req, res) => {
+app.post("/auth/register", registerLimiter, async (req, res) => {
   try {
     const {
       email,
@@ -10373,31 +10379,6 @@ app.post("/auth/register", authLimiter, async (req, res) => {
     })
 
     let warning = registrationWarning
-
-    if (payoutProfile) {
-      try {
-        await provisionVirtualAccountForUser(user)
-      } catch (error) {
-        const requiresBvnVerification = String(error?.errorCode || "") === "BVN_VERIFICATION_REQUIRED"
-
-        if (requiresBvnVerification) {
-          warning =
-            "Your account was created as Tier 1 (unverified). Please verify your BVN in Settings before generating your virtual account."
-        } else {
-          const reason =
-            error instanceof Error ? error.message : "Could not provision a dedicated virtual account."
-
-          if (isCollectionProviderPaystack()) {
-            await markPaystackVirtualAccountPending(user, reason)
-            warning =
-              "Your account was created, but the virtual account could not be provisioned yet. It has been marked as pending so you can continue into the dashboard."
-          } else {
-            warning =
-              "Your account was created, but the virtual account could not be provisioned yet. Please retry from your account page after a short while."
-          }
-        }
-      }
-    }
 
     return res.json({
       user: sanitizeUser(user),
