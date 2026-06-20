@@ -891,6 +891,7 @@ let monitoringHeartbeatTimer = null
 
 const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
+const MONNIFY_CREATOR_SETTLEMENT_VAT_RATE = 0.0202
 const MIN_CREATOR_WITHDRAWAL = 5000
 const TIER_LIMITS = {
   1: {
@@ -1344,6 +1345,8 @@ const donationSchema = new mongoose.Schema({
   monnifyPaymentReference: { type: String, index: true, sparse: true },
   creatorSubAccountCode: { type: String, index: true, sparse: true },
   platformSubAccountCode: { type: String, index: true, sparse: true },
+  creatorSettlementVat: { type: Number, default: 0 },
+  creatorSettlementNetAmount: { type: Number, default: 0 },
   creatorSettledAmount: { type: Number, default: 0 },
   platformSettledAmount: { type: Number, default: 0 },
   settlementPendingAmount: { type: Number, default: 0 },
@@ -4800,6 +4803,8 @@ function sanitizePortalDonation(donation, options = {}) {
     walletStatus: donation.walletStatus || "available",
     fundsFlow: donation.fundsFlow || "wallet",
     settlementStatus: donation.settlementStatus || "pending",
+    creatorSettlementVat: Number(donation.creatorSettlementVat) || 0,
+    creatorSettlementNetAmount: Number(donation.creatorSettlementNetAmount) || 0,
     creatorSettledAmount: Number(donation.creatorSettledAmount) || 0,
     settlementPendingAmount: Number(donation.settlementPendingAmount) || 0,
     settlementSyncedAt: donation.settlementSyncedAt || "",
@@ -4827,14 +4832,27 @@ function sanitizeCreatorDonation(donation) {
     typeof donation.creatorShare === "number"
       ? donation.creatorShare
       : calculateRevenueSplit(donation.amount).creatorShare
+  const settlementNet = calculateCreatorSettlementNetAmount(creatorShare)
+  const creatorSettlementVat =
+    typeof donation.creatorSettlementVat === "number"
+      ? donation.creatorSettlementVat
+      : settlementNet.creatorSettlementVat
+  const creatorSettlementNetAmount =
+    typeof donation.creatorSettlementNetAmount === "number" && donation.creatorSettlementNetAmount > 0
+      ? donation.creatorSettlementNetAmount
+      : settlementNet.creatorSettlementNetAmount
   const creatorSettledAmount = Math.max(0, Number(donation.creatorSettledAmount) || 0)
-  const pendingSettlementAmount = Math.max(0, Number(donation.settlementPendingAmount) || creatorShare - creatorSettledAmount)
+  const pendingSettlementAmount = Math.max(
+    0,
+    Number(donation.settlementPendingAmount) || creatorSettlementNetAmount - creatorSettledAmount,
+  )
   const provider = String(donation.provider || "monnify").toLowerCase()
   const fundsFlow = String(donation.fundsFlow || "wallet").toLowerCase()
+  const isMonnifySettlementTracked = provider === "monnify" && ["wallet", "direct_split"].includes(fundsFlow)
   const settlementStatus = String(donation.settlementStatus || "pending").toLowerCase()
   const walletStatus = String(donation.walletStatus || "available").toLowerCase()
   const status =
-    provider === "monnify" && fundsFlow === "wallet"
+    isMonnifySettlementTracked
       ? settlementStatus === "settled"
         ? "completed"
         : settlementStatus === "failed"
@@ -4855,6 +4873,8 @@ function sanitizeCreatorDonation(donation) {
     senderNameSource: donation.senderNameSource || "",
     amount: donation.amount || 0,
     creatorShare,
+    creatorSettlementVat,
+    creatorSettlementNetAmount,
     creatorSettledAmount,
     pendingSettlementAmount,
     settlementStatus,
@@ -5466,6 +5486,12 @@ async function buildPublicOverlayCacheEntry(creatorId) {
         paymentStatus: 1,
         walletStatus: 1,
         fundsFlow: 1,
+        creatorSettlementVat: 1,
+        creatorSettlementNetAmount: 1,
+        creatorSettledAmount: 1,
+        settlementPendingAmount: 1,
+        settlementStatus: 1,
+        settlementSyncedAt: 1,
         riskFlags: 1,
         transactionReference: 1,
         paystackReference: 1,
@@ -5734,6 +5760,19 @@ function calculateRevenueSplit(amount) {
     gross,
     platformFee,
     creatorShare,
+  }
+}
+
+function calculateCreatorSettlementNetAmount(creatorShare) {
+  const grossCreatorShare = parseMoneyAmount(creatorShare)
+  const creatorSettlementVat = roundWalletAmount(grossCreatorShare * MONNIFY_CREATOR_SETTLEMENT_VAT_RATE)
+  const creatorSettlementNetAmount = roundWalletAmount(
+    Math.max(0, grossCreatorShare - creatorSettlementVat),
+  )
+
+  return {
+    creatorSettlementVat,
+    creatorSettlementNetAmount,
   }
 }
 
@@ -7434,6 +7473,9 @@ async function applyMonnifySettlementForDonation({
 
   const creatorShare = Math.max(0, Number(donation.creatorShare) || 0)
   const platformFee = Math.max(0, Number(donation.platformFee) || 0)
+  const settlementNet = calculateCreatorSettlementNetAmount(creatorShare)
+  const creatorSettlementVat = settlementNet.creatorSettlementVat
+  const creatorSettlementNetAmount = settlementNet.creatorSettlementNetAmount
   const creatorSubAccountCode = await getDonationCreatorSubAccountCode(donation)
   const platformSubAccountCode = compactString(
     donation?.platformSubAccountCode || MONNIFY_PLATFORM_SUBACCOUNT_CODE || "",
@@ -7444,7 +7486,7 @@ async function applyMonnifySettlementForDonation({
     rows,
     creatorSubAccountCode,
     platformSubAccountCode,
-    creatorShare,
+    creatorShare: creatorSettlementNetAmount || creatorShare,
   })
 
   let creatorSettledAmount = picked.creatorSettledAmount
@@ -7452,9 +7494,9 @@ async function applyMonnifySettlementForDonation({
 
   if (!picked.usedBeneficiaryRows && hasSettlementSignal) {
     const settlementAmount = firstValidMoneyAmount(payload?.settlementAmount)
-    if (settlementAmount > 0 && creatorShare > 0 && Number(donation.amount) > 0) {
-      const ratio = creatorShare / Math.max(1, Number(donation.amount))
-      creatorSettledAmount = Math.min(creatorShare, settlementAmount * ratio)
+    if (settlementAmount > 0 && creatorSettlementNetAmount > 0 && Number(donation.amount) > 0) {
+      const ratio = creatorSettlementNetAmount / Math.max(1, Number(donation.amount))
+      creatorSettledAmount = Math.min(creatorSettlementNetAmount, settlementAmount * ratio)
       if (platformFee > 0) {
         platformSettledAmount = Math.min(platformFee, Math.max(0, settlementAmount - creatorSettledAmount))
       }
@@ -7466,11 +7508,12 @@ async function applyMonnifySettlementForDonation({
   const existingCreatorSettled = roundWalletAmount(Math.max(0, Number(donation.creatorSettledAmount) || 0))
   const existingPlatformSettled = roundWalletAmount(Math.max(0, Number(donation.platformSettledAmount) || 0))
 
-  const clampedCreatorSettled = Math.min(creatorShare || creatorSettledAmount, creatorSettledAmount)
-  const creatorPendingAmount = roundWalletAmount(Math.max(0, creatorShare - clampedCreatorSettled))
+  const settlementTargetAmount = creatorSettlementNetAmount || creatorShare
+  const clampedCreatorSettled = Math.min(settlementTargetAmount || creatorSettledAmount, creatorSettledAmount)
+  const creatorPendingAmount = roundWalletAmount(Math.max(0, settlementTargetAmount - clampedCreatorSettled))
   const settlementStatus = normalizeSettlementStatus({
     settledAmount: clampedCreatorSettled,
-    targetAmount: creatorShare,
+    targetAmount: settlementTargetAmount,
     failed:
       picked.hasFailure ||
       isMonnifyFailedStatus(payload?.settlementStatus) ||
@@ -7499,6 +7542,8 @@ async function applyMonnifySettlementForDonation({
 
   donation.creatorSettledAmount = clampedCreatorSettled
   donation.platformSettledAmount = platformSettledAmount
+  donation.creatorSettlementVat = creatorSettlementVat
+  donation.creatorSettlementNetAmount = creatorSettlementNetAmount
   donation.settlementPendingAmount = creatorPendingAmount
   donation.settlementStatus = settlementStatus
   donation.settlementSyncedAt = new Date()
@@ -8536,17 +8581,21 @@ async function backfillMonnifySettlementStateBatch(limit = 200) {
 
   const docs = await Donation.find({
     provider: "monnify",
-    fundsFlow: "wallet",
+    fundsFlow: { $in: ["wallet", "direct_split"] },
     $or: [
       { creatorSettledAmount: { $exists: false } },
       { settlementStatus: { $exists: false } },
       { settlementPendingAmount: { $exists: false } },
+      { creatorSettlementNetAmount: { $exists: false } },
     ],
   })
     .select({
       _id: 1,
       walletStatus: 1,
+      fundsFlow: 1,
       creatorShare: 1,
+      creatorSettlementVat: 1,
+      creatorSettlementNetAmount: 1,
       creatorSettledAmount: 1,
       settlementStatus: 1,
       settlementPendingAmount: 1,
@@ -8561,14 +8610,19 @@ async function backfillMonnifySettlementStateBatch(limit = 200) {
 
   for (const donation of docs) {
     const creatorShare = Math.max(0, Number(donation.creatorShare) || 0)
+    const creatorSettlement = calculateCreatorSettlementNetAmount(creatorShare)
+    const creatorSettlementVat = Number(donation.creatorSettlementVat) || creatorSettlement.creatorSettlementVat
+    const creatorSettlementNetAmount =
+      Number(donation.creatorSettlementNetAmount) || creatorSettlement.creatorSettlementNetAmount
     const walletStatus = String(donation.walletStatus || "").toLowerCase()
+    const fundsFlow = String(donation.fundsFlow || "wallet").toLowerCase()
     const isRejected = walletStatus === "rejected"
-    const isAvailable = walletStatus === "available"
-    const creatorSettledAmount = isRejected ? 0 : isAvailable ? creatorShare : 0
-    const settlementPendingAmount = isRejected ? 0 : Math.max(0, creatorShare - creatorSettledAmount)
+    const isAvailable = walletStatus === "available" && fundsFlow === "wallet"
+    const creatorSettledAmount = isRejected ? 0 : isAvailable ? creatorSettlementNetAmount : 0
+    const settlementPendingAmount = isRejected ? 0 : Math.max(0, creatorSettlementNetAmount - creatorSettledAmount)
     const settlementStatus = normalizeSettlementStatus({
       settledAmount: creatorSettledAmount,
-      targetAmount: creatorShare,
+      targetAmount: creatorSettlementNetAmount,
       failed: isRejected,
     })
 
@@ -8577,6 +8631,8 @@ async function backfillMonnifySettlementStateBatch(limit = 200) {
       {
         $set: {
           creatorSettledAmount,
+          creatorSettlementVat,
+          creatorSettlementNetAmount,
           settlementPendingAmount,
           settlementStatus,
           settlementSyncedAt: donation.settlementSyncedAt || new Date(),
@@ -8598,7 +8654,7 @@ async function reconcileMonnifyDonationSettlements() {
   const staleSyncThreshold = new Date(Date.now() - 15 * 60 * 1000)
   const candidates = await Donation.find({
     provider: "monnify",
-    fundsFlow: "wallet",
+    fundsFlow: { $in: ["wallet", "direct_split"] },
     walletStatus: { $ne: "rejected" },
     date: { $gte: cutoffDate },
     $or: [
@@ -11520,6 +11576,7 @@ async function processMonnifyWebhookPayload({ data = {}, source = "http" }) {
     }
 
     const donationFundsFlow = getIncomingDonationFundsFlow()
+    const creatorSettlement = calculateCreatorSettlementNetAmount(split.creatorShare)
     const donation = await Donation.create({
       creatorId: creator._id,
       creatorEmail: creator.email,
@@ -11543,9 +11600,11 @@ async function processMonnifyWebhookPayload({ data = {}, source = "http" }) {
       monnifyPaymentReference: paymentReference || undefined,
       creatorSubAccountCode: compactString(creator?.payoutProfile?.monnifySubAccountCode || "") || undefined,
       platformSubAccountCode: compactString(MONNIFY_PLATFORM_SUBACCOUNT_CODE || "") || undefined,
+      creatorSettlementVat: creatorSettlement.creatorSettlementVat,
+      creatorSettlementNetAmount: creatorSettlement.creatorSettlementNetAmount,
       creatorSettledAmount: 0,
       platformSettledAmount: 0,
-      settlementPendingAmount: split.creatorShare,
+      settlementPendingAmount: creatorSettlement.creatorSettlementNetAmount,
       settlementStatus: "pending",
       settlementReferences: getMonnifySettlementReferences(eventData, transactionReference || paymentReference),
       fundsFlow: donationFundsFlow,
@@ -12004,6 +12063,7 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
 
     const split = calculateRevenueSplit(amount)
     const donationFundsFlow = getIncomingDonationFundsFlow()
+    const creatorSettlement = calculateCreatorSettlementNetAmount(split.creatorShare)
     const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1_000_000)}`
     const donation = await Donation.create({
       creatorId: req.user._id,
@@ -12017,6 +12077,12 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
       paymentStatus: "PAID",
       provider: "monnify",
       fundsFlow: donationFundsFlow,
+      creatorSettlementVat: creatorSettlement.creatorSettlementVat,
+      creatorSettlementNetAmount: creatorSettlement.creatorSettlementNetAmount,
+      creatorSettledAmount: 0,
+      platformSettledAmount: 0,
+      settlementPendingAmount: creatorSettlement.creatorSettlementNetAmount,
+      settlementStatus: "pending",
       transactionReference: `TEST-TXN-${uniqueSuffix}`,
       destinationAccountNumber: req.user.virtualAccount.accountNumber,
       destinationBankName: req.user.virtualAccount.bankName || "Monnify",
@@ -12471,6 +12537,12 @@ app.get("/donations", requireSessionUser, async (req, res) => {
         paymentStatus: 1,
         walletStatus: 1,
         fundsFlow: 1,
+        creatorSettlementVat: 1,
+        creatorSettlementNetAmount: 1,
+        creatorSettledAmount: 1,
+        settlementPendingAmount: 1,
+        settlementStatus: 1,
+        settlementSyncedAt: 1,
         riskFlags: 1,
         transactionReference: 1,
         paystackReference: 1,
