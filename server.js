@@ -133,6 +133,10 @@ const OVERLAY_PUBLIC_RESPONSE_DONATION_LIMIT = Math.min(
   120,
   Math.max(30, Number(readEnv("OVERLAY_PUBLIC_RESPONSE_DONATION_LIMIT") || 100)),
 )
+const OVERLAY_PUBLIC_LEADERBOARD_LIMIT = Math.min(
+  10,
+  Math.max(1, Number(readEnv("OVERLAY_PUBLIC_LEADERBOARD_LIMIT") || 5)),
+)
 const SOCKET_IO_ADAPTER = String(readEnv("SOCKET_IO_ADAPTER") || "memory")
   .trim()
   .toLowerCase()
@@ -5385,6 +5389,50 @@ function isOverlayDonationVisibleInPublicOverlay(donation) {
   return walletStatus === "available"
 }
 
+function buildPublicOverlayLeaderboard(donations = [], manualEntries = []) {
+  const totalsByName = new Map()
+
+  const addContributorAmount = (rawName, rawAmount) => {
+    const name = String(rawName || "Anonymous").trim() || "Anonymous"
+    const amount = Number(rawAmount) || 0
+
+    if (amount <= 0) {
+      return
+    }
+
+    const current = totalsByName.get(name) || {
+      id: name,
+      name,
+      amount: 0,
+    }
+
+    current.amount += amount
+    totalsByName.set(name, current)
+  }
+
+  donations
+    .filter((donation) => isOverlayDonationVisibleInPublicOverlay(donation))
+    .forEach((donation) => {
+      addContributorAmount(
+        donation.alertDisplayName || donation.sender,
+        donation.amount,
+      )
+    })
+
+  manualEntries.forEach((entry) => {
+    addContributorAmount(entry.name, entry.amount)
+  })
+
+  return Array.from(totalsByName.values())
+    .sort((left, right) => right.amount - left.amount)
+    .slice(0, OVERLAY_PUBLIC_LEADERBOARD_LIMIT)
+    .map((contributor, index) => ({
+      ...contributor,
+      rank: index + 1,
+      isChampion: index === 0,
+    }))
+}
+
 function buildPublicOverlayUserLean(user) {
   if (!user) {
     return null
@@ -5499,6 +5547,10 @@ async function buildPublicOverlayCacheEntry(creatorId) {
     .filter((donation) => isOverlayDonationVisibleInPublicOverlay(donation))
     .slice(0, OVERLAY_PUBLIC_RESPONSE_DONATION_LIMIT)
     .map(sanitizeCreatorDonation)
+  const leaderboard = buildPublicOverlayLeaderboard(
+    candidateDonations,
+    overlayState.manualLeaderboardEntries,
+  )
 
   return {
     notFound: false,
@@ -5506,6 +5558,7 @@ async function buildPublicOverlayCacheEntry(creatorId) {
       ...overlayState,
       user: buildPublicOverlayUserLean(user),
       donations,
+      leaderboard,
     },
     etag,
     lastModifiedMs,
