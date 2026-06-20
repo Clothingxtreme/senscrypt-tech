@@ -962,6 +962,7 @@ const defaultOverlayCustomization = {
   leaderboardOpacity: 0.88,
   accountOpacity: 0.9,
   showLeaderboard: true,
+  leaderboardDisplayMode: "top5",
   showGoal: true,
   showAccountDetails: true,
   showTopSupporter: true,
@@ -3600,9 +3601,15 @@ function migrateLegacyOverlayGradient(value, key) {
 
 function sanitizeOverlayCustomizationForServer(value) {
   const customization = sanitizePlainObject(value, defaultOverlayCustomization)
+  const leaderboardDisplayMode =
+    customization.leaderboardDisplayMode === "champion" ||
+    customization.leaderboardDisplayMode === "top5"
+      ? customization.leaderboardDisplayMode
+      : defaultOverlayCustomization.leaderboardDisplayMode
 
   return {
     ...customization,
+    leaderboardDisplayMode,
     goalGradient: migrateLegacyOverlayGradient(customization.goalGradient, "goalGradient"),
     leaderboardGradient: migrateLegacyOverlayGradient(
       customization.leaderboardGradient,
