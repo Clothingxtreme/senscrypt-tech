@@ -5862,6 +5862,31 @@ function getMonnifySettlementReferences(payload = {}, fallbackReference = "") {
   return Array.from(refs)
 }
 
+function getMonnifySettlementTransactionReferences(payload = {}, data = {}) {
+  const refs = new Set()
+  const push = (value) => {
+    const normalized = compactString(value)
+    if (normalized) refs.add(normalized)
+  }
+
+  const topLevelReferences = getMonnifyPaymentReferences(payload, data)
+  push(topLevelReferences.transactionReference)
+  push(topLevelReferences.paymentReference)
+  push(payload?.transactionReference)
+  push(payload?.paymentReference)
+  push(data?.transactionReference)
+  push(data?.paymentReference)
+
+  parseMonnifyBeneficiaryRows(payload).forEach((row) => {
+    push(row?.transactionReference)
+    push(row?.paymentReference)
+    push(row?.beneficiaryReference)
+    push(row?.reference)
+  })
+
+  return Array.from(refs)
+}
+
 function pickMonnifySettlementAmounts({
   rows = [],
   creatorSubAccountCode = "",
@@ -7598,6 +7623,78 @@ async function applyMonnifySettlementForDonation({
     creatorSettledAmount: clampedCreatorSettled,
     creatorPendingAmount,
   }
+}
+
+async function applyMonnifySettlementNotificationToPendingDonations({
+  data = {},
+  eventData = {},
+  eventType = "",
+  source = "webhook",
+}) {
+  if (!isMonnifySettlementSignal({ eventType, payload: eventData })) {
+    return { matched: 0, updated: 0, skipped: 0 }
+  }
+
+  const references = getMonnifySettlementTransactionReferences(eventData, data)
+  if (!references.length) {
+    await createAuditLog({
+      actorType: "system",
+      eventType: "webhook.monnify.settlement_unmatched",
+      message: "Monnify settlement notification did not include transaction references.",
+      metadata: {
+        source,
+        eventType,
+        settlementReferences: getMonnifySettlementReferences(eventData),
+      },
+    })
+    return { matched: 0, updated: 0, skipped: 0 }
+  }
+
+  const donations = await Donation.find({
+    provider: "monnify",
+    walletStatus: { $ne: "rejected" },
+    settlementStatus: { $in: ["pending", "partial", "unknown"] },
+    $or: [
+      { transactionReference: { $in: references } },
+      { monnifyTransactionReference: { $in: references } },
+      { monnifyPaymentReference: { $in: references } },
+    ],
+  })
+
+  let updated = 0
+  let skipped = 0
+
+  for (const donation of donations) {
+    const reference = compactString(
+      donation.monnifyTransactionReference ||
+        donation.monnifyPaymentReference ||
+        donation.transactionReference ||
+        donation._id,
+    )
+
+    await withWebhookReferenceLock(reference, async () => {
+      const freshDonation = await Donation.findById(donation._id)
+      if (!freshDonation) {
+        skipped += 1
+        return
+      }
+
+      const result = await applyMonnifySettlementForDonation({
+        donation: freshDonation,
+        payload: eventData,
+        eventType,
+        source,
+      })
+
+      if (result.updated) {
+        updated += 1
+      } else {
+        skipped += 1
+      }
+    })
+  }
+
+  return { matched: donations.length, updated, skipped }
 }
 
 function getPayoutBankProvider() {
@@ -11420,6 +11517,22 @@ async function processMonnifyWebhookPayload({ data = {}, source = "http" }) {
   )
   const split = calculateRevenueSplit(grossAmount)
 
+  if (settlementSignal) {
+    const settlementResult = await applyMonnifySettlementNotificationToPendingDonations({
+      data,
+      eventData,
+      eventType,
+      source,
+    })
+
+    if (settlementResult.matched > 0) {
+      return {
+        status: "settlement_processed",
+        ...settlementResult,
+      }
+    }
+  }
+
   if (paymentStatus && paymentStatus !== "PAID") {
     await upsertComplianceInflowFromMonnify({
       eventType,
@@ -11852,6 +11965,26 @@ async function enqueueMonnifyWebhookPayload(data = {}) {
   return { deduped: false, idempotencyKey }
 }
 
+function processMonnifyWebhookPayloadInBackground(data = {}, source = "background") {
+  setImmediate(() => {
+    const startedAt = Date.now()
+    void processMonnifyWebhookPayload({ data, source })
+      .then((result) => {
+        webhookPipelineMetrics.monnifyInlineProcessed += 1
+        if (result?.status === "deduped") {
+          webhookPipelineMetrics.monnifyDeduped += 1
+        }
+        webhookPipelineMetrics.lastProcessedAt = new Date().toISOString()
+        webhookPipelineMetrics.lastDurationMs = Date.now() - startedAt
+      })
+      .catch((error) => {
+        console.error("webhook.monnify.background_failed", error)
+        webhookPipelineMetrics.monnifyFailed += 1
+        webhookPipelineMetrics.lastError = error instanceof Error ? error.message : String(error)
+      })
+  })
+}
+
 function startMonitoringHeartbeat() {
   if (monitoringHeartbeatTimer) {
     return
@@ -11966,33 +12099,25 @@ app.post("/webhook/monnify", webhookLimiter, async (req, res) => {
         ? data.eventData
         : data.responseBody) || data
 
-    let enqueueFailed = false
     if (webhookQueueMode === "bullmq" && monnifyWebhookQueue) {
       try {
         await enqueueMonnifyWebhookPayload(data)
         return res.sendStatus(200)
       } catch (enqueueError) {
-        enqueueFailed = true
         webhookPipelineMetrics.monnifyQueueFallback += 1
         webhookPipelineMetrics.lastError =
           enqueueError instanceof Error ? enqueueError.message : String(enqueueError)
       }
     }
 
-    if (!enqueueFailed) {
-      const idempotencyKey = buildMonnifyWebhookIdempotencyKey(data, eventData)
-      const claimed = await claimWebhookIdempotencyKey(idempotencyKey)
-      if (!claimed) {
-        webhookPipelineMetrics.monnifyDeduped += 1
-        return res.sendStatus(200)
-      }
+    const idempotencyKey = buildMonnifyWebhookIdempotencyKey(data, eventData)
+    const claimed = await claimWebhookIdempotencyKey(idempotencyKey)
+    if (!claimed) {
+      webhookPipelineMetrics.monnifyDeduped += 1
+      return res.sendStatus(200)
     }
 
-    const startedAt = Date.now()
-    await processMonnifyWebhookPayload({ data, source: "inline" })
-    webhookPipelineMetrics.monnifyInlineProcessed += 1
-    webhookPipelineMetrics.lastProcessedAt = new Date().toISOString()
-    webhookPipelineMetrics.lastDurationMs = Date.now() - startedAt
+    processMonnifyWebhookPayloadInBackground(data, "background")
     return res.sendStatus(200)
   } catch (error) {
     console.error(error)
