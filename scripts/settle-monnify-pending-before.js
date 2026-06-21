@@ -5,7 +5,7 @@ require("dotenv").config({ path: path.join(__dirname, "..", ".env") })
 
 const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
-const MONNIFY_CREATOR_SETTLEMENT_VAT_RATE = 0.0202
+const MONNIFY_CREATOR_SETTLEMENT_VAT_RATE = 0.0161
 const DEFAULT_CUTOFF = "2026-06-20T22:15:00+01:00"
 
 function readArg(name) {

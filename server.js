@@ -895,7 +895,7 @@ let monitoringHeartbeatTimer = null
 
 const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
-const MONNIFY_CREATOR_SETTLEMENT_VAT_RATE = 0.0202
+const MONNIFY_CREATOR_SETTLEMENT_VAT_RATE = 0.0161
 const MIN_CREATOR_WITHDRAWAL = 5000
 const TIER_LIMITS = {
   1: {
@@ -5920,6 +5920,34 @@ function isMonnifySettlementSignal({ eventType, payload = {} }) {
   return rows.length > 0
 }
 
+function isMonnifyDonationCollectionSignal({ eventType, eventData = {}, data = {} }) {
+  const normalizedEventType = String(eventType || "").toLowerCase()
+  if (/(settlement|beneficiar|wallet\.credit|split|disbursement|transfer)/i.test(normalizedEventType)) {
+    return false
+  }
+
+  const paymentStatus = String(
+    eventData.paymentStatus || eventData.status || data.paymentStatus || data.status || "",
+  ).toUpperCase()
+  if (paymentStatus !== "PAID") {
+    return false
+  }
+
+  const amount = firstValidMoneyAmount(
+    eventData.amountPaid,
+    eventData.amount,
+    eventData.totalPayable,
+    data.amount,
+    data.amountPaid,
+  )
+  if (amount <= 0) {
+    return false
+  }
+
+  const destinationDetails = getDonationDestinationDetails(eventData, data)
+  return Boolean(destinationDetails.destinationAccountNumber || getReservedAccountReference(eventData, data))
+}
+
 function getMonnifySettlementReferences(payload = {}, fallbackReference = "") {
   const refs = new Set()
   const push = (value) => {
@@ -7600,10 +7628,16 @@ async function applyMonnifySettlementForDonation({
   let platformSettledAmount = picked.platformSettledAmount
 
   if (!picked.usedBeneficiaryRows && hasSettlementSignal) {
-    const settlementAmount = firstValidMoneyAmount(payload?.settlementAmount)
+    const settlementAmount = firstValidMoneyAmount(
+      payload?.creatorSettlementAmount,
+      payload?.beneficiaryAmount,
+      payload?.settlementAmount,
+    )
     if (settlementAmount > 0 && creatorSettlementNetAmount > 0 && Number(donation.amount) > 0) {
-      const ratio = creatorSettlementNetAmount / Math.max(1, Number(donation.amount))
-      creatorSettledAmount = Math.min(creatorSettlementNetAmount, settlementAmount * ratio)
+      creatorSettledAmount =
+        settlementAmount + 0.01 >= creatorSettlementNetAmount
+          ? creatorSettlementNetAmount
+          : Math.min(creatorSettlementNetAmount, settlementAmount)
       if (platformFee > 0) {
         platformSettledAmount = Math.min(platformFee, Math.max(0, settlementAmount - creatorSettledAmount))
       }
@@ -11624,6 +11658,33 @@ async function processMonnifyWebhookPayload({ data = {}, source = "http" }) {
         status: "settlement_processed",
         ...settlementResult,
       }
+    }
+
+    if (!isMonnifyDonationCollectionSignal({ eventType, eventData, data })) {
+      await upsertComplianceInflowFromMonnify({
+        eventType,
+        eventData,
+        data,
+        creator,
+        status: "held",
+        validationReason:
+          "Settlement notification did not match an existing donation; it was not recorded as a new gift.",
+      })
+
+      await createAuditLog({
+        actorType: "system",
+        eventType: "webhook.monnify.settlement_unmatched_ignored",
+        message: "Ignored unmatched Monnify settlement notification so it does not create a duplicate pending gift.",
+        metadata: {
+          source,
+          eventType,
+          transactionReference,
+          paymentReference,
+          settlementReferences: getMonnifySettlementReferences(eventData),
+        },
+      })
+
+      return { status: "ignored_unmatched_settlement" }
     }
   }
 
