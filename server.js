@@ -4849,10 +4849,16 @@ function sanitizeCreatorDonation(donation) {
   const provider = String(donation.provider || "monnify").toLowerCase()
   const fundsFlow = String(donation.fundsFlow || "wallet").toLowerCase()
   const isMonnifySettlementTracked = provider === "monnify" && ["wallet", "direct_split"].includes(fundsFlow)
+  const isPaidMonnifyDonation =
+    provider === "monnify" &&
+    String(donation.paymentStatus || "").toUpperCase() === "PAID" &&
+    String(donation.walletStatus || "").toLowerCase() !== "rejected"
   const settlementStatus = String(donation.settlementStatus || "pending").toLowerCase()
   const walletStatus = String(donation.walletStatus || "available").toLowerCase()
   const status =
-    isMonnifySettlementTracked
+    isPaidMonnifyDonation
+      ? "completed"
+      : isMonnifySettlementTracked
       ? settlementStatus === "settled"
         ? "completed"
         : settlementStatus === "failed"
@@ -4881,7 +4887,7 @@ function sanitizeCreatorDonation(donation) {
     message: donation.alertMessage || donation.narration || "",
     provider: donation.provider || "monnify",
     paymentStatus: donation.paymentStatus || "",
-    walletStatus: donation.walletStatus || "available",
+    walletStatus: isPaidMonnifyDonation ? "available" : donation.walletStatus || "available",
     fundsFlow: donation.fundsFlow || "wallet",
     status,
     riskFlags: donation.riskFlags || [],
@@ -5397,12 +5403,28 @@ function invalidateOverlayPublicCache(creatorId) {
 
 function isOverlayDonationVisibleInPublicOverlay(donation) {
   const walletStatus = String(donation?.walletStatus || "").toLowerCase().trim()
+  const isPaidMonnifyDonation =
+    String(donation?.provider || "").toLowerCase() === "monnify" &&
+    String(donation?.paymentStatus || "").toUpperCase() === "PAID" &&
+    walletStatus !== "rejected"
+
+  if (isPaidMonnifyDonation) {
+    return true
+  }
 
   if (!walletStatus) {
     return true
   }
 
   return walletStatus === "available"
+}
+
+function isPaidMonnifyDonationForStream(donation) {
+  return (
+    String(donation?.provider || "").toLowerCase() === "monnify" &&
+    String(donation?.paymentStatus || "").toUpperCase() === "PAID" &&
+    String(donation?.walletStatus || "").toLowerCase() !== "rejected"
+  )
 }
 
 function buildPublicOverlayUserLean(user) {
@@ -10143,10 +10165,14 @@ async function applyWalletCredit({ creator, donation, status }) {
 
 function buildOverlayAlertPayload(donation) {
   const walletStatus = String(donation.walletStatus || "").toLowerCase()
+  const paidMonnifyDonation = isPaidMonnifyDonationForStream(donation)
   const alertStatus =
-    walletStatus === "pending_review" || walletStatus === "migration_hold"
+    paidMonnifyDonation
+      ? "available"
+      : walletStatus === "pending_review" || walletStatus === "migration_hold"
       ? "pending_review"
       : "available"
+  const alertWalletStatus = paidMonnifyDonation ? "available" : donation.walletStatus || "available"
 
   return {
     id: donation._id?.toString?.() || String(donation._id || donation.transactionReference || ""),
@@ -10156,7 +10182,7 @@ function buildOverlayAlertPayload(donation) {
     provider: donation.provider || "monnify",
     fundsFlow: donation.fundsFlow || "wallet",
     paymentStatus: donation.paymentStatus || "",
-    walletStatus: donation.walletStatus || "available",
+    walletStatus: alertWalletStatus,
     displayName: donation.alertDisplayName || donation.sender || "Someone sent you a tip",
     narration: donation.alertMessage || donation.narration || "",
     message: donation.alertMessage || donation.narration || "",
@@ -10174,10 +10200,14 @@ function buildOverlayAlertPayload(donation) {
 
 function emitDonationAlert(creatorId, donation) {
   const walletStatus = String(donation.walletStatus || "").toLowerCase()
+  const paidMonnifyDonation = isPaidMonnifyDonationForStream(donation)
   const alertStatus =
-    walletStatus === "pending_review" || walletStatus === "migration_hold"
+    paidMonnifyDonation
+      ? "available"
+      : walletStatus === "pending_review" || walletStatus === "migration_hold"
       ? "pending_review"
       : "available"
+  const alertWalletStatus = paidMonnifyDonation ? "available" : donation.walletStatus || "available"
 
   const transactionReference =
     donation.transactionReference ||
@@ -10195,7 +10225,7 @@ function emitDonationAlert(creatorId, donation) {
         ? donation.creatorShare
         : calculateRevenueSplit(donation.amount).creatorShare,
     provider: donation.provider || "monnify",
-    walletStatus: donation.walletStatus || "available",
+    walletStatus: alertWalletStatus,
     fundsFlow: donation.fundsFlow || "wallet",
     paymentStatus: donation.paymentStatus || "",
     transactionReference,
