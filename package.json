@@ -8,6 +8,7 @@
     "dev": "node server.js",
     "encrypt-identity": "node scripts/encrypt-identity-fields.js",
     "settle-monnify-pending-before": "node scripts/settle-monnify-pending-before.js",
+    "settle-monnify-pending-due-now": "node scripts/settle-monnify-pending-due-now.js",
     "settle-monnify-pending-yesterday-11pm": "node scripts/settle-monnify-pending-yesterday-11pm.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

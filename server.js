@@ -5887,10 +5887,10 @@ function normalizeSettlementStatus({ settledAmount, targetAmount, failed = false
 }
 
 const LAGOS_TIME_OFFSET_MS = 60 * 60 * 1000
-const MONNIFY_DAILY_SETTLEMENT_CUTOFF_HOUR = 22
-const MONNIFY_DAILY_SETTLEMENT_CUTOFF_MINUTE = 0
+const MONNIFY_DAILY_SETTLEMENT_CUTOFF_HOUR = 21
+const MONNIFY_DAILY_SETTLEMENT_CUTOFF_MINUTE = 50
 const MONNIFY_DAILY_SETTLEMENT_CLEAR_HOUR = 22
-const MONNIFY_DAILY_SETTLEMENT_CLEAR_MINUTE = 20
+const MONNIFY_DAILY_SETTLEMENT_CLEAR_MINUTE = 0
 
 function shiftUtcDateToLagos(value = new Date()) {
   const date = value instanceof Date ? value : new Date(value)
@@ -17024,7 +17024,7 @@ setInterval(() => {
   }
 
   monnifyDailySettlementClearRunning = true
-  void autoSettleMonnifyDonationBatch({ source: "daily_10_20_lagos_cutoff" })
+  void autoSettleMonnifyDonationBatch({ source: "daily_10pm_lagos_950pm_cutoff" })
     .then((result) => {
       if (result.settled > 0) {
         console.log("monnify.daily_settlement_clear.completed", {
