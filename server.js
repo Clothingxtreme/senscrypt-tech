@@ -217,6 +217,17 @@ const MONNIFY_SETTLEMENT_RECONCILE_LOOKBACK_DAYS = Math.max(
 const MONNIFY_SETTLEMENT_SYNC_ON_PAID_WEBHOOK = !/^(0|false|no)$/i.test(
   readEnv("MONNIFY_SETTLEMENT_SYNC_ON_PAID_WEBHOOK"),
 )
+const MONNIFY_DAILY_SETTLEMENT_CLEAR_ENABLED = !/^(0|false|no)$/i.test(
+  readEnv("MONNIFY_DAILY_SETTLEMENT_CLEAR_ENABLED"),
+)
+const MONNIFY_DAILY_SETTLEMENT_CLEAR_INTERVAL_MS = Math.max(
+  60_000,
+  Math.min(3_600_000, Number(readEnv("MONNIFY_DAILY_SETTLEMENT_CLEAR_INTERVAL_MS") || 300_000)),
+)
+const MONNIFY_DAILY_SETTLEMENT_CLEAR_BATCH_SIZE = Math.max(
+  1,
+  Math.min(1000, Number(readEnv("MONNIFY_DAILY_SETTLEMENT_CLEAR_BATCH_SIZE") || 300)),
+)
 const MONITORING_HEARTBEAT_SECONDS = Math.max(
   15,
   Math.min(3600, Number(readEnv("MONITORING_HEARTBEAT_SECONDS") || 60)),
@@ -5875,6 +5886,77 @@ function normalizeSettlementStatus({ settledAmount, targetAmount, failed = false
   return "partial"
 }
 
+const LAGOS_TIME_OFFSET_MS = 60 * 60 * 1000
+const MONNIFY_DAILY_SETTLEMENT_CUTOFF_HOUR = 22
+const MONNIFY_DAILY_SETTLEMENT_CUTOFF_MINUTE = 0
+const MONNIFY_DAILY_SETTLEMENT_CLEAR_HOUR = 22
+const MONNIFY_DAILY_SETTLEMENT_CLEAR_MINUTE = 20
+
+function shiftUtcDateToLagos(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value)
+  return new Date(date.getTime() + LAGOS_TIME_OFFSET_MS)
+}
+
+function getLagosDateParts(value = new Date()) {
+  const lagosDate = shiftUtcDateToLagos(value)
+  return {
+    year: lagosDate.getUTCFullYear(),
+    month: lagosDate.getUTCMonth(),
+    day: lagosDate.getUTCDate(),
+    hour: lagosDate.getUTCHours(),
+    minute: lagosDate.getUTCMinutes(),
+    second: lagosDate.getUTCSeconds(),
+  }
+}
+
+function lagosDateTimeToUtcDate({ year, month, day, hour = 0, minute = 0, second = 0, millisecond = 0 }) {
+  return new Date(Date.UTC(year, month, day, hour, minute, second, millisecond) - LAGOS_TIME_OFFSET_MS)
+}
+
+function addUtcDays(value, days) {
+  const date = new Date(value)
+  date.setUTCDate(date.getUTCDate() + days)
+  return date
+}
+
+function getLagosStartOfDayUtc(value = new Date()) {
+  const parts = getLagosDateParts(value)
+  return lagosDateTimeToUtcDate(parts)
+}
+
+function isSameLagosDate(left, right) {
+  const leftParts = getLagosDateParts(left)
+  const rightParts = getLagosDateParts(right)
+
+  return (
+    leftParts.year === rightParts.year &&
+    leftParts.month === rightParts.month &&
+    leftParts.day === rightParts.day
+  )
+}
+
+function getLatestMonnifyDailySettlementCutoff(now = new Date()) {
+  const todayStart = getLagosStartOfDayUtc(now)
+  const todayClearAt = lagosDateTimeToUtcDate({
+    ...getLagosDateParts(todayStart),
+    hour: MONNIFY_DAILY_SETTLEMENT_CLEAR_HOUR,
+    minute: MONNIFY_DAILY_SETTLEMENT_CLEAR_MINUTE,
+  })
+  const cutoffDayStart = now >= todayClearAt ? todayStart : addUtcDays(todayStart, -1)
+  const cutoffDate = lagosDateTimeToUtcDate({
+    ...getLagosDateParts(cutoffDayStart),
+    hour: MONNIFY_DAILY_SETTLEMENT_CUTOFF_HOUR,
+    minute: MONNIFY_DAILY_SETTLEMENT_CUTOFF_MINUTE,
+  })
+  const clearAt = lagosDateTimeToUtcDate({
+    ...getLagosDateParts(cutoffDayStart),
+    hour: MONNIFY_DAILY_SETTLEMENT_CLEAR_HOUR,
+    minute: MONNIFY_DAILY_SETTLEMENT_CLEAR_MINUTE,
+  })
+
+  return { cutoffDate, clearAt }
+}
+
 function parseMonnifyBeneficiaryRows(payload) {
   const candidates = [
     payload?.transactionBeneficiaries,
@@ -8855,6 +8937,143 @@ async function backfillMonnifySettlementStateBatch(limit = 200) {
   }
 
   return docs.length
+}
+
+async function autoSettleMonnifyDonationBatch({
+  now = new Date(),
+  cutoffDate,
+  batchSize = MONNIFY_DAILY_SETTLEMENT_CLEAR_BATCH_SIZE,
+  respectNewCreatorDelay = true,
+  source = "daily_cutoff_job",
+} = {}) {
+  if (!isDatabaseConnected()) {
+    return { checked: 0, settled: 0, skippedNewCreators: 0, cutoffDate: null, affectedCreators: 0 }
+  }
+
+  const resolvedCutoff = cutoffDate || getLatestMonnifyDailySettlementCutoff(now).cutoffDate
+  const candidates = await Donation.find({
+    provider: "monnify",
+    fundsFlow: { $in: ["wallet", "direct_split"] },
+    walletStatus: { $ne: "rejected" },
+    date: { $lte: resolvedCutoff },
+    settlementStatus: { $in: ["pending", "partial", "unknown", "PENDING_SETTLEMENT"] },
+  })
+    .select({
+      _id: 1,
+      creatorId: 1,
+      amount: 1,
+      creatorShare: 1,
+      creatorSettlementVat: 1,
+      creatorSettlementNetAmount: 1,
+      creatorSettledAmount: 1,
+      settlementReferences: 1,
+      date: 1,
+    })
+    .sort({ date: 1 })
+    .limit(Math.max(1, Math.min(1000, Number(batchSize) || MONNIFY_DAILY_SETTLEMENT_CLEAR_BATCH_SIZE)))
+
+  const firstDonationDateByCreator = new Map()
+  const operations = []
+  const affectedCreatorIds = new Set()
+  let skippedNewCreators = 0
+
+  for (const donation of candidates) {
+    const creatorKey = String(donation.creatorId || "")
+
+    if (respectNewCreatorDelay && creatorKey) {
+      if (!firstDonationDateByCreator.has(creatorKey)) {
+        const firstDonation = await Donation.findOne({
+          creatorId: donation.creatorId,
+          provider: "monnify",
+          fundsFlow: { $in: ["wallet", "direct_split"] },
+          walletStatus: { $ne: "rejected" },
+        })
+          .select({ date: 1 })
+          .sort({ date: 1 })
+
+        firstDonationDateByCreator.set(creatorKey, firstDonation?.date || donation.date)
+      }
+
+      const firstDonationDate = firstDonationDateByCreator.get(creatorKey)
+      if (firstDonationDate && isSameLagosDate(firstDonationDate, resolvedCutoff)) {
+        skippedNewCreators += 1
+        continue
+      }
+    }
+
+    const creatorShare =
+      Number(donation.creatorShare) > 0
+        ? Number(donation.creatorShare)
+        : calculateRevenueSplit(donation.amount).creatorShare
+    const creatorSettlement = calculateCreatorSettlementNetAmount(creatorShare)
+    const creatorSettlementVat =
+      Number(donation.creatorSettlementVat) > 0
+        ? Number(donation.creatorSettlementVat)
+        : creatorSettlement.creatorSettlementVat
+    const creatorSettlementNetAmount =
+      Number(donation.creatorSettlementNetAmount) > 0
+        ? Number(donation.creatorSettlementNetAmount)
+        : creatorSettlement.creatorSettlementNetAmount
+    const settlementReferences = Array.isArray(donation.settlementReferences)
+      ? donation.settlementReferences
+      : []
+    const referenceNote = `${source}-settled-before-${resolvedCutoff.toISOString()}`
+
+    operations.push({
+      updateOne: {
+        filter: { _id: donation._id },
+        update: {
+          $set: {
+            creatorShare,
+            creatorSettlementVat,
+            creatorSettlementNetAmount,
+            creatorSettledAmount: creatorSettlementNetAmount,
+            settlementPendingAmount: 0,
+            settlementStatus: "settled",
+            settlementSyncedAt: now,
+            settlementConfirmedAt: now,
+            settlementLastError: "",
+            settlementReferences: Array.from(new Set([...settlementReferences, referenceNote])),
+          },
+        },
+      },
+    })
+
+    if (creatorKey) {
+      affectedCreatorIds.add(creatorKey)
+    }
+  }
+
+  if (!operations.length) {
+    return {
+      checked: candidates.length,
+      settled: 0,
+      skippedNewCreators,
+      cutoffDate: resolvedCutoff,
+      affectedCreators: 0,
+    }
+  }
+
+  const result = await Donation.bulkWrite(operations, { ordered: false })
+
+  for (const creatorId of affectedCreatorIds) {
+    try {
+      await syncCreatorWalletFromLedger(creatorId)
+    } catch (error) {
+      console.error("monnify.daily_settlement.wallet_sync_failed", {
+        creatorId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  return {
+    checked: candidates.length,
+    settled: result.modifiedCount || 0,
+    skippedNewCreators,
+    cutoffDate: resolvedCutoff,
+    affectedCreators: affectedCreatorIds.size,
+  }
 }
 
 async function reconcileMonnifyDonationSettlements() {
@@ -16797,3 +17016,30 @@ setInterval(() => {
       monnifySettlementReconciliationRunning = false
     })
 }, MONNIFY_SETTLEMENT_RECONCILE_INTERVAL_MS)
+
+let monnifyDailySettlementClearRunning = false
+setInterval(() => {
+  if (monnifyDailySettlementClearRunning || !MONNIFY_DAILY_SETTLEMENT_CLEAR_ENABLED) {
+    return
+  }
+
+  monnifyDailySettlementClearRunning = true
+  void autoSettleMonnifyDonationBatch({ source: "daily_10_20_lagos_cutoff" })
+    .then((result) => {
+      if (result.settled > 0) {
+        console.log("monnify.daily_settlement_clear.completed", {
+          cutoffDate: result.cutoffDate?.toISOString?.() || "",
+          settled: result.settled,
+          checked: result.checked,
+          skippedNewCreators: result.skippedNewCreators,
+          affectedCreators: result.affectedCreators,
+        })
+      }
+    })
+    .catch((error) => {
+      console.error("monnify.daily_settlement_clear.interval_failed", error)
+    })
+    .finally(() => {
+      monnifyDailySettlementClearRunning = false
+    })
+}, MONNIFY_DAILY_SETTLEMENT_CLEAR_INTERVAL_MS)
