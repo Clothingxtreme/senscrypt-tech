@@ -1646,6 +1646,15 @@ const userSchema = new mongoose.Schema(
     proofOfAddressSubmitted: { type: Boolean, default: false },
     bankStatementSubmitted: { type: Boolean, default: false },
     socialMediaVerified: { type: Boolean, default: false },
+    socialProfile: {
+      platform: { type: String, default: "" },
+      handle: { type: String, default: "" },
+      profileUrl: { type: String, default: "" },
+      liveUrl: { type: String, default: "" },
+      isLive: { type: Boolean, default: false },
+      notes: { type: String, default: "" },
+      updatedAt: Date,
+    },
     kycUpgradeStatus: {
       type: String,
       enum: ["none", "awaiting_review", "approved", "rejected"],
@@ -3388,6 +3397,49 @@ function sanitizeWallet(wallet) {
   }
 }
 
+function normalizeSocialUrl(value) {
+  const raw = String(value || "").trim()
+  if (!raw) return ""
+
+  if (/^https?:\/\//i.test(raw)) {
+    return raw.slice(0, 500)
+  }
+
+  if (/^[a-z0-9.-]+\.[a-z]{2,}(\/.*)?$/i.test(raw)) {
+    return `https://${raw}`.slice(0, 500)
+  }
+
+  return raw.slice(0, 500)
+}
+
+function sanitizeSocialProfile(profile) {
+  const source = profile && typeof profile === "object" ? profile : {}
+
+  return {
+    platform: String(source.platform || "").trim().slice(0, 40),
+    handle: String(source.handle || "").trim().replace(/^@+/, "").slice(0, 80),
+    profileUrl: normalizeSocialUrl(source.profileUrl),
+    liveUrl: normalizeSocialUrl(source.liveUrl),
+    isLive: Boolean(source.isLive),
+    notes: String(source.notes || "").trim().slice(0, 300),
+    updatedAt: source.updatedAt || "",
+  }
+}
+
+function buildSocialUrlFromHandle(platform, handle) {
+  const cleanPlatform = String(platform || "").trim().toLowerCase()
+  const cleanHandle = String(handle || "").trim().replace(/^@+/, "")
+
+  if (!cleanHandle) return ""
+  if (cleanPlatform === "tiktok") return `https://www.tiktok.com/@${cleanHandle}`
+  if (cleanPlatform === "instagram") return `https://www.instagram.com/${cleanHandle}`
+  if (cleanPlatform === "youtube") return `https://www.youtube.com/@${cleanHandle}`
+  if (cleanPlatform === "x" || cleanPlatform === "twitter") return `https://x.com/${cleanHandle}`
+  if (cleanPlatform === "twitch") return `https://www.twitch.tv/${cleanHandle}`
+
+  return ""
+}
+
 function sanitizeKyc(user) {
   const tier = getTierLevel(user)
   const limits = getTierLimits(tier)
@@ -4526,6 +4578,7 @@ function sanitizeUser(user) {
     role: user.role || "creator",
     status: user.status || "active",
     profileImage: user.profileImage || "",
+    socialProfile: sanitizeSocialProfile(user.socialProfile),
     phoneNumber: user.phoneNumber || "",
     phoneVerified: Boolean(user.phoneVerified),
     onboardingTourCompleted: Boolean(user.onboardingTourCompleted),
@@ -4602,6 +4655,8 @@ function sanitizeAdminUserListItem(user) {
     email: user.email || "",
     role: user.role || "creator",
     status: user.status || "active",
+    profileImage: user.profileImage || "",
+    socialProfile: sanitizeSocialProfile(user.socialProfile),
     identity: {
       hasBvn: Boolean(bvn),
       hasNin: Boolean(nin),
@@ -13162,6 +13217,8 @@ app.put("/user", requireSessionUser, async (req, res) => {
     const nextPhoneNumber =
       typeof req.body?.phoneNumber === "string" ? normalizePhoneNumber(req.body.phoneNumber) : user.phoneNumber
     const nextProfileImage = String(req.body?.profileImage || "").trim()
+    const socialProfileBody =
+      req.body?.socialProfile && typeof req.body.socialProfile === "object" ? req.body.socialProfile : null
     const currentPassword = String(req.body?.currentPassword || "")
     const newPassword = String(req.body?.newPassword || "")
     const nextBvn = typeof req.body?.bvn === "string" ? req.body.bvn.trim() : undefined
@@ -13210,6 +13267,23 @@ app.put("/user", requireSessionUser, async (req, res) => {
     user.email = nextEmail
     user.phoneNumber = nextPhoneNumber || ""
     user.profileImage = nextProfileImage
+    if (socialProfileBody) {
+      const platform = String(socialProfileBody.platform || "").trim().toLowerCase().slice(0, 40)
+      const handle = String(socialProfileBody.handle || "").trim().replace(/^@+/, "").slice(0, 80)
+      const profileUrl = normalizeSocialUrl(socialProfileBody.profileUrl)
+      const liveUrl = normalizeSocialUrl(socialProfileBody.liveUrl)
+
+      user.socialProfile = {
+        ...(user.socialProfile || {}),
+        platform,
+        handle,
+        profileUrl: profileUrl || buildSocialUrlFromHandle(platform, handle),
+        liveUrl,
+        notes: String(user.socialProfile?.notes || ""),
+        isLive: Boolean(user.socialProfile?.isLive),
+        updatedAt: new Date(),
+      }
+    }
     user.identity = user.identity || { bvn: "", nin: "" }
     user.identity.dateOfBirth = nextDateOfBirth
 
@@ -14906,6 +14980,8 @@ app.get("/portal/users", requireAdminSession, async (req, res) => {
           email: 1,
           role: 1,
           status: 1,
+          profileImage: 1,
+          socialProfile: 1,
           identity: 1,
           createdAt: 1,
         })
@@ -15931,6 +16007,93 @@ app.get("/admin/users", requireAdminSession, async (req, res) => {
   }
 })
 
+app.get("/admin/social-directory", requireAdminSession, async (req, res) => {
+  try {
+    const queryText = String(req.query.q || "").trim()
+    const platform = String(req.query.platform || "").trim().toLowerCase()
+    const liveOnly = String(req.query.liveOnly || "").toLowerCase() === "true"
+    const searchQuery = {}
+    const andConditions = []
+
+    if (queryText) {
+      andConditions.push({
+        $or: [
+          { email: { $regex: escapeRegex(queryText), $options: "i" } },
+          { name: { $regex: escapeRegex(queryText), $options: "i" } },
+          { firstName: { $regex: escapeRegex(queryText), $options: "i" } },
+          { middleName: { $regex: escapeRegex(queryText), $options: "i" } },
+          { lastName: { $regex: escapeRegex(queryText), $options: "i" } },
+          { "socialProfile.handle": { $regex: escapeRegex(queryText), $options: "i" } },
+          { "socialProfile.profileUrl": { $regex: escapeRegex(queryText), $options: "i" } },
+          { "socialProfile.liveUrl": { $regex: escapeRegex(queryText), $options: "i" } },
+        ],
+      })
+    }
+
+    if (platform && platform !== "all") {
+      andConditions.push({ "socialProfile.platform": { $regex: `^${escapeRegex(platform)}$`, $options: "i" } })
+    }
+
+    if (liveOnly) {
+      andConditions.push({ "socialProfile.isLive": true })
+    }
+
+    if (andConditions.length) {
+      searchQuery.$and = andConditions
+    }
+
+    const users = await User.find(searchQuery)
+      .select({
+        _id: 1,
+        name: 1,
+        firstName: 1,
+        middleName: 1,
+        lastName: 1,
+        email: 1,
+        role: 1,
+        status: 1,
+        profileImage: 1,
+        socialProfile: 1,
+        createdAt: 1,
+      })
+      .sort({ "socialProfile.isLive": -1, "socialProfile.updatedAt": -1, createdAt: -1 })
+      .limit(250)
+      .lean()
+
+    const sanitizedUsers = users.map((user) => {
+      const sanitized = sanitizeAdminUserListItem(user)
+      const socialProfile = sanitizeSocialProfile(user.socialProfile)
+      const fallbackProfileUrl = buildSocialUrlFromHandle(socialProfile.platform, socialProfile.handle)
+
+      return {
+        ...sanitized,
+        socialProfile: {
+          ...socialProfile,
+          profileUrl: socialProfile.profileUrl || fallbackProfileUrl,
+          liveUrl: socialProfile.liveUrl || socialProfile.profileUrl || fallbackProfileUrl,
+        },
+      }
+    })
+
+    res.json({
+      users: sanitizedUsers,
+      summary: {
+        total: sanitizedUsers.length,
+        live: sanitizedUsers.filter((user) => user.socialProfile?.isLive).length,
+        withSocial: sanitizedUsers.filter(
+          (user) =>
+            user.socialProfile?.handle ||
+            user.socialProfile?.profileUrl ||
+            user.socialProfile?.liveUrl,
+        ).length,
+      },
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load social directory." })
+  }
+})
+
 app.get("/admin/users/:id", requireAdminSession, async (req, res) => {
   try {
     const user = await User.findById(req.params.id).select({
@@ -15943,6 +16106,7 @@ app.get("/admin/users/:id", requireAdminSession, async (req, res) => {
       role: 1,
       status: 1,
       profileImage: 1,
+      socialProfile: 1,
       phoneNumber: 1,
       phoneVerified: 1,
       onboardingTourCompleted: 1,
@@ -16164,6 +16328,25 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
     user.phoneNumber = nextPhoneNumber || ""
     user.role = nextRole
     user.status = nextStatus
+
+    if (req.body?.socialProfile && typeof req.body.socialProfile === "object") {
+      const socialProfileBody = req.body.socialProfile
+      const platform = String(socialProfileBody.platform || "").trim().toLowerCase().slice(0, 40)
+      const handle = String(socialProfileBody.handle || "").trim().replace(/^@+/, "").slice(0, 80)
+      const profileUrl = normalizeSocialUrl(socialProfileBody.profileUrl)
+      const liveUrl = normalizeSocialUrl(socialProfileBody.liveUrl)
+
+      user.socialProfile = {
+        ...(user.socialProfile || {}),
+        platform,
+        handle,
+        profileUrl: profileUrl || buildSocialUrlFromHandle(platform, handle),
+        liveUrl,
+        isLive: Boolean(socialProfileBody.isLive),
+        notes: String(socialProfileBody.notes || "").trim().slice(0, 300),
+        updatedAt: new Date(),
+      }
+    }
 
     const dateOfBirthInput =
       typeof req.body?.dateOfBirth === "string"
