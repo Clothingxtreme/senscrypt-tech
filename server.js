@@ -1393,6 +1393,143 @@ donationSchema.index({ creatorId: 1, fundsFlow: 1, walletStatus: 1, date: -1 })
 
 const Donation = mongoose.model("Donation", donationSchema)
 
+const battleParticipantSchema = new mongoose.Schema(
+  {
+    battleId: { type: String, required: true, index: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    side: { type: String, enum: ["left", "right"], required: true },
+    displayName: { type: String, default: "" },
+    profileImage: { type: String, default: "" },
+    ready: { type: Boolean, default: false },
+    score: { type: Number, default: 0 },
+    amountRaised: { type: Number, default: 0 },
+    supporters: { type: [String], default: [] },
+    joinedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true },
+)
+
+const battleSchema = new mongoose.Schema(
+  {
+    battleId: { type: String, required: true, unique: true, index: true },
+    inviteToken: { type: String, required: true, unique: true, index: true },
+    status: {
+      type: String,
+      enum: ["waiting", "connected", "countdown", "active", "finished", "cancelled"],
+      default: "waiting",
+      index: true,
+    },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    creatorA: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    creatorB: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
+    durationSeconds: { type: Number, default: 300 },
+    countdownStartedAt: Date,
+    startedAt: Date,
+    endsAt: Date,
+    finishedAt: Date,
+    cancelledAt: Date,
+    cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    mode: { type: String, default: "normal" },
+    doublePoints: {
+      active: { type: Boolean, default: false },
+      startedAt: Date,
+      endsAt: Date,
+    },
+    finalMinuteActive: { type: Boolean, default: false },
+    winnerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    loserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    result: { type: String, enum: ["pending", "left", "right", "draw"], default: "pending" },
+    scores: {
+      left: { type: Number, default: 0 },
+      right: { type: Number, default: 0 },
+    },
+    stats: {
+      totalRaised: { type: Number, default: 0 },
+      largestDonation: { type: Number, default: 0 },
+      topSupporter: { type: String, default: "" },
+      supporterCount: { type: Number, default: 0 },
+      donationCount: { type: Number, default: 0 },
+    },
+  },
+  { timestamps: true },
+)
+
+const battleDonationSchema = new mongoose.Schema(
+  {
+    battleId: { type: String, required: true, index: true },
+    donationId: { type: mongoose.Schema.Types.ObjectId, ref: "Donation", required: true, unique: true },
+    creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    side: { type: String, enum: ["left", "right"], required: true },
+    sender: { type: String, default: "Anonymous" },
+    amount: { type: Number, default: 0 },
+    points: { type: Number, default: 0 },
+    multiplier: { type: Number, default: 1 },
+    transactionReference: { type: String, default: "", index: true },
+    countedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true },
+)
+
+const battleStatisticsSchema = new mongoose.Schema(
+  {
+    battleId: { type: String, required: true, unique: true, index: true },
+    winnerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    loserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    result: { type: String, default: "pending" },
+    totalRaised: { type: Number, default: 0 },
+    largestDonation: { type: Number, default: 0 },
+    topSupporter: { type: String, default: "" },
+    supporterCount: { type: Number, default: 0 },
+    donationCount: { type: Number, default: 0 },
+    durationSeconds: { type: Number, default: 300 },
+    finalScores: {
+      left: { type: Number, default: 0 },
+      right: { type: Number, default: 0 },
+    },
+    finishedAt: Date,
+  },
+  { timestamps: true },
+)
+
+const battleHistorySchema = new mongoose.Schema(
+  {
+    battleId: { type: String, required: true, index: true },
+    creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    opponentId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    result: { type: String, enum: ["win", "loss", "draw"], required: true, index: true },
+    finalScore: { type: Number, default: 0 },
+    opponentScore: { type: Number, default: 0 },
+    moneyRaised: { type: Number, default: 0 },
+    durationSeconds: { type: Number, default: 300 },
+    finishedAt: Date,
+  },
+  { timestamps: true },
+)
+
+const battleSettingsSchema = new mongoose.Schema(
+  {
+    creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true },
+    defaultDurationSeconds: { type: Number, default: 300 },
+    allowDoublePoints: { type: Boolean, default: true },
+    updatedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true },
+)
+
+battleParticipantSchema.index({ battleId: 1, userId: 1 }, { unique: true })
+battleParticipantSchema.index({ userId: 1, battleId: 1 })
+battleSchema.index({ status: 1, creatorA: 1 })
+battleSchema.index({ status: 1, creatorB: 1 })
+battleDonationSchema.index({ battleId: 1, creatorId: 1 })
+battleHistorySchema.index({ creatorId: 1, finishedAt: -1 })
+
+const Battle = mongoose.model("Battle", battleSchema)
+const BattleParticipant = mongoose.model("BattleParticipant", battleParticipantSchema)
+const BattleDonation = mongoose.model("BattleDonation", battleDonationSchema)
+const BattleStatistics = mongoose.model("BattleStatistics", battleStatisticsSchema)
+const BattleHistory = mongoose.model("BattleHistory", battleHistorySchema)
+const BattleSettings = mongoose.model("BattleSettings", battleSettingsSchema)
+
 const walletTransactionSchema = new mongoose.Schema({
   creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
   donationId: { type: mongoose.Schema.Types.ObjectId, ref: "Donation", index: true },
@@ -1922,6 +2059,410 @@ if (mongoose.connection.readyState === 1) {
 
 function getCreatorRoom(userId) {
   return `creator:${String(userId)}`
+}
+
+function getBattleRoom(battleId) {
+  return `battle:${String(battleId || "").trim().toUpperCase()}`
+}
+
+function generateBattleId() {
+  return `BTL-${crypto.randomBytes(4).toString("hex").toUpperCase()}`
+}
+
+function normalizeBattleId(value) {
+  const raw = String(value || "").trim()
+  const match = raw.match(/BTL-[A-Z0-9]{8}/i)
+  return match ? match[0].toUpperCase() : raw.toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 32)
+}
+
+function normalizeBattleDurationSeconds(value) {
+  const seconds = Number(value) || 300
+  return [180, 300, 600].includes(seconds) ? seconds : 300
+}
+
+function getBattleInviteUrl(battleId) {
+  return `${String(PORTAL_URL || "https://streamtips.live").replace(/\/+$/, "")}/battle/${encodeURIComponent(battleId)}`
+}
+
+function getBattleOverlayUrl(battleId) {
+  return `${String(PORTAL_URL || "https://streamtips.live").replace(/\/+$/, "")}/battle/${encodeURIComponent(battleId)}/overlay`
+}
+
+function isActiveBattleStatus(status) {
+  return ["waiting", "connected", "countdown", "active"].includes(String(status || ""))
+}
+
+function isBattleDonationEligible(donation) {
+  const amount = Number(donation?.amount) || 0
+  const walletStatus = String(donation?.walletStatus || "available").toLowerCase()
+  const settlementStatus = String(donation?.settlementStatus || "").toLowerCase()
+  const paymentStatus = String(donation?.paymentStatus || "").toUpperCase()
+  const paidMonnifyDonation = isPaidMonnifyDonationForStream(donation)
+
+  if (amount <= 0) return false
+  if (["pending_review", "rejected", "migration_hold"].includes(walletStatus)) return false
+  if (settlementStatus === "failed") return false
+  if (String(donation?.status || "").toLowerCase() === "failed") return false
+  if (paidMonnifyDonation) return true
+  if (paymentStatus && !["PAID", "SUCCESS", "SUCCESSFUL", "COMPLETED"].includes(paymentStatus)) return false
+
+  return true
+}
+
+async function getBattleSnapshot(battleOrId) {
+  const battle =
+    typeof battleOrId === "string"
+      ? await Battle.findOne({ battleId: normalizeBattleId(battleOrId) }).lean()
+      : battleOrId?.toObject
+        ? battleOrId.toObject()
+        : battleOrId
+
+  if (!battle) return null
+
+  const [participants, donations] = await Promise.all([
+    BattleParticipant.find({ battleId: battle.battleId }).populate("userId", "name firstName middleName lastName email profileImage").lean(),
+    BattleDonation.find({ battleId: battle.battleId }).sort({ countedAt: -1 }).limit(10).lean(),
+  ])
+  const participantBySide = new Map(participants.map((participant) => [participant.side, participant]))
+  const left = participantBySide.get("left") || null
+  const right = participantBySide.get("right") || null
+  const now = Date.now()
+  const endsAtMs = battle.endsAt ? new Date(battle.endsAt).getTime() : 0
+  const doubleEndsAtMs = battle.doublePoints?.endsAt ? new Date(battle.doublePoints.endsAt).getTime() : 0
+
+  return {
+    battleId: battle.battleId,
+    inviteLink: getBattleInviteUrl(battle.battleId),
+    overlayLink: getBattleOverlayUrl(battle.battleId),
+    status: battle.status,
+    durationSeconds: Number(battle.durationSeconds) || 300,
+    mode: battle.mode || "normal",
+    createdAt: battle.createdAt,
+    startedAt: battle.startedAt || "",
+    endsAt: battle.endsAt || "",
+    finishedAt: battle.finishedAt || "",
+    remainingSeconds: battle.status === "active" && endsAtMs ? Math.max(0, Math.ceil((endsAtMs - now) / 1000)) : 0,
+    doublePoints: {
+      active: Boolean(battle.doublePoints?.active && doubleEndsAtMs > now),
+      endsAt: battle.doublePoints?.endsAt || "",
+      remainingSeconds: doubleEndsAtMs ? Math.max(0, Math.ceil((doubleEndsAtMs - now) / 1000)) : 0,
+    },
+    finalMinuteActive: Boolean(battle.finalMinuteActive),
+    scores: {
+      left: Number(battle.scores?.left) || 0,
+      right: Number(battle.scores?.right) || 0,
+    },
+    result: battle.result || "pending",
+    winnerId: battle.winnerId || "",
+    stats: battle.stats || {},
+    participants: {
+      left: left
+        ? {
+            userId: left.userId?._id || left.userId || "",
+            name: buildFullNameFromParts(getUserNameParts(left.userId), left.displayName || left.userId?.name || "Creator"),
+            email: left.userId?.email || "",
+            profileImage: left.profileImage || left.userId?.profileImage || "",
+            ready: Boolean(left.ready),
+            score: Number(left.score) || 0,
+            amountRaised: Number(left.amountRaised) || 0,
+          }
+        : null,
+      right: right
+        ? {
+            userId: right.userId?._id || right.userId || "",
+            name: buildFullNameFromParts(getUserNameParts(right.userId), right.displayName || right.userId?.name || "Creator"),
+            email: right.userId?.email || "",
+            profileImage: right.profileImage || right.userId?.profileImage || "",
+            ready: Boolean(right.ready),
+            score: Number(right.score) || 0,
+            amountRaised: Number(right.amountRaised) || 0,
+          }
+        : null,
+    },
+    recentDonations: donations.map((donation) => ({
+      id: donation._id,
+      creatorId: donation.creatorId,
+      side: donation.side,
+      sender: donation.sender,
+      amount: Number(donation.amount) || 0,
+      points: Number(donation.points) || 0,
+      multiplier: Number(donation.multiplier) || 1,
+      countedAt: donation.countedAt,
+    })),
+  }
+}
+
+async function emitBattleSnapshot(battleId, eventName = "battle_updated") {
+  const snapshot = await getBattleSnapshot(battleId)
+  if (!snapshot) return null
+  io.to(getBattleRoom(snapshot.battleId)).emit(eventName, snapshot)
+  for (const participant of [snapshot.participants.left, snapshot.participants.right]) {
+    if (participant?.userId) {
+      io.to(getCreatorRoom(participant.userId)).emit(eventName, snapshot)
+    }
+  }
+  return snapshot
+}
+
+const activeBattleIntervals = new Map()
+
+async function finishBattle(battleId) {
+  const normalizedBattleId = normalizeBattleId(battleId)
+  const battle = await Battle.findOne({ battleId: normalizedBattleId })
+  if (!battle || battle.status !== "active") return null
+
+  const participants = await BattleParticipant.find({ battleId: normalizedBattleId })
+  const left = participants.find((participant) => participant.side === "left")
+  const right = participants.find((participant) => participant.side === "right")
+  const leftScore = Number(left?.score) || 0
+  const rightScore = Number(right?.score) || 0
+  const result = leftScore > rightScore ? "left" : rightScore > leftScore ? "right" : "draw"
+  const winner = result === "left" ? left : result === "right" ? right : null
+  const loser = result === "left" ? right : result === "right" ? left : null
+  const donations = await BattleDonation.find({ battleId: normalizedBattleId }).lean()
+  const supporters = new Set(donations.map((donation) => String(donation.sender || "Anonymous").trim()).filter(Boolean))
+  const supporterTotals = new Map()
+  let largestDonation = 0
+  let totalRaised = 0
+
+  for (const donation of donations) {
+    const amount = Number(donation.amount) || 0
+    totalRaised += amount
+    largestDonation = Math.max(largestDonation, amount)
+    const sender = String(donation.sender || "Anonymous").trim() || "Anonymous"
+    supporterTotals.set(sender, (supporterTotals.get(sender) || 0) + amount)
+  }
+
+  const topSupporter =
+    Array.from(supporterTotals.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] || ""
+
+  battle.status = "finished"
+  battle.finishedAt = new Date()
+  battle.winnerId = winner?.userId || null
+  battle.loserId = loser?.userId || null
+  battle.result = result
+  battle.mode = "finished"
+  battle.doublePoints = { ...(battle.doublePoints || {}), active: false }
+  battle.scores = { left: leftScore, right: rightScore }
+  battle.stats = {
+    totalRaised,
+    largestDonation,
+    topSupporter,
+    supporterCount: supporters.size,
+    donationCount: donations.length,
+  }
+  await battle.save()
+
+  await BattleStatistics.findOneAndUpdate(
+    { battleId: normalizedBattleId },
+    {
+      battleId: normalizedBattleId,
+      winnerId: battle.winnerId,
+      loserId: battle.loserId,
+      result,
+      totalRaised,
+      largestDonation,
+      topSupporter,
+      supporterCount: supporters.size,
+      donationCount: donations.length,
+      durationSeconds: battle.durationSeconds,
+      finalScores: { left: leftScore, right: rightScore },
+      finishedAt: battle.finishedAt,
+    },
+    { upsert: true, new: true },
+  )
+
+  if (left && right) {
+    await BattleHistory.bulkWrite([
+      {
+        updateOne: {
+          filter: { battleId: normalizedBattleId, creatorId: left.userId },
+          update: {
+            battleId: normalizedBattleId,
+            creatorId: left.userId,
+            opponentId: right.userId,
+            result: result === "draw" ? "draw" : result === "left" ? "win" : "loss",
+            finalScore: leftScore,
+            opponentScore: rightScore,
+            moneyRaised: Number(left.amountRaised) || 0,
+            durationSeconds: battle.durationSeconds,
+            finishedAt: battle.finishedAt,
+          },
+          upsert: true,
+        },
+      },
+      {
+        updateOne: {
+          filter: { battleId: normalizedBattleId, creatorId: right.userId },
+          update: {
+            battleId: normalizedBattleId,
+            creatorId: right.userId,
+            opponentId: left.userId,
+            result: result === "draw" ? "draw" : result === "right" ? "win" : "loss",
+            finalScore: rightScore,
+            opponentScore: leftScore,
+            moneyRaised: Number(right.amountRaised) || 0,
+            durationSeconds: battle.durationSeconds,
+            finishedAt: battle.finishedAt,
+          },
+          upsert: true,
+        },
+      },
+    ])
+  }
+
+  const interval = activeBattleIntervals.get(normalizedBattleId)
+  if (interval) {
+    clearInterval(interval)
+    activeBattleIntervals.delete(normalizedBattleId)
+  }
+
+  return emitBattleSnapshot(normalizedBattleId, "battle_finished")
+}
+
+function startBattleTicker(battleId) {
+  const normalizedBattleId = normalizeBattleId(battleId)
+  if (activeBattleIntervals.has(normalizedBattleId)) return
+
+  const interval = setInterval(async () => {
+    const battle = await Battle.findOne({ battleId: normalizedBattleId })
+    if (!battle || battle.status !== "active") {
+      clearInterval(interval)
+      activeBattleIntervals.delete(normalizedBattleId)
+      return
+    }
+
+    const now = new Date()
+    const remainingSeconds = battle.endsAt ? Math.max(0, Math.ceil((battle.endsAt.getTime() - now.getTime()) / 1000)) : 0
+    const doubleRemainingSeconds = battle.doublePoints?.endsAt
+      ? Math.max(0, Math.ceil((battle.doublePoints.endsAt.getTime() - now.getTime()) / 1000))
+      : 0
+    let changed = false
+
+    if (remainingSeconds <= 60 && !battle.finalMinuteActive) {
+      battle.finalMinuteActive = true
+      battle.mode = "final_minute"
+      changed = true
+      io.to(getBattleRoom(normalizedBattleId)).emit("battle_mode_changed", {
+        battleId: normalizedBattleId,
+        mode: "final_minute",
+        remainingSeconds,
+      })
+    }
+
+    if (battle.doublePoints?.active && doubleRemainingSeconds <= 0) {
+      battle.doublePoints.active = false
+      battle.mode = battle.finalMinuteActive ? "final_minute" : "normal"
+      changed = true
+      io.to(getBattleRoom(normalizedBattleId)).emit("battle_mode_changed", {
+        battleId: normalizedBattleId,
+        mode: battle.mode,
+        remainingSeconds,
+      })
+    }
+
+    if (changed) {
+      await battle.save()
+    }
+
+    io.to(getBattleRoom(normalizedBattleId)).emit("battle_timer", {
+      battleId: normalizedBattleId,
+      remainingSeconds,
+      endsAt: battle.endsAt,
+      mode: battle.mode,
+      doublePointsRemainingSeconds: doubleRemainingSeconds,
+    })
+
+    if (remainingSeconds <= 0) {
+      await finishBattle(normalizedBattleId)
+    }
+  }, 1000)
+
+  activeBattleIntervals.set(normalizedBattleId, interval)
+}
+
+async function processBattleDonation(donation) {
+  if (!isBattleDonationEligible(donation)) return null
+  const creatorId = donation.creatorId || donation.creatorId?._id
+  if (!creatorId) return null
+
+  const donationDate = new Date(donation.date || donation.createdAt || Date.now())
+  const battle = await Battle.findOne({
+    status: "active",
+    startedAt: { $lte: donationDate },
+    endsAt: { $gte: donationDate },
+    $or: [{ creatorA: creatorId }, { creatorB: creatorId }],
+  })
+
+  if (!battle) return null
+
+  const existing = await BattleDonation.findOne({ donationId: donation._id })
+  if (existing) return null
+
+  const participant = await BattleParticipant.findOne({ battleId: battle.battleId, userId: creatorId })
+  if (!participant) return null
+
+  const doubleActive =
+    Boolean(battle.doublePoints?.active) &&
+    battle.doublePoints?.startedAt &&
+    battle.doublePoints?.endsAt &&
+    donationDate >= battle.doublePoints.startedAt &&
+    donationDate <= battle.doublePoints.endsAt
+  const multiplier = doubleActive ? 2 : 1
+  const amount = Number(donation.amount) || 0
+  const points = (amount / 2) * multiplier
+  const previousLeader =
+    (Number(battle.scores?.left) || 0) === (Number(battle.scores?.right) || 0)
+      ? "draw"
+      : (Number(battle.scores?.left) || 0) > (Number(battle.scores?.right) || 0)
+        ? "left"
+        : "right"
+
+  await BattleDonation.create({
+    battleId: battle.battleId,
+    donationId: donation._id,
+    creatorId,
+    side: participant.side,
+    sender: donation.alertDisplayName || donation.sender || "Anonymous",
+    amount,
+    points,
+    multiplier,
+    transactionReference:
+      donation.transactionReference ||
+      donation.paystackReference ||
+      donation.monnifyTransactionReference ||
+      donation.monnifyPaymentReference ||
+      "",
+  })
+
+  participant.score = Number(participant.score || 0) + points
+  participant.amountRaised = Number(participant.amountRaised || 0) + amount
+  participant.supporters = Array.from(new Set([...(participant.supporters || []), donation.alertDisplayName || donation.sender || "Anonymous"]))
+  await participant.save()
+
+  const nextScores = {
+    left: participant.side === "left" ? participant.score : Number(battle.scores?.left) || 0,
+    right: participant.side === "right" ? participant.score : Number(battle.scores?.right) || 0,
+  }
+  const nextLeader = nextScores.left === nextScores.right ? "draw" : nextScores.left > nextScores.right ? "left" : "right"
+  battle.scores = nextScores
+  battle.stats = {
+    ...(battle.stats || {}),
+    totalRaised: Number(battle.stats?.totalRaised || 0) + amount,
+    largestDonation: Math.max(Number(battle.stats?.largestDonation || 0), amount),
+    donationCount: Number(battle.stats?.donationCount || 0) + 1,
+  }
+  await battle.save()
+
+  const snapshot = await emitBattleSnapshot(battle.battleId, "battle_score_updated")
+  if (previousLeader !== nextLeader && nextLeader !== "draw") {
+    io.to(getBattleRoom(battle.battleId)).emit("battle_new_leader", {
+      battleId: battle.battleId,
+      leader: nextLeader,
+      scores: nextScores,
+    })
+  }
+  return snapshot
 }
 
 const inflightWebhookReferenceLocks = new Map()
@@ -10610,6 +11151,9 @@ function emitDonationAlert(creatorId, donation) {
   invalidateOverlayPublicCache(creatorId)
   io.to(getCreatorRoom(creatorId)).emit("newDonation", payload)
   io.to(getCreatorRoom(creatorId)).emit("overlayAlert", alertPayload)
+  void processBattleDonation(donation).catch((error) => {
+    console.error("battle.donation_score_failed", error)
+  })
 }
 
 function emitDonationSettlementUpdated(creatorId, donation) {
@@ -10684,6 +11228,17 @@ io.use(async (socket, next) => {
       socket.handshake.auth?.sessionToken || socket.handshake.headers["x-session-token"] || "",
     ).trim()
     const overlayCreatorId = String(socket.handshake.auth?.overlayCreatorId || "").trim()
+    const battleOverlayId = normalizeBattleId(socket.handshake.auth?.battleId || socket.handshake.query?.battleId || "")
+
+    if (battleOverlayId) {
+      const battle = await Battle.findOne({ battleId: battleOverlayId })
+
+      if (battle) {
+        socket.data.user = null
+        socket.data.battleId = battle.battleId
+        socket.join(getBattleRoom(battle.battleId))
+      }
+    }
 
     if (overlayCreatorId && mongoose.Types.ObjectId.isValid(overlayCreatorId)) {
       const creator = await User.findById(overlayCreatorId)
@@ -10715,6 +11270,22 @@ io.use(async (socket, next) => {
   } catch (error) {
     return next(error)
   }
+})
+
+io.on("connection", (socket) => {
+  socket.on("battle_subscribe", async (payload = {}) => {
+    const battleId = normalizeBattleId(payload?.battleId)
+    if (!battleId) return
+
+    const battle = await Battle.findOne({ battleId })
+    if (!battle) return
+
+    socket.join(getBattleRoom(battle.battleId))
+    const snapshot = await getBattleSnapshot(battle.battleId)
+    if (snapshot) {
+      socket.emit("battle_updated", snapshot)
+    }
+  })
 })
 
 app.get("/health", (_req, res) => {
@@ -11312,6 +11883,337 @@ app.post("/admin/auth/logout", requireAdminSession, async (req, res) => {
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: "Failed to log out admin." })
+  }
+})
+
+async function findActiveBattleForUser(userId) {
+  return Battle.findOne({
+    status: { $in: ["waiting", "connected", "countdown", "active"] },
+    $or: [{ creatorA: userId }, { creatorB: userId }],
+  })
+}
+
+async function startBattleAfterCountdown(battleId) {
+  const normalizedBattleId = normalizeBattleId(battleId)
+  const battle = await Battle.findOne({ battleId: normalizedBattleId })
+  if (!battle || battle.status !== "countdown") return null
+
+  const participants = await BattleParticipant.find({ battleId: normalizedBattleId })
+  if (participants.length < 2 || participants.some((participant) => !participant.ready)) {
+    return null
+  }
+
+  const now = new Date()
+  battle.status = "active"
+  battle.mode = "normal"
+  battle.startedAt = now
+  battle.endsAt = new Date(now.getTime() + (Number(battle.durationSeconds) || 300) * 1000)
+  await battle.save()
+  startBattleTicker(normalizedBattleId)
+  return emitBattleSnapshot(normalizedBattleId, "battle_started")
+}
+
+function scheduleBattleCountdown(battleId) {
+  const normalizedBattleId = normalizeBattleId(battleId)
+  let remaining = 10
+  io.to(getBattleRoom(normalizedBattleId)).emit("battle_countdown", { battleId: normalizedBattleId, remaining })
+
+  const countdown = setInterval(async () => {
+    remaining -= 1
+    if (remaining > 0) {
+      io.to(getBattleRoom(normalizedBattleId)).emit("battle_countdown", { battleId: normalizedBattleId, remaining })
+      return
+    }
+
+    clearInterval(countdown)
+    await startBattleAfterCountdown(normalizedBattleId)
+  }, 1000)
+}
+
+app.get("/battles/me", requireSessionUser, async (req, res) => {
+  try {
+    const [activeBattle, history, settings] = await Promise.all([
+      findActiveBattleForUser(req.user._id),
+      BattleHistory.find({ creatorId: req.user._id }).sort({ finishedAt: -1 }).limit(20).lean(),
+      BattleSettings.findOne({ creatorId: req.user._id }).lean(),
+    ])
+
+    res.json({
+      activeBattle: activeBattle ? await getBattleSnapshot(activeBattle) : null,
+      history,
+      settings: settings || {
+        defaultDurationSeconds: 300,
+        allowDoublePoints: true,
+      },
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load battle dashboard." })
+  }
+})
+
+app.post("/battles", requireSessionUser, async (req, res) => {
+  try {
+    const existing = await findActiveBattleForUser(req.user._id)
+    if (existing) {
+      return res.status(409).json({ error: "You already have an active battle." })
+    }
+
+    let battleId = generateBattleId()
+    while (await Battle.exists({ battleId })) {
+      battleId = generateBattleId()
+    }
+
+    const durationSeconds = normalizeBattleDurationSeconds(req.body?.durationSeconds)
+    const inviteToken = crypto.randomBytes(18).toString("hex")
+    const battle = await Battle.create({
+      battleId,
+      inviteToken,
+      createdBy: req.user._id,
+      creatorA: req.user._id,
+      durationSeconds,
+      status: "waiting",
+    })
+    await BattleParticipant.create({
+      battleId,
+      userId: req.user._id,
+      side: "left",
+      displayName: req.user.name,
+      profileImage: req.user.profileImage || "",
+    })
+
+    const snapshot = await emitBattleSnapshot(battle.battleId, "battle_created")
+    res.status(201).json({ battle: snapshot })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to create battle." })
+  }
+})
+
+app.post("/battles/join", requireSessionUser, async (req, res) => {
+  try {
+    const battleId = normalizeBattleId(req.body?.battleId || req.body?.inviteLink || "")
+    const existing = await findActiveBattleForUser(req.user._id)
+    if (existing) {
+      return res.status(409).json({ error: "You already have an active battle." })
+    }
+
+    const battle = await Battle.findOne({ battleId })
+    if (!battle) {
+      return res.status(404).json({ error: "Battle not found." })
+    }
+    if (String(battle.creatorA) === String(req.user._id)) {
+      return res.status(409).json({ error: "You cannot join your own battle." })
+    }
+    if (battle.status !== "waiting") {
+      return res.status(409).json({ error: "This battle is no longer waiting for an opponent." })
+    }
+    if (req.user.status && req.user.status !== "active") {
+      return res.status(403).json({ error: "Only active StreamTips accounts can join battles." })
+    }
+
+    battle.creatorB = req.user._id
+    battle.status = "connected"
+    await battle.save()
+    await BattleParticipant.create({
+      battleId: battle.battleId,
+      userId: req.user._id,
+      side: "right",
+      displayName: req.user.name,
+      profileImage: req.user.profileImage || "",
+    })
+
+    const snapshot = await emitBattleSnapshot(battle.battleId, "battle_joined")
+    res.json({ battle: snapshot })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to join battle." })
+  }
+})
+
+app.post("/battles/:battleId/ready", requireSessionUser, async (req, res) => {
+  try {
+    const battleId = normalizeBattleId(req.params.battleId)
+    const battle = await Battle.findOne({ battleId })
+    if (!battle) return res.status(404).json({ error: "Battle not found." })
+    if (!["connected", "countdown"].includes(battle.status)) {
+      return res.status(409).json({ error: "Battle is not in the lobby." })
+    }
+
+    const participant = await BattleParticipant.findOne({ battleId, userId: req.user._id })
+    if (!participant) return res.status(403).json({ error: "You are not in this battle." })
+
+    participant.ready = true
+    await participant.save()
+    const participants = await BattleParticipant.find({ battleId })
+    const bothReady = participants.length === 2 && participants.every((item) => item.ready)
+
+    if (bothReady && battle.status !== "countdown") {
+      battle.status = "countdown"
+      battle.countdownStartedAt = new Date()
+      await battle.save()
+      scheduleBattleCountdown(battleId)
+    }
+
+    const snapshot = await emitBattleSnapshot(battleId, bothReady ? "battle_ready" : "battle_ready")
+    res.json({ battle: snapshot })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to mark battle ready." })
+  }
+})
+
+app.post("/battles/:battleId/double-points", requireSessionUser, async (req, res) => {
+  try {
+    const battleId = normalizeBattleId(req.params.battleId)
+    const battle = await Battle.findOne({ battleId })
+    if (!battle) return res.status(404).json({ error: "Battle not found." })
+    if (battle.status !== "active") return res.status(409).json({ error: "Battle is not active." })
+
+    const participant = await BattleParticipant.findOne({ battleId, userId: req.user._id })
+    if (!participant) return res.status(403).json({ error: "You are not in this battle." })
+    const now = new Date()
+    if (battle.doublePoints?.active && battle.doublePoints?.endsAt && battle.doublePoints.endsAt > now) {
+      return res.status(409).json({ error: "Double Points is already active." })
+    }
+
+    battle.doublePoints = {
+      active: true,
+      startedAt: now,
+      endsAt: new Date(now.getTime() + 60_000),
+    }
+    battle.mode = "double_points"
+    await battle.save()
+    io.to(getBattleRoom(battleId)).emit("battle_mode_changed", {
+      battleId,
+      mode: "double_points",
+      remainingSeconds: 60,
+    })
+    const snapshot = await emitBattleSnapshot(battleId, "battle_mode_changed")
+    res.json({ battle: snapshot })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to activate Double Points." })
+  }
+})
+
+app.post("/battles/:battleId/cancel", requireSessionUser, async (req, res) => {
+  try {
+    const battleId = normalizeBattleId(req.params.battleId)
+    const battle = await Battle.findOne({ battleId })
+    if (!battle) return res.status(404).json({ error: "Battle not found." })
+
+    const participant = await BattleParticipant.findOne({ battleId, userId: req.user._id })
+    if (!participant) return res.status(403).json({ error: "You are not in this battle." })
+    if (!isActiveBattleStatus(battle.status)) {
+      return res.status(409).json({ error: "Battle is already closed." })
+    }
+
+    battle.status = "cancelled"
+    battle.cancelledAt = new Date()
+    battle.cancelledBy = req.user._id
+    await battle.save()
+    const snapshot = await emitBattleSnapshot(battleId, "battle_cancelled")
+    res.json({ battle: snapshot })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to cancel battle." })
+  }
+})
+
+app.get("/battles/rankings", requireSessionUser, async (req, res) => {
+  try {
+    const period = String(req.query.period || "all").toLowerCase()
+    const since = new Date()
+    let match = {}
+    if (period === "weekly") {
+      since.setDate(since.getDate() - 7)
+      match = { finishedAt: { $gte: since } }
+    } else if (period === "monthly") {
+      since.setMonth(since.getMonth() - 1)
+      match = { finishedAt: { $gte: since } }
+    }
+
+    const [mostWins, highestRaised, longestStreak, largestDonation] = await Promise.all([
+      BattleHistory.aggregate([
+        { $match: { ...match, result: "win" } },
+        { $group: { _id: "$creatorId", value: { $sum: 1 } } },
+        { $sort: { value: -1 } },
+        { $limit: 10 },
+      ]),
+      BattleHistory.aggregate([
+        { $match: match },
+        { $group: { _id: "$creatorId", value: { $sum: "$moneyRaised" } } },
+        { $sort: { value: -1 } },
+        { $limit: 10 },
+      ]),
+      BattleHistory.aggregate([
+        { $match: { ...match, result: "win" } },
+        { $group: { _id: "$creatorId", value: { $sum: 1 } } },
+        { $sort: { value: -1 } },
+        { $limit: 10 },
+      ]),
+      BattleDonation.aggregate([
+        { $match: period === "all" ? {} : { countedAt: match.finishedAt } },
+        { $group: { _id: "$creatorId", value: { $max: "$amount" } } },
+        { $sort: { value: -1 } },
+        { $limit: 10 },
+      ]),
+    ])
+
+    const userIds = Array.from(
+      new Set([...mostWins, ...highestRaised, ...longestStreak, ...largestDonation].map((item) => String(item._id))),
+    )
+    const users = await User.find({ _id: { $in: userIds } }).select({ name: 1, firstName: 1, middleName: 1, lastName: 1, profileImage: 1 }).lean()
+    const usersById = new Map(users.map((user) => [String(user._id), user]))
+    const hydrate = (items) =>
+      items.map((item) => {
+        const user = usersById.get(String(item._id))
+        return {
+          creatorId: item._id,
+          name: user ? buildFullNameFromParts(getUserNameParts(user), user.name || "Creator") : "Creator",
+          profileImage: user?.profileImage || "",
+          value: Number(item.value) || 0,
+        }
+      })
+
+    res.json({
+      period,
+      mostWins: hydrate(mostWins),
+      highestAmountRaised: hydrate(highestRaised),
+      longestWinStreak: hydrate(longestStreak),
+      largestSingleDonationReceived: hydrate(largestDonation),
+    })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load battle rankings." })
+  }
+})
+
+app.get("/battles/:battleId", requireSessionUser, async (req, res) => {
+  try {
+    const battleId = normalizeBattleId(req.params.battleId)
+    const snapshot = await getBattleSnapshot(battleId)
+    if (!snapshot) return res.status(404).json({ error: "Battle not found." })
+    const inBattle = [snapshot.participants.left, snapshot.participants.right].some(
+      (participant) => String(participant?.userId || "") === String(req.user._id),
+    )
+    if (!inBattle) return res.status(403).json({ error: "You are not in this battle." })
+    res.json({ battle: snapshot })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load battle." })
+  }
+})
+
+app.get("/public/battle/:battleId", async (req, res) => {
+  try {
+    const snapshot = await getBattleSnapshot(req.params.battleId)
+    if (!snapshot) return res.status(404).json({ error: "Battle not found." })
+    res.json({ battle: snapshot })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to load battle overlay." })
   }
 })
 
