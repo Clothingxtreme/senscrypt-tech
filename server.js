@@ -906,6 +906,19 @@ let monitoringHeartbeatTimer = null
 
 const PLATFORM_FEE_RATE = 0.2
 const CREATOR_SHARE_RATE = 0.8
+const DEFAULT_PLATFORM_FEE_PERCENT = 20
+const MINIMUM_PLATFORM_FEE_PERCENT = 15
+const DEFAULT_REWARD_EXPIRATION_DAYS = 30
+const DEFAULT_REFERRAL_QUALIFYING_DONATION_AMOUNT = 10000
+const DEFAULT_REFERRAL_REDUCTION_PERCENT = 1
+const DEFAULT_REFERRAL_REDUCTION_CAP_PERCENT = 3
+const DEFAULT_REWARD_MILESTONES = [
+  { id: "total-50000", title: "Receive ₦50,000", metric: "total_amount", target: 50000, reductionPercent: 1, expirationDays: 30, enabled: true, sortOrder: 10 },
+  { id: "total-100000", title: "Receive ₦100,000", metric: "total_amount", target: 100000, reductionPercent: 1, expirationDays: 30, enabled: true, sortOrder: 20 },
+  { id: "donations-100", title: "Receive 100 Donations", metric: "total_donations", target: 100, reductionPercent: 1, expirationDays: 30, enabled: true, sortOrder: 30 },
+  { id: "days-10", title: "Receive Donations On 10 Different Days", metric: "donation_days", target: 10, reductionPercent: 1, expirationDays: 30, enabled: true, sortOrder: 40 },
+  { id: "supporters-20", title: "Get 20 Unique Supporters", metric: "unique_supporters", target: 20, reductionPercent: 1, expirationDays: 30, enabled: true, sortOrder: 50 },
+]
 const MONNIFY_CREATOR_SETTLEMENT_VAT_RATE = 0.0161
 const MIN_CREATOR_WITHDRAWAL = 5000
 const TIER_LIMITS = {
@@ -969,6 +982,7 @@ const defaultOverlayCustomization = {
   giftPack: "tiktok",
   goalAmount: 250000,
   goalTitle: "Tonight's Gift Goal",
+  goalColor: "#00C3F7",
   previewPlatform: "tiktok",
   goalOpacity: 0.92,
   leaderboardOpacity: 0.88,
@@ -979,6 +993,9 @@ const defaultOverlayCustomization = {
   showAccountDetails: true,
   showTopSupporter: true,
   showAmbientScene: true,
+  showDonationCombo: true,
+  comboDurationSeconds: 10,
+  comboStyle: "neon",
   alertPosition: { anchor: "center", offsetX: 0, offsetY: 12 },
   goalPosition: { anchor: "top-center", offsetX: 0, offsetY: 0 },
   leaderboardPosition: { anchor: "top-right", offsetX: 0, offsetY: 0 },
@@ -1323,6 +1340,8 @@ const donationSchema = new mongoose.Schema({
   senderNameSource: String,
   amount: Number,
   platformFee: Number,
+  platformFeePercent: Number,
+  rewardReductionPercent: Number,
   creatorShare: Number,
   eventType: String,
   paymentStatus: String,
@@ -1744,9 +1763,59 @@ const giftSoundSchema = new mongoose.Schema(
   { timestamps: false },
 )
 
+const rewardMilestoneSchema = new mongoose.Schema(
+  {
+    id: { type: String, default: "" },
+    title: { type: String, default: "" },
+    metric: {
+      type: String,
+      enum: ["total_amount", "total_donations", "donation_days", "unique_supporters"],
+      default: "total_amount",
+    },
+    target: { type: Number, default: 0 },
+    reductionPercent: { type: Number, default: 1 },
+    expirationDays: { type: Number, default: 30 },
+    enabled: { type: Boolean, default: true },
+    sortOrder: { type: Number, default: 0 },
+  },
+  { _id: false },
+)
+
+const rewardConfigSchema = new mongoose.Schema(
+  {
+    key: { type: String, default: "creator_rewards", unique: true },
+    defaultPlatformFeePercent: { type: Number, default: 20 },
+    minimumPlatformFeePercent: { type: Number, default: 15 },
+    rewardExpirationDays: { type: Number, default: 30 },
+    referralQualifyingDonationAmount: { type: Number, default: 10000 },
+    referralReductionPercent: { type: Number, default: 1 },
+    referralReductionCapPercent: { type: Number, default: 3 },
+    milestones: { type: [rewardMilestoneSchema], default: undefined },
+    updatedBy: { type: String, default: "" },
+  },
+  { timestamps: true },
+)
+
+const creatorRewardSchema = new mongoose.Schema(
+  {
+    creatorId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    source: { type: String, enum: ["referral", "milestone", "manual"], required: true, index: true },
+    sourceId: { type: String, required: true },
+    title: { type: String, required: true },
+    reductionPercent: { type: Number, default: 0 },
+    awardedAt: { type: Date, default: Date.now, index: true },
+    expiresAt: { type: Date, required: true, index: true },
+    metadata: { type: Object, default: {} },
+  },
+  { timestamps: true },
+)
+creatorRewardSchema.index({ creatorId: 1, source: 1, sourceId: 1 }, { unique: true })
+
 const AdminSession = mongoose.model("AdminSession", adminSessionSchema)
 const AuditLog = mongoose.model("AuditLog", auditLogSchema)
 const GiftSound = mongoose.model("GiftSound", giftSoundSchema)
+const RewardConfig = mongoose.model("RewardConfig", rewardConfigSchema)
+const CreatorReward = mongoose.model("CreatorReward", creatorRewardSchema)
 
 const userSchema = new mongoose.Schema(
   {
@@ -1790,6 +1859,27 @@ const userSchema = new mongoose.Schema(
       liveUrl: { type: String, default: "" },
       isLive: { type: Boolean, default: false },
       notes: { type: String, default: "" },
+      updatedAt: Date,
+    },
+    referralCode: { type: String, default: "", index: true },
+    referredBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
+    referredByCode: { type: String, default: "" },
+    personalRecords: {
+      current: { type: mongoose.Schema.Types.Mixed, default: {} },
+      history: {
+        type: [
+          {
+            key: String,
+            title: String,
+            previousValue: Number,
+            newValue: Number,
+            previousRecord: mongoose.Schema.Types.Mixed,
+            newRecord: mongoose.Schema.Types.Mixed,
+            brokenAt: { type: Date, default: Date.now },
+          },
+        ],
+        default: [],
+      },
       updatedAt: Date,
     },
     kycUpgradeStatus: {
@@ -1977,6 +2067,7 @@ const userSchema = new mongoose.Schema(
 )
 
 userSchema.index({ createdAt: -1 })
+userSchema.index({ referralCode: 1 }, { unique: true, sparse: true })
 
 const User = mongoose.model("User", userSchema)
 
@@ -4213,10 +4304,47 @@ function sanitizeOverlayCustomizationForServer(value) {
     customization.leaderboardDisplayMode === "top5"
       ? customization.leaderboardDisplayMode
       : defaultOverlayCustomization.leaderboardDisplayMode
+  const goalAmount =
+    Number.isFinite(Number(customization.goalAmount)) && Number(customization.goalAmount) > 0
+      ? Math.max(1000, Math.round(Number(customization.goalAmount)))
+      : defaultOverlayCustomization.goalAmount
+  const goalTitle =
+    typeof customization.goalTitle === "string" && customization.goalTitle.trim()
+      ? customization.goalTitle.trim().slice(0, 80)
+      : defaultOverlayCustomization.goalTitle
+  const goalColor =
+    typeof customization.goalColor === "string" && /^#[0-9a-fA-F]{6}$/.test(customization.goalColor.trim())
+      ? customization.goalColor.trim()
+      : defaultOverlayCustomization.goalColor
+  const showGoal =
+    typeof customization.showGoal === "boolean"
+      ? customization.showGoal
+      : defaultOverlayCustomization.showGoal
+  const showDonationCombo =
+    typeof customization.showDonationCombo === "boolean"
+      ? customization.showDonationCombo
+      : defaultOverlayCustomization.showDonationCombo
+  const comboDurationSeconds =
+    Number.isFinite(Number(customization.comboDurationSeconds))
+      ? Math.max(3, Math.min(30, Math.round(Number(customization.comboDurationSeconds))))
+      : defaultOverlayCustomization.comboDurationSeconds
+  const comboStyle =
+    customization.comboStyle === "neon" ||
+    customization.comboStyle === "flame" ||
+    customization.comboStyle === "arcade"
+      ? customization.comboStyle
+      : defaultOverlayCustomization.comboStyle
 
   return {
     ...customization,
     leaderboardDisplayMode,
+    goalAmount,
+    goalTitle,
+    goalColor,
+    showGoal,
+    showDonationCombo,
+    comboDurationSeconds,
+    comboStyle,
     goalGradient: migrateLegacyOverlayGradient(customization.goalGradient, "goalGradient"),
     leaderboardGradient: migrateLegacyOverlayGradient(
       customization.leaderboardGradient,
@@ -5120,6 +5248,8 @@ function sanitizeUser(user) {
     status: user.status || "active",
     profileImage: user.profileImage || "",
     socialProfile: sanitizeSocialProfile(user.socialProfile),
+    referralCode: user.referralCode || "",
+    referredByCode: user.referredByCode || "",
     phoneNumber: user.phoneNumber || "",
     phoneVerified: Boolean(user.phoneVerified),
     onboardingTourCompleted: Boolean(user.onboardingTourCompleted),
@@ -5387,6 +5517,14 @@ function sanitizePortalDonation(donation, options = {}) {
       typeof donation.platformFee === "number"
         ? donation.platformFee
         : calculateRevenueSplit(donation.amount).platformFee,
+    platformFeePercent:
+      typeof donation.platformFeePercent === "number"
+        ? donation.platformFeePercent
+        : DEFAULT_PLATFORM_FEE_PERCENT,
+    rewardReductionPercent:
+      typeof donation.rewardReductionPercent === "number"
+        ? donation.rewardReductionPercent
+        : 0,
     creatorShare:
       typeof donation.creatorShare === "number"
         ? donation.creatorShare
@@ -5496,6 +5634,14 @@ function sanitizeCreatorDonation(donation) {
     senderName: donation.alertDisplayName || donation.sender || "Anonymous",
     senderNameSource: donation.senderNameSource || "",
     amount: donation.amount || 0,
+    platformFeePercent:
+      typeof donation.platformFeePercent === "number"
+        ? donation.platformFeePercent
+        : DEFAULT_PLATFORM_FEE_PERCENT,
+    rewardReductionPercent:
+      typeof donation.rewardReductionPercent === "number"
+        ? donation.rewardReductionPercent
+        : 0,
     creatorShare,
     creatorSettlementVat,
     creatorSettlementNetAmount,
@@ -6440,15 +6586,679 @@ function firstValidMoneyAmount(...values) {
   return 0
 }
 
-function calculateRevenueSplit(amount) {
+function calculateRevenueSplit(amount, platformFeePercent = DEFAULT_PLATFORM_FEE_PERCENT) {
   const gross = parseMoneyAmount(amount)
-  const platformFee = Math.round(gross * PLATFORM_FEE_RATE)
+  const feePercent = Math.max(0, Number(platformFeePercent) || DEFAULT_PLATFORM_FEE_PERCENT)
+  const platformFee = Math.round(gross * (feePercent / 100))
   const creatorShare = Math.max(0, gross - platformFee)
 
   return {
     gross,
     platformFee,
     creatorShare,
+    platformFeePercent: feePercent,
+    rewardReductionPercent: Math.max(0, DEFAULT_PLATFORM_FEE_PERCENT - feePercent),
+  }
+}
+
+function normalizeRewardPercent(value, fallback = 0) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? Math.max(0, Math.min(20, Number(parsed.toFixed(2)))) : fallback
+}
+
+function normalizeRewardDays(value, fallback = DEFAULT_REWARD_EXPIRATION_DAYS) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(365, Math.round(parsed))) : fallback
+}
+
+function normalizeRewardConfigPayload(value = {}) {
+  const candidate = value && typeof value === "object" ? value : {}
+  const defaultPlatformFeePercent = normalizeRewardPercent(
+    candidate.defaultPlatformFeePercent,
+    DEFAULT_PLATFORM_FEE_PERCENT,
+  )
+  const minimumPlatformFeePercent = Math.min(
+    defaultPlatformFeePercent,
+    Math.max(0, normalizeRewardPercent(candidate.minimumPlatformFeePercent, MINIMUM_PLATFORM_FEE_PERCENT)),
+  )
+  const rewardExpirationDays = normalizeRewardDays(candidate.rewardExpirationDays)
+  const milestones = (Array.isArray(candidate.milestones) && candidate.milestones.length
+    ? candidate.milestones
+    : DEFAULT_REWARD_MILESTONES
+  ).map((item, index) => {
+    const metric = ["total_amount", "total_donations", "donation_days", "unique_supporters"].includes(item?.metric)
+      ? item.metric
+      : "total_amount"
+    const target = Math.max(1, Math.round(Number(item?.target || 0)))
+    const id = String(item?.id || `${metric}-${target}-${index + 1}`)
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+
+    return {
+      id: id || `milestone-${index + 1}`,
+      title: String(item?.title || "Creator milestone").trim().slice(0, 100),
+      metric,
+      target,
+      reductionPercent: normalizeRewardPercent(item?.reductionPercent, 1),
+      expirationDays: normalizeRewardDays(item?.expirationDays, rewardExpirationDays),
+      enabled: item?.enabled !== false,
+      sortOrder: Number.isFinite(Number(item?.sortOrder)) ? Math.round(Number(item.sortOrder)) : index * 10,
+    }
+  })
+
+  return {
+    defaultPlatformFeePercent,
+    minimumPlatformFeePercent,
+    rewardExpirationDays,
+    referralQualifyingDonationAmount: Math.max(
+      1000,
+      Math.round(Number(candidate.referralQualifyingDonationAmount || DEFAULT_REFERRAL_QUALIFYING_DONATION_AMOUNT)),
+    ),
+    referralReductionPercent: normalizeRewardPercent(
+      candidate.referralReductionPercent,
+      DEFAULT_REFERRAL_REDUCTION_PERCENT,
+    ),
+    referralReductionCapPercent: normalizeRewardPercent(
+      candidate.referralReductionCapPercent,
+      DEFAULT_REFERRAL_REDUCTION_CAP_PERCENT,
+    ),
+    milestones,
+  }
+}
+
+async function getCreatorRewardsConfig() {
+  const existing = await RewardConfig.findOne({ key: "creator_rewards" })
+  if (existing) {
+    return normalizeRewardConfigPayload(existing.toObject())
+  }
+
+  const created = await RewardConfig.create({
+    key: "creator_rewards",
+    ...normalizeRewardConfigPayload(),
+  })
+  return normalizeRewardConfigPayload(created.toObject())
+}
+
+function getReferralCodeSeed(user) {
+  return String(user?.name || user?.email || user?._id || "creator")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "")
+    .slice(0, 8) || "CREATOR"
+}
+
+async function generateUniqueReferralCode(user) {
+  const seed = getReferralCodeSeed(user)
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const suffix = Math.random().toString(36).slice(2, 6).toUpperCase()
+    const code = `${seed.slice(0, Math.max(4, 8 - String(attempt).length))}${attempt ? attempt : ""}${suffix}`.slice(0, 12)
+    const existing = await User.exists({ referralCode: code, _id: { $ne: user?._id } })
+    if (!existing) {
+      return code
+    }
+  }
+  return `ST${Date.now().toString(36).toUpperCase()}`
+}
+
+async function ensureCreatorReferralCode(user) {
+  if (!user) return ""
+  const existingCode = String(user.referralCode || "").trim().toUpperCase()
+  if (existingCode) return existingCode
+
+  const code = await generateUniqueReferralCode(user)
+  user.referralCode = code
+  if (typeof user.save === "function") {
+    await user.save()
+  } else if (user._id) {
+    await User.updateOne({ _id: user._id }, { $set: { referralCode: code } })
+  }
+  return code
+}
+
+function getRewardEligibleDonationFilter(creatorId) {
+  return {
+    creatorId,
+    paymentStatus: "PAID",
+    walletStatus: { $ne: "rejected" },
+  }
+}
+
+function getPersonalRecordDefinitions() {
+  return [
+    { key: "highestEarningDay", title: "Highest Earning Day", valueType: "currency" },
+    { key: "highestDonation", title: "Highest Donation", valueType: "currency" },
+    { key: "mostDonationsInOneDay", title: "Most Donations In One Day", valueType: "count" },
+    { key: "highestMonthlyEarnings", title: "Highest Monthly Earnings", valueType: "currency" },
+    { key: "longestDonationStreak", title: "Longest Donation Streak", valueType: "days" },
+    { key: "mostUniqueSupporters", title: "Most Unique Supporters", valueType: "count" },
+    { key: "largestSingleSupporter", title: "Largest Single Supporter", valueType: "currency" },
+  ]
+}
+
+function toLagosDateKey(value) {
+  const date = value ? new Date(value) : new Date()
+  if (Number.isNaN(date.getTime())) return ""
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Africa/Lagos",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date)
+}
+
+function toLagosMonthKey(value) {
+  const date = value ? new Date(value) : new Date()
+  if (Number.isNaN(date.getTime())) return ""
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Africa/Lagos",
+    year: "numeric",
+    month: "2-digit",
+  }).format(date)
+}
+
+function normalizeRecordSupporterName(value) {
+  return String(value || "Anonymous").trim() || "Anonymous"
+}
+
+function calculateLongestDateStreak(dateKeys) {
+  const sorted = Array.from(new Set(dateKeys.filter(Boolean))).sort()
+  let best = 0
+  let current = 0
+  let previousTime = 0
+
+  sorted.forEach((key) => {
+    const time = new Date(`${key}T00:00:00.000Z`).getTime()
+    if (!previousTime || time - previousTime === 86_400_000) {
+      current += 1
+    } else {
+      current = 1
+    }
+    best = Math.max(best, current)
+    previousTime = time
+  })
+
+  return best
+}
+
+async function calculateCreatorPersonalRecords(creatorId) {
+  const donations = await Donation.find(getRewardEligibleDonationFilter(creatorId))
+    .select({ amount: 1, sender: 1, alertDisplayName: 1, senderNameSource: 1, date: 1, createdAt: 1 })
+    .sort({ date: 1, createdAt: 1 })
+    .lean()
+  const daily = new Map()
+  const monthly = new Map()
+  const supporters = new Map()
+  let highestDonation = null
+
+  donations.forEach((donation) => {
+    const amount = parseMoneyAmount(donation.amount)
+    if (amount <= 0) return
+    const occurredAt = donation.date || donation.createdAt || new Date()
+    const dayKey = toLagosDateKey(occurredAt)
+    const monthKey = toLagosMonthKey(occurredAt)
+    const supporterName = normalizeRecordSupporterName(donation.alertDisplayName || donation.sender)
+
+    if (!highestDonation || amount > highestDonation.value) {
+      highestDonation = {
+        value: amount,
+        label: supporterName,
+        occurredAt,
+        metadata: { donorName: supporterName },
+      }
+    }
+
+    const day = daily.get(dayKey) || { value: 0, count: 0, supporters: new Set(), label: dayKey, occurredAt }
+    day.value += amount
+    day.count += 1
+    day.supporters.add(supporterName.toLowerCase())
+    daily.set(dayKey, day)
+
+    const month = monthly.get(monthKey) || { value: 0, count: 0, label: monthKey, occurredAt }
+    month.value += amount
+    month.count += 1
+    monthly.set(monthKey, month)
+
+    const supporter = supporters.get(supporterName) || { value: 0, count: 0, label: supporterName }
+    supporter.value += amount
+    supporter.count += 1
+    supporters.set(supporterName, supporter)
+  })
+
+  const dailyList = Array.from(daily.values())
+  const monthlyList = Array.from(monthly.values())
+  const supporterList = Array.from(supporters.values())
+  const highestEarningDay = dailyList.reduce((best, item) => (!best || item.value > best.value ? item : best), null)
+  const mostDonationsInOneDay = dailyList.reduce((best, item) => (!best || item.count > best.value ? { ...item, value: item.count } : best), null)
+  const mostUniqueSupporters = dailyList.reduce((best, item) => {
+    const value = item.supporters.size
+    return !best || value > best.value ? { ...item, value } : best
+  }, null)
+  const highestMonthlyEarnings = monthlyList.reduce((best, item) => (!best || item.value > best.value ? item : best), null)
+  const largestSingleSupporter = supporterList.reduce((best, item) => (!best || item.value > best.value ? item : best), null)
+  const longestDonationStreakValue = calculateLongestDateStreak(dailyList.map((item) => item.label))
+
+  const makeEmpty = (key, title, valueType) => ({
+    key,
+    title,
+    valueType,
+    value: 0,
+    label: "",
+    occurredAt: "",
+    metadata: {},
+  })
+  const byKey = Object.fromEntries(
+    getPersonalRecordDefinitions().map((definition) => [
+      definition.key,
+      makeEmpty(definition.key, definition.title, definition.valueType),
+    ]),
+  )
+
+  if (highestEarningDay) {
+    byKey.highestEarningDay = {
+      ...byKey.highestEarningDay,
+      value: highestEarningDay.value,
+      label: highestEarningDay.label,
+      occurredAt: highestEarningDay.occurredAt,
+      metadata: { donations: highestEarningDay.count },
+    }
+  }
+  if (highestDonation) {
+    byKey.highestDonation = {
+      ...byKey.highestDonation,
+      ...highestDonation,
+    }
+  }
+  if (mostDonationsInOneDay) {
+    byKey.mostDonationsInOneDay = {
+      ...byKey.mostDonationsInOneDay,
+      value: mostDonationsInOneDay.value,
+      label: mostDonationsInOneDay.label,
+      occurredAt: mostDonationsInOneDay.occurredAt,
+      metadata: { amount: mostDonationsInOneDay.amount },
+    }
+  }
+  if (highestMonthlyEarnings) {
+    byKey.highestMonthlyEarnings = {
+      ...byKey.highestMonthlyEarnings,
+      value: highestMonthlyEarnings.value,
+      label: highestMonthlyEarnings.label,
+      occurredAt: highestMonthlyEarnings.occurredAt,
+      metadata: { donations: highestMonthlyEarnings.count },
+    }
+  }
+  byKey.longestDonationStreak = {
+    ...byKey.longestDonationStreak,
+    value: longestDonationStreakValue,
+    label: longestDonationStreakValue ? `${longestDonationStreakValue} day${longestDonationStreakValue === 1 ? "" : "s"}` : "",
+    occurredAt: "",
+    metadata: {},
+  }
+  if (mostUniqueSupporters) {
+    byKey.mostUniqueSupporters = {
+      ...byKey.mostUniqueSupporters,
+      value: mostUniqueSupporters.value,
+      label: mostUniqueSupporters.label,
+      occurredAt: mostUniqueSupporters.occurredAt,
+      metadata: { donations: mostUniqueSupporters.count },
+    }
+  }
+  if (largestSingleSupporter) {
+    byKey.largestSingleSupporter = {
+      ...byKey.largestSingleSupporter,
+      value: largestSingleSupporter.value,
+      label: largestSingleSupporter.label,
+      occurredAt: "",
+      metadata: { donations: largestSingleSupporter.count },
+    }
+  }
+
+  return getPersonalRecordDefinitions().map((definition) => byKey[definition.key])
+}
+
+function serializePersonalRecord(record, newRecordKeys = new Set()) {
+  return {
+    key: record.key,
+    title: record.title,
+    valueType: record.valueType,
+    value: Number(record.value) || 0,
+    label: record.label || "",
+    occurredAt: record.occurredAt || "",
+    metadata: record.metadata || {},
+    isNew: newRecordKeys.has(record.key),
+  }
+}
+
+async function buildCreatorPersonalRecordsDashboard(user) {
+  const creator = user?._id ? user : await User.findById(user)
+  if (!creator) {
+    throw createStatusCodeError("Creator not found.", 404)
+  }
+
+  const currentRecords = await calculateCreatorPersonalRecords(creator._id)
+  const previousRecords = creator.personalRecords?.current || {}
+  const historyEntries = Array.isArray(creator.personalRecords?.history)
+    ? [...creator.personalRecords.history]
+    : []
+  const newRecordKeys = new Set()
+  let changed = false
+
+  currentRecords.forEach((record) => {
+    const previous = previousRecords?.[record.key]
+    const previousValue = Number(previous?.value || 0)
+    const newValue = Number(record.value || 0)
+
+    if (newValue > previousValue) {
+      if (previous && previousValue > 0) {
+        historyEntries.unshift({
+          key: record.key,
+          title: record.title,
+          previousValue,
+          newValue,
+          previousRecord: previous,
+          newRecord: record,
+          brokenAt: new Date(),
+        })
+      }
+      previousRecords[record.key] = record
+      newRecordKeys.add(record.key)
+      changed = true
+    } else if (!previous) {
+      previousRecords[record.key] = record
+      changed = true
+    }
+  })
+
+  if (changed) {
+    creator.personalRecords = {
+      current: previousRecords,
+      history: historyEntries.slice(0, 100),
+      updatedAt: new Date(),
+    }
+    creator.markModified("personalRecords")
+    await creator.save()
+  }
+
+  const records = getPersonalRecordDefinitions().map((definition) =>
+    serializePersonalRecord(previousRecords[definition.key] || currentRecords.find((record) => record.key === definition.key), newRecordKeys),
+  )
+
+  return {
+    records,
+    newRecords: records.filter((record) => record.isNew),
+    history: historyEntries.slice(0, 50).map((entry) => ({
+      key: entry.key,
+      title: entry.title,
+      previousValue: Number(entry.previousValue) || 0,
+      newValue: Number(entry.newValue) || 0,
+      previousRecord: entry.previousRecord || null,
+      newRecord: entry.newRecord || null,
+      brokenAt: entry.brokenAt || "",
+    })),
+    updatedAt: creator.personalRecords?.updatedAt || "",
+  }
+}
+
+async function getCreatorRewardStats(creatorId) {
+  const donations = await Donation.find(getRewardEligibleDonationFilter(creatorId))
+    .select({ amount: 1, sender: 1, alertDisplayName: 1, senderNameSource: 1, date: 1, createdAt: 1 })
+    .lean()
+  const uniqueSupporters = new Set()
+  const donationDays = new Set()
+  let totalAmount = 0
+
+  donations.forEach((donation) => {
+    totalAmount += parseMoneyAmount(donation.amount)
+    const supporter = String(donation.alertDisplayName || donation.sender || "Anonymous").trim().toLowerCase()
+    if (supporter) uniqueSupporters.add(supporter)
+    const date = donation.date || donation.createdAt
+    if (date) {
+      const day = new Date(date)
+      if (!Number.isNaN(day.getTime())) {
+        donationDays.add(day.toISOString().slice(0, 10))
+      }
+    }
+  })
+
+  return {
+    totalAmount,
+    totalDonations: donations.length,
+    donationDays: donationDays.size,
+    uniqueSupporters: uniqueSupporters.size,
+  }
+}
+
+function getMilestoneProgressValue(stats, metric) {
+  if (metric === "total_donations") return stats.totalDonations
+  if (metric === "donation_days") return stats.donationDays
+  if (metric === "unique_supporters") return stats.uniqueSupporters
+  return stats.totalAmount
+}
+
+async function awardCreatorReward({ creatorId, source, sourceId, title, reductionPercent, expirationDays, metadata = {} }) {
+  const expiresAt = new Date(Date.now() + normalizeRewardDays(expirationDays) * 24 * 60 * 60 * 1000)
+  return CreatorReward.findOneAndUpdate(
+    { creatorId, source, sourceId },
+    {
+      $setOnInsert: {
+        creatorId,
+        source,
+        sourceId,
+        title,
+        reductionPercent: normalizeRewardPercent(reductionPercent, 0),
+        awardedAt: new Date(),
+        expiresAt,
+        metadata,
+      },
+    },
+    { upsert: true, new: true },
+  )
+}
+
+async function evaluateCreatorRewards(creatorId) {
+  if (!creatorId) return null
+  const [config, creator] = await Promise.all([
+    getCreatorRewardsConfig(),
+    User.findById(creatorId),
+  ])
+
+  if (!creator) return null
+
+  const stats = await getCreatorRewardStats(creator._id)
+  const activeMilestones = config.milestones
+    .filter((milestone) => milestone.enabled)
+    .sort((left, right) => left.sortOrder - right.sortOrder)
+
+  for (const milestone of activeMilestones) {
+    const progress = getMilestoneProgressValue(stats, milestone.metric)
+    if (progress >= milestone.target) {
+      await awardCreatorReward({
+        creatorId: creator._id,
+        source: "milestone",
+        sourceId: milestone.id,
+        title: milestone.title,
+        reductionPercent: milestone.reductionPercent,
+        expirationDays: milestone.expirationDays || config.rewardExpirationDays,
+        metadata: { milestone, progress },
+      })
+    }
+  }
+
+  if (creator.referredBy && stats.totalAmount >= config.referralQualifyingDonationAmount) {
+    await awardCreatorReward({
+      creatorId: creator.referredBy,
+      source: "referral",
+      sourceId: creator._id.toString(),
+      title: `Successful referral: ${creator.name || creator.email}`,
+      reductionPercent: config.referralReductionPercent,
+      expirationDays: config.rewardExpirationDays,
+      metadata: {
+        referredCreatorId: creator._id.toString(),
+        referredCreatorEmail: creator.email,
+        referredCreatorTotalDonations: stats.totalAmount,
+        qualifyingAmount: config.referralQualifyingDonationAmount,
+      },
+    })
+  }
+
+  return stats
+}
+
+async function getEffectivePlatformFeeForCreator(creatorId) {
+  const config = await getCreatorRewardsConfig()
+  const now = new Date()
+  const activeRewards = creatorId
+    ? await CreatorReward.find({ creatorId, expiresAt: { $gt: now } }).sort({ awardedAt: -1 }).lean()
+    : []
+  const referralReduction = Math.min(
+    config.referralReductionCapPercent,
+    activeRewards
+      .filter((reward) => reward.source === "referral")
+      .reduce((total, reward) => total + normalizeRewardPercent(reward.reductionPercent, 0), 0),
+  )
+  const milestoneReduction = activeRewards
+    .filter((reward) => reward.source !== "referral")
+    .reduce((total, reward) => total + normalizeRewardPercent(reward.reductionPercent, 0), 0)
+  const maximumReduction = Math.max(0, config.defaultPlatformFeePercent - config.minimumPlatformFeePercent)
+  const totalReduction = Math.min(maximumReduction, referralReduction + milestoneReduction)
+  const platformFeePercent = Math.max(
+    config.minimumPlatformFeePercent,
+    Number((config.defaultPlatformFeePercent - totalReduction).toFixed(2)),
+  )
+
+  return {
+    config,
+    activeRewards,
+    platformFeePercent,
+    referralReduction,
+    milestoneReduction,
+    totalReduction,
+  }
+}
+
+async function calculateCreatorRevenueSplit(creatorId, amount) {
+  const fee = await getEffectivePlatformFeeForCreator(creatorId)
+  return {
+    ...calculateRevenueSplit(amount, fee.platformFeePercent),
+    platformFeePercent: fee.platformFeePercent,
+    rewardReductionPercent: fee.totalReduction,
+  }
+}
+
+function serializeCreatorReward(reward) {
+  if (!reward) return null
+  const now = Date.now()
+  const expiresAt = reward.expiresAt ? new Date(reward.expiresAt) : null
+  const remainingMs = expiresAt && !Number.isNaN(expiresAt.getTime())
+    ? Math.max(0, expiresAt.getTime() - now)
+    : 0
+
+  return {
+    id: reward._id?.toString?.() || "",
+    source: reward.source || "",
+    sourceId: reward.sourceId || "",
+    title: reward.title || "",
+    reductionPercent: Number(reward.reductionPercent) || 0,
+    awardedAt: reward.awardedAt || reward.createdAt || "",
+    expiresAt: reward.expiresAt || "",
+    remainingMs,
+    expired: remainingMs <= 0,
+    metadata: reward.metadata || {},
+  }
+}
+
+function getReferralLinkForCode(code) {
+  const baseUrl = String(PORTAL_URL || "https://streamtips.live").replace(/\/+$/, "")
+  return `${baseUrl}/register?ref=${encodeURIComponent(code)}`
+}
+
+async function buildCreatorRewardsDashboard(user) {
+  const creator = user?._id ? user : await User.findById(user)
+  if (!creator) {
+    throw createStatusCodeError("Creator not found.", 404)
+  }
+
+  const referralCode = await ensureCreatorReferralCode(creator)
+  await evaluateCreatorRewards(creator._id)
+
+  const [config, stats, feeSummary, rewards, referredCreators] = await Promise.all([
+    getCreatorRewardsConfig(),
+    getCreatorRewardStats(creator._id),
+    getEffectivePlatformFeeForCreator(creator._id),
+    CreatorReward.find({ creatorId: creator._id }).sort({ awardedAt: -1 }).limit(100).lean(),
+    User.find({ referredBy: creator._id })
+      .select({ _id: 1, name: 1, email: 1, createdAt: 1 })
+      .sort({ createdAt: -1 })
+      .lean(),
+  ])
+
+  const referredCreatorStats = await Promise.all(
+    referredCreators.map(async (referredCreator) => {
+      const referredStats = await getCreatorRewardStats(referredCreator._id)
+      const qualified = referredStats.totalAmount >= config.referralQualifyingDonationAmount
+
+      return {
+        id: referredCreator._id.toString(),
+        name: referredCreator.name || referredCreator.email || "Creator",
+        email: referredCreator.email || "",
+        joinedAt: referredCreator.createdAt || "",
+        totalDonations: referredStats.totalAmount,
+        qualified,
+        progressPercent: Math.min(
+          100,
+          Math.round((referredStats.totalAmount / config.referralQualifyingDonationAmount) * 100),
+        ),
+      }
+    }),
+  )
+
+  const completedRewardIds = new Set(rewards.map((reward) => `${reward.source}:${reward.sourceId}`))
+  const milestoneProgress = config.milestones
+    .filter((milestone) => milestone.enabled)
+    .sort((left, right) => left.sortOrder - right.sortOrder)
+    .map((milestone) => {
+      const current = getMilestoneProgressValue(stats, milestone.metric)
+      const completed = current >= milestone.target
+      return {
+        ...milestone,
+        current,
+        completed,
+        awarded: completedRewardIds.has(`milestone:${milestone.id}`),
+        progressPercent: Math.min(100, Math.round((current / milestone.target) * 100)),
+      }
+    })
+  const serializedRewards = rewards.map(serializeCreatorReward).filter(Boolean)
+  const activeRewards = serializedRewards.filter((reward) => !reward.expired)
+  const nextExpiry = activeRewards.reduce((earliest, reward) => {
+    const expiresAt = reward.expiresAt ? new Date(reward.expiresAt).getTime() : 0
+    if (!expiresAt) return earliest
+    return earliest ? Math.min(earliest, expiresAt) : expiresAt
+  }, 0)
+
+  return {
+    currentPlatformFeePercent: feeSummary.platformFeePercent,
+    defaultPlatformFeePercent: config.defaultPlatformFeePercent,
+    minimumPlatformFeePercent: config.minimumPlatformFeePercent,
+    activeReductionPercent: feeSummary.totalReduction,
+    referralReductionPercent: feeSummary.referralReduction,
+    milestoneReductionPercent: feeSummary.milestoneReduction,
+    timeRemainingMs: nextExpiry ? Math.max(0, nextExpiry - Date.now()) : 0,
+    referral: {
+      code: referralCode,
+      link: getReferralLinkForCode(referralCode),
+      qualifyingDonationAmount: config.referralQualifyingDonationAmount,
+      reductionPercent: config.referralReductionPercent,
+      reductionCapPercent: config.referralReductionCapPercent,
+      total: referredCreatorStats.length,
+      successful: referredCreatorStats.filter((item) => item.qualified).length,
+      referredCreators: referredCreatorStats,
+    },
+    progress: stats,
+    milestones: milestoneProgress,
+    upcomingRewards: milestoneProgress.filter((milestone) => !milestone.completed),
+    completedRewards: milestoneProgress.filter((milestone) => milestone.completed),
+    activeRewards,
+    rewardHistory: serializedRewards,
+    config,
   }
 }
 
@@ -8220,7 +9030,8 @@ async function syncDonationFromMonnifyTransaction(donation) {
   const sourceDetails = getDonationSourceDetails(providerPayload, providerPayload)
   const destinationDetails = getDonationDestinationDetails(providerPayload, providerPayload)
   const paidOn = parseProviderDate(providerPayload.paidOn || providerPayload.paidAt)
-  const split = calculateRevenueSplit(
+  const split = await calculateCreatorRevenueSplit(
+    donation.creatorId,
     firstValidMoneyAmount(
       providerPayload.amountPaid,
       providerPayload.amount,
@@ -8248,6 +9059,8 @@ async function syncDonationFromMonnifyTransaction(donation) {
   if (split.gross > 0) {
     donation.amount = split.gross
     donation.platformFee = split.platformFee
+    donation.platformFeePercent = split.platformFeePercent
+    donation.rewardReductionPercent = split.rewardReductionPercent
     donation.creatorShare = split.creatorShare
   }
 
@@ -11325,6 +12138,7 @@ app.post("/auth/register", registerLimiter, async (req, res) => {
       bankName = "",
       bankCode = "",
       accountNumber = "",
+      referralCode = "",
     } = req.body
 
     if (!email || !password) {
@@ -11377,6 +12191,10 @@ app.post("/auth/register", registerLimiter, async (req, res) => {
     let payoutProfile
     let registrationWarning = ""
     let registrationNextStep = "dashboard"
+    const cleanReferralCode = String(referralCode || "").trim().toUpperCase()
+    const referrer = cleanReferralCode
+      ? await User.findOne({ referralCode: cleanReferralCode, email: { $ne: normalizedEmail } }).select({ _id: 1, email: 1, referralCode: 1 })
+      : null
 
     try {
       payoutProfile = await buildVerifiedPayoutProfile({
@@ -11460,6 +12278,9 @@ app.post("/auth/register", registerLimiter, async (req, res) => {
       sessionToken: generateSessionToken(),
       role: "creator",
       status: "active",
+      referralCode: await generateUniqueReferralCode({ name: trimmedName, email: normalizedEmail }),
+      referredBy: referrer?._id || null,
+      referredByCode: referrer?.referralCode || cleanReferralCode,
       phoneNumber: cleanPhoneNumber,
       phoneVerified: false,
       kycTier: 1,
@@ -11501,6 +12322,8 @@ app.post("/auth/register", registerLimiter, async (req, res) => {
         name: trimmedName,
         email: normalizedEmail,
         registrationComplete: Boolean(payoutProfile),
+        referredBy: referrer?._id?.toString?.() || "",
+        referredByCode: referrer?.referralCode || cleanReferralCode,
       },
     })
 
@@ -12657,7 +13480,7 @@ app.post("/api/webhooks/paystack", webhookLimiter, async (req, res) => {
       return res.sendStatus(200)
     }
 
-    const split = calculateRevenueSplit(grossAmount)
+    const split = await calculateCreatorRevenueSplit(creator._id, grossAmount)
     const donationFundsFlow = getIncomingDonationFundsFlow()
     const risk = await assessDonationRisk({
       creator,
@@ -12672,6 +13495,8 @@ app.post("/api/webhooks/paystack", webhookLimiter, async (req, res) => {
       senderNameSource: alertDisplay.source,
       amount: split.gross,
       platformFee: split.platformFee,
+      platformFeePercent: split.platformFeePercent,
+      rewardReductionPercent: split.rewardReductionPercent,
       creatorShare: split.creatorShare,
       eventType,
       paymentStatus: "PAID",
@@ -12731,6 +13556,9 @@ app.post("/api/webhooks/paystack", webhookLimiter, async (req, res) => {
     })
 
     emitDonationAlert(creator._id, donation)
+    void evaluateCreatorRewards(creator._id).catch((error) =>
+      console.error("rewards.evaluate_paystack_failed", error),
+    )
 
     createAuditLogAsync({
       actorType: "system",
@@ -12819,7 +13647,7 @@ async function processMonnifyWebhookPayload({ data = {}, source = "http" }) {
     data.amount,
     data.amountPaid,
   )
-  const split = calculateRevenueSplit(grossAmount)
+  const split = await calculateCreatorRevenueSplit(creator?._id, grossAmount)
 
   if (settlementSignal) {
     const settlementResult = await applyMonnifySettlementNotificationToPendingDonations({
@@ -13028,6 +13856,8 @@ async function processMonnifyWebhookPayload({ data = {}, source = "http" }) {
       senderNameSource: resolvedSenderDisplay.source,
       amount: split.gross,
       platformFee: split.platformFee,
+      platformFeePercent: split.platformFeePercent,
+      rewardReductionPercent: split.rewardReductionPercent,
       creatorShare: split.creatorShare,
       eventType,
       paymentStatus,
@@ -13079,6 +13909,9 @@ async function processMonnifyWebhookPayload({ data = {}, source = "http" }) {
     })
 
     emitDonationAlert(creator._id, donation)
+    void evaluateCreatorRewards(creator._id).catch((error) =>
+      console.error("rewards.evaluate_monnify_failed", error),
+    )
 
     createAuditLogAsync({
       actorType: "system",
@@ -13517,7 +14350,7 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
       return res.sendStatus(200)
     }
 
-    const split = calculateRevenueSplit(amount)
+    const split = await calculateCreatorRevenueSplit(req.user._id, amount)
     const donationFundsFlow = getIncomingDonationFundsFlow()
     const creatorSettlement = calculateCreatorSettlementNetAmount(split.creatorShare)
     const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1_000_000)}`
@@ -13528,6 +14361,8 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
       senderNameSource: "manual_test",
       amount: split.gross,
       platformFee: split.platformFee,
+      platformFeePercent: split.platformFeePercent,
+      rewardReductionPercent: split.rewardReductionPercent,
       creatorShare: split.creatorShare,
       eventType: "monnify.test_api",
       paymentStatus: "PAID",
@@ -13548,6 +14383,9 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
     })
 
     emitDonationAlert(req.user._id, donation)
+    void evaluateCreatorRewards(req.user._id).catch((error) =>
+      console.error("rewards.evaluate_sandbox_failed", error),
+    )
 
     await createAuditLog({
       actorType: "user",
@@ -13578,6 +14416,30 @@ app.get("/overlay-state", requireSessionUser, async (req, res) => {
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: "Failed to load overlay state." })
+  }
+})
+
+app.get("/rewards", requireSessionUser, async (req, res) => {
+  try {
+    const rewards = await buildCreatorRewardsDashboard(req.user)
+    return res.json({ rewards })
+  } catch (error) {
+    console.error(error)
+    return res.status(error.statusCode || 500).json({
+      error: error instanceof Error ? error.message : "Failed to load creator rewards.",
+    })
+  }
+})
+
+app.get("/personal-records", requireSessionUser, async (req, res) => {
+  try {
+    const personalRecords = await buildCreatorPersonalRecordsDashboard(req.user)
+    return res.json({ personalRecords })
+  } catch (error) {
+    console.error(error)
+    return res.status(error.statusCode || 500).json({
+      error: error instanceof Error ? error.message : "Failed to load personal records.",
+    })
   }
 })
 
@@ -16857,6 +17719,50 @@ app.post("/admin/send-animation", requireAdminSession, async (req, res) => {
   } catch (error) {
     console.error(error)
     res.status(500).json({ error: "Failed to send overlay animation." })
+  }
+})
+
+app.get("/admin/rewards-config", requireAdminSession, async (_req, res) => {
+  try {
+    const config = await getCreatorRewardsConfig()
+    return res.json({ config })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to load rewards configuration." })
+  }
+})
+
+app.put("/admin/rewards-config", requireAdminSession, async (req, res) => {
+  try {
+    const nextConfig = normalizeRewardConfigPayload(req.body || {})
+    const saved = await RewardConfig.findOneAndUpdate(
+      { key: "creator_rewards" },
+      {
+        $set: {
+          ...nextConfig,
+          updatedBy: req.adminSession._id.toString(),
+        },
+      },
+      { upsert: true, new: true },
+    )
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "admin.rewards_config.updated",
+      message: "Admin updated creator rewards configuration.",
+      metadata: {
+        defaultPlatformFeePercent: nextConfig.defaultPlatformFeePercent,
+        minimumPlatformFeePercent: nextConfig.minimumPlatformFeePercent,
+        rewardExpirationDays: nextConfig.rewardExpirationDays,
+        milestoneCount: nextConfig.milestones.length,
+      },
+    })
+
+    return res.json({ config: normalizeRewardConfigPayload(saved.toObject()) })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to save rewards configuration." })
   }
 })
 
