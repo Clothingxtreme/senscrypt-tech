@@ -7169,106 +7169,39 @@ async function awardCreatorReward({ creatorId, source, sourceId, title, reductio
 
 async function evaluateCreatorRewards(creatorId, { throwOnSyncError = true } = {}) {
   if (!creatorId) return null
-  const [config, creator] = await Promise.all([
-    getCreatorRewardsConfig(),
-    User.findById(creatorId),
-  ])
+  const creator = await User.findById(creatorId)
 
   if (!creator) return null
 
   const stats = await getCreatorRewardStats(creator._id)
-  const affectedCreatorIds = new Set([creator._id.toString()])
-  const activeMilestones = config.milestones
-    .filter((milestone) => milestone.enabled)
-    .sort((left, right) => left.sortOrder - right.sortOrder)
-
-  for (const milestone of activeMilestones) {
-    const progress = getMilestoneProgressValue(stats, milestone.metric)
-    if (progress >= milestone.target) {
-      await awardCreatorReward({
-        creatorId: creator._id,
-        source: "milestone",
-        sourceId: milestone.id,
-        title: milestone.title,
-        reductionPercent: milestone.reductionPercent,
-        expirationDays: milestone.expirationDays || config.rewardExpirationDays,
-        metadata: { milestone, progress },
-      })
-      affectedCreatorIds.add(creator._id.toString())
-    }
-  }
-
-  if (creator.referredBy && stats.totalAmount >= config.referralQualifyingDonationAmount) {
-    await awardCreatorReward({
-      creatorId: creator.referredBy,
-      source: "referral",
-      sourceId: creator._id.toString(),
-      title: `Successful referral: ${creator.name || creator.email}`,
-      reductionPercent: config.referralReductionPercent,
-      expirationDays: config.rewardExpirationDays,
-      metadata: {
-        referredCreatorId: creator._id.toString(),
-        referredCreatorEmail: creator.email,
-        referredCreatorTotalDonations: stats.totalAmount,
-        qualifyingAmount: config.referralQualifyingDonationAmount,
-      },
-    })
-    affectedCreatorIds.add(creator.referredBy.toString())
-  }
-
-  const platformFeeSyncResults = []
-
-  for (const affectedCreatorId of affectedCreatorIds) {
-    try {
-      platformFeeSyncResults.push(await syncCreatorPlatformFeeWithRewards(affectedCreatorId, { config }))
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Creator rewards platform fee sync failed."
-      platformFeeSyncResults.push({
-        creatorId: affectedCreatorId,
-        error: message,
-      })
-
-      if (throwOnSyncError) {
-        throw error
-      }
-    }
-  }
 
   return {
     ...stats,
-    platformFeeSyncResults,
+    platformFeeSyncResults: [
+      {
+        skipped: true,
+        reason: "creator_fee_rewards_disabled",
+        platformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+      },
+    ],
   }
 }
 
 async function getEffectivePlatformFeeForCreator(creatorId) {
-  const [config, creator] = await Promise.all([
-    getCreatorRewardsConfig(),
-    creatorId ? User.findById(creatorId).select({ email: 1, platformFee: 1 }).lean() : null,
-  ])
-  const defaultFee = normalizePlatformFeePercent(config.defaultPlatformFeePercent, config)
-
-  if (!creator) {
-    return {
-      config,
-      activeRewards: [],
-      platformFeePercent: defaultFee,
-      referralReduction: 0,
-      milestoneReduction: 0,
-      totalReduction: 0,
-      monnifySplitUpdateSkipped: "creator_not_found",
-    }
-  }
-
-  const platformFeePercent = normalizePlatformFeePercent(creator.platformFee, config)
-  const totalReduction = Math.max(0, Number((defaultFee - platformFeePercent).toFixed(2)))
+  const config = normalizeRewardConfigPayload({
+    defaultPlatformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+    minimumPlatformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+    milestones: [],
+  })
 
   return {
     config,
     activeRewards: [],
-    platformFeePercent,
+    platformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
     referralReduction: 0,
-    milestoneReduction: totalReduction,
-    totalReduction,
+    milestoneReduction: 0,
+    totalReduction: 0,
+    monnifySplitUpdateSkipped: "creator_fee_rewards_disabled",
   }
 }
 
@@ -7393,340 +7326,10 @@ async function appendCreatorMonnifySplitLog(creatorId, logEntry, extraSet = {}) 
 }
 
 async function syncCreatorPlatformFeeWithRewards(creatorId, { config } = {}) {
-  if (!creatorId) return null
-
-  const creator = await User.findById(creatorId)
-  const resolvedConfig = config || (await getCreatorRewardsConfig())
-
-  if (!creator) {
-    return null
-  }
-
-  const feeSummary = await getRewardTargetPlatformFeeForCreator(creator._id, resolvedConfig)
-  const oldFee = normalizePlatformFeePercent(creator.platformFee, resolvedConfig)
-  const newFee = normalizePlatformFeePercent(feeSummary.platformFeePercent, resolvedConfig)
-  const previousCreatorSplit = Number((100 - oldFee).toFixed(2))
-  const newCreatorSplit = Number((100 - newFee).toFixed(2))
-
-  if (oldFee === newFee && typeof creator.platformFee === "number") {
-    return {
-      skipped: true,
-      reason: "platform_fee_unchanged",
-      platformFeePercent: newFee,
-    }
-  }
-
-  const accountReference = String(creator.virtualAccount?.accountReference || "").trim()
-  const endpointUrl = accountReference ? getMonnifyIncomeSplitConfigEndpoint(accountReference) : ""
-  const httpMethod = "PUT"
-
-  if (!isMonnifyConfigured()) {
-    const message = "Monnify is not configured, so creator platform fee cannot be synced."
-    await appendCreatorMonnifySplitLog(creator._id, {
-      oldFee,
-      newFee,
-      previousCreatorSplit,
-      newCreatorSplit,
-      endpointUrl,
-      httpMethod,
-      accountReference,
-      subAccountCode: "",
-      status: "validation_failed",
-      error: message,
-    })
-    await createAuditLog({
-      actorType: "system",
-      eventType: "creator_rewards.monnify_split_validation_failed",
-      message,
-      metadata: buildCreatorRewardsMonnifyAuditMetadata({
-        creator,
-        accountReference,
-        subAccountCode: "",
-        previousPlatformFee: oldFee,
-        newPlatformFee: newFee,
-        previousCreatorSplit,
-        newCreatorSplit,
-        endpointUrl,
-        httpMethod,
-        requestPayload: null,
-        error: message,
-      }),
-    })
-    throw createStatusCodeError(message, 500)
-  }
-
-  const validationErrors = []
-  if (!accountReference) validationErrors.push("Creator does not have a Monnify accountReference to update.")
-  if (newFee < MINIMUM_PLATFORM_FEE_PERCENT || newFee > DEFAULT_PLATFORM_FEE_PERCENT) {
-    validationErrors.push("Creator platformFee must be between 15 and 20 before Monnify split update.")
-  }
-
-  let accessToken = ""
-  let streamerSubAccount = null
-  if (!validationErrors.length) {
-    try {
-      accessToken = await getMonnifyAccessToken()
-      streamerSubAccount = await ensureMonnifyStreamerSubAccount(creator, accessToken)
-    } catch (error) {
-      const message = getAxiosErrorMessage(error, "Monnify split update failed while preparing creator subaccount.")
-      const httpStatusCode = error?.response?.status || error?.statusCode || 502
-      const responseBody = error?.response?.data || null
-      const monnifyResponseBody = getMonnifyResponseBody(error?.response)
-      const monnifyResponseCode = getMonnifyResponseCodeFromBody(monnifyResponseBody)
-      const monnifyResponseMessage = getMonnifyResponseMessageFromBody(monnifyResponseBody, message)
-      const monnifyRequest = {
-        endpointUrl,
-        httpMethod,
-        accountReference,
-        subAccountCode: "",
-        creatorEmail: creator.email,
-        platformFee: newFee,
-        creatorPercentage: newCreatorSplit,
-        requestPayload: null,
-      }
-
-      await appendCreatorMonnifySplitLog(creator._id, {
-        oldFee,
-        newFee,
-        previousCreatorSplit,
-        newCreatorSplit,
-        httpStatusCode,
-        monnifyResponseCode,
-        monnifyResponseMessage,
-        endpointUrl,
-        httpMethod,
-        accountReference,
-        subAccountCode: "",
-        monnifyRequest,
-        monnifyResponse: responseBody,
-        status: "failed",
-        error: message,
-      }, {
-        monnifySplitConfigLastError: message,
-      })
-
-      await createAuditLog({
-        actorType: "system",
-        eventType: "creator_rewards.monnify_split_update_failed",
-        message: `Could not prepare Monnify split update for ${creator.email}.`,
-        metadata: buildCreatorRewardsMonnifyAuditMetadata({
-          creator,
-          accountReference,
-          subAccountCode: "",
-          previousPlatformFee: oldFee,
-          newPlatformFee: newFee,
-          previousCreatorSplit,
-          newCreatorSplit,
-          endpointUrl,
-          httpMethod,
-          requestPayload: null,
-          responseBody,
-          httpStatusCode,
-          error: message,
-        }),
-      })
-
-      throw createStatusCodeError(
-        `Monnify split update failed for creator ${creator._id}: ${message}`,
-        httpStatusCode,
-      )
-    }
-  }
-  const streamerSubAccountCode = String(streamerSubAccount?.subAccountCode || "").trim()
-  const incomeSplitConfig = buildMonnifyIncomeSplitConfigForPlatformFee({
-    streamerSubAccountCode,
-    platformFeePercent: newFee,
-  })
-  if (!streamerSubAccountCode) validationErrors.push("Creator does not have a Monnify subAccountCode to update.")
-  if (!incomeSplitConfig.length || incomeSplitConfig.length < 2) {
-    validationErrors.push("Monnify split update requires valid creator and platform subaccount codes.")
-  }
-  const requestPayload = { incomeSplitConfig }
-  const monnifyRequest = {
-    endpointUrl,
-    httpMethod,
-    accountReference,
-    subAccountCode: streamerSubAccountCode,
-    creatorEmail: creator.email,
-    platformFee: newFee,
-    creatorPercentage: newCreatorSplit,
-    requestPayload,
-  }
-
-  if (validationErrors.length) {
-    const message = validationErrors.join(" ")
-    await appendCreatorMonnifySplitLog(creator._id, {
-      oldFee,
-      newFee,
-      previousCreatorSplit,
-      newCreatorSplit,
-      endpointUrl,
-      httpMethod,
-      accountReference,
-      subAccountCode: streamerSubAccountCode,
-      monnifyRequest,
-      status: "validation_failed",
-      error: message,
-    }, {
-      monnifySplitConfigLastError: message,
-    })
-    await createAuditLog({
-      actorType: "system",
-      eventType: "creator_rewards.monnify_split_validation_failed",
-      message: `Skipped Monnify split update for ${creator.email}: ${message}`,
-      metadata: buildCreatorRewardsMonnifyAuditMetadata({
-        creator,
-        accountReference,
-        subAccountCode: streamerSubAccountCode,
-        previousPlatformFee: oldFee,
-        newPlatformFee: newFee,
-        previousCreatorSplit,
-        newCreatorSplit,
-        endpointUrl,
-        httpMethod,
-        requestPayload,
-        error: message,
-      }),
-    })
-    throw createStatusCodeError(message, 400)
-  }
-
-  creator.platformFee = newFee
-  creator.monnifySplitConfigLastError = ""
-  await creator.save()
-
-  try {
-    const monnifyResponse = await updateMonnifyReservedAccountSplitConfig({
-      accessToken,
-      accountReference,
-      incomeSplitConfig,
-    })
-
-    const appliedAt = new Date()
-    const responseCode = getMonnifyResponseCodeFromBody(monnifyResponse)
-    const responseMessage = getMonnifyResponseMessageFromBody(monnifyResponse)
-    creator.virtualAccount = {
-      ...(creator.virtualAccount?.toObject?.() || creator.virtualAccount || {}),
-      settlementMode: "direct_split",
-      monnifySubAccountCode: streamerSubAccountCode,
-      incomeSplitConfigApplied: incomeSplitConfig,
-      updatedAt: appliedAt,
-    }
-    creator.monnifySplitConfigLastResponse = monnifyResponse
-    creator.monnifySplitConfigLastSyncedAt = appliedAt
-    creator.monnifySplitConfigLastError = ""
-    creator.monnifySplitUpdateLogs = [
-      ...(Array.isArray(creator.monnifySplitUpdateLogs) ? creator.monnifySplitUpdateLogs : []),
-      {
-        oldFee,
-        newFee,
-        previousCreatorSplit,
-        newCreatorSplit,
-        httpStatusCode: 200,
-        monnifyResponseCode: responseCode,
-        monnifyResponseMessage: responseMessage,
-        endpointUrl,
-        httpMethod,
-        accountReference,
-        subAccountCode: streamerSubAccountCode,
-        monnifyRequest,
-        monnifyResponse,
-        status: "success",
-        timestamp: appliedAt,
-      },
-    ].slice(-25)
-    await creator.save()
-
-    await createAuditLog({
-      actorType: "system",
-      eventType: "creator_rewards.monnify_split_updated",
-      message: `Updated Monnify split for ${creator.email} from ${oldFee}% to ${newFee}%.`,
-      metadata: {
-        creatorId: creator._id.toString(),
-        creatorEmail: creator.email,
-        accountReference,
-        subAccountCode: streamerSubAccountCode,
-        previousPlatformFee: oldFee,
-        newPlatformFee: newFee,
-        previousCreatorSplit,
-        newCreatorSplit,
-        monnifyRequest,
-        monnifyResponse,
-        httpStatusCode: 200,
-        monnifyResponseCode: responseCode,
-        monnifyResponseMessage: responseMessage,
-        endpointUrl,
-        httpMethod,
-        requestPayload,
-        responseBody: monnifyResponse,
-        timestamp: appliedAt,
-      },
-    })
-
-    return {
-      updated: true,
-      oldFee,
-      newFee,
-      monnifyRequest,
-      monnifyResponse,
-    }
-  } catch (error) {
-    const message = getAxiosErrorMessage(error, "Monnify split update failed.")
-    const httpStatusCode = error?.response?.status || error?.statusCode || 502
-    const responseBody = error?.response?.data || null
-    const monnifyResponseBody = getMonnifyResponseBody(error?.response)
-    const monnifyResponseCode = getMonnifyResponseCodeFromBody(monnifyResponseBody)
-    const monnifyResponseMessage = getMonnifyResponseMessageFromBody(monnifyResponseBody, message)
-    await appendCreatorMonnifySplitLog(
-      creator._id,
-      {
-        oldFee,
-        newFee,
-        previousCreatorSplit,
-        newCreatorSplit,
-        httpStatusCode,
-        monnifyResponseCode,
-        monnifyResponseMessage,
-        endpointUrl,
-        httpMethod,
-        accountReference,
-        subAccountCode: streamerSubAccountCode,
-        monnifyRequest,
-        monnifyResponse: responseBody,
-        status: "failed",
-        error: message,
-      },
-      {
-        platformFee: oldFee,
-        monnifySplitConfigLastError: message,
-      },
-    )
-
-    await createAuditLog({
-      actorType: "system",
-      eventType: "creator_rewards.monnify_split_update_failed",
-      message: `Rolled back platform fee for ${creator.email} after Monnify split update failed.`,
-      metadata: buildCreatorRewardsMonnifyAuditMetadata({
-        creator,
-        accountReference,
-        subAccountCode: streamerSubAccountCode,
-        previousPlatformFee: oldFee,
-        newPlatformFee: newFee,
-        previousCreatorSplit,
-        newCreatorSplit,
-        endpointUrl,
-        httpMethod,
-        requestPayload,
-        responseBody,
-        httpStatusCode,
-        error: message,
-      }),
-    })
-
-    throw createStatusCodeError(
-      `Monnify split update failed for creator ${creator._id}: ${message}`,
-      httpStatusCode,
-    )
+  return {
+    skipped: true,
+    reason: "creator_fee_rewards_disabled",
+    platformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
   }
 }
 
@@ -7773,13 +7376,10 @@ async function buildCreatorRewardsDashboard(user) {
   }
 
   const referralCode = await ensureCreatorReferralCode(creator)
-  const rewardEvaluation = await evaluateCreatorRewards(creator._id, { throwOnSyncError: false })
 
-  const [config, stats, feeSummary, rewards, referredCreators] = await Promise.all([
+  const [config, stats, referredCreators] = await Promise.all([
     getCreatorRewardsConfig(),
     getCreatorRewardStats(creator._id),
-    getEffectivePlatformFeeForCreator(creator._id),
-    CreatorReward.find({ creatorId: creator._id }).sort({ awardedAt: -1 }).limit(100).lean(),
     User.find({ referredBy: creator._id })
       .select({ _id: 1, name: 1, email: 1, createdAt: 1 })
       .sort({ createdAt: -1 })
@@ -7789,7 +7389,6 @@ async function buildCreatorRewardsDashboard(user) {
   const referredCreatorStats = await Promise.all(
     referredCreators.map(async (referredCreator) => {
       const referredStats = await getCreatorRewardStats(referredCreator._id)
-      const qualified = referredStats.totalAmount >= config.referralQualifyingDonationAmount
 
       return {
         id: referredCreator._id.toString(),
@@ -7797,73 +7396,54 @@ async function buildCreatorRewardsDashboard(user) {
         email: referredCreator.email || "",
         joinedAt: referredCreator.createdAt || "",
         totalDonations: referredStats.totalAmount,
-        qualified,
-        progressPercent: Math.min(
-          100,
-          Math.round((referredStats.totalAmount / config.referralQualifyingDonationAmount) * 100),
-        ),
+        totalDonationCount: referredStats.totalDonations,
       }
     }),
   )
 
-  const completedRewardIds = new Set(rewards.map((reward) => `${reward.source}:${reward.sourceId}`))
-  const milestoneProgress = config.milestones
-    .filter((milestone) => milestone.enabled)
-    .sort((left, right) => left.sortOrder - right.sortOrder)
-    .map((milestone) => {
-      const current = getMilestoneProgressValue(stats, milestone.metric)
-      const completed = current >= milestone.target
-      return {
-        ...milestone,
-        current,
-        completed,
-        awarded: completedRewardIds.has(`milestone:${milestone.id}`),
-        progressPercent: Math.min(100, Math.round((current / milestone.target) * 100)),
-      }
-    })
-  const serializedRewards = rewards.map(serializeCreatorReward).filter(Boolean)
-  const activeRewards = serializedRewards.filter((reward) => !reward.expired)
-  const nextExpiry = activeRewards.reduce((earliest, reward) => {
-    const expiresAt = reward.expiresAt ? new Date(reward.expiresAt).getTime() : 0
-    if (!expiresAt) return earliest
-    return earliest ? Math.min(earliest, expiresAt) : expiresAt
-  }, 0)
-
   return {
-    currentPlatformFeePercent: feeSummary.platformFeePercent,
-    defaultPlatformFeePercent: config.defaultPlatformFeePercent,
-    minimumPlatformFeePercent: config.minimumPlatformFeePercent,
-    activeReductionPercent: feeSummary.totalReduction,
-    referralReductionPercent: feeSummary.referralReduction,
-    milestoneReductionPercent: feeSummary.milestoneReduction,
-    timeRemainingMs: nextExpiry ? Math.max(0, nextExpiry - Date.now()) : 0,
+    currentPlatformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+    defaultPlatformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+    minimumPlatformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+    activeReductionPercent: 0,
+    referralReductionPercent: 0,
+    milestoneReductionPercent: 0,
+    timeRemainingMs: 0,
     referral: {
       code: referralCode,
       link: getReferralLinkForCode(referralCode),
-      qualifyingDonationAmount: config.referralQualifyingDonationAmount,
-      reductionPercent: config.referralReductionPercent,
-      reductionCapPercent: config.referralReductionCapPercent,
+      qualifyingDonationAmount: 0,
+      reductionPercent: 0,
+      reductionCapPercent: 0,
       total: referredCreatorStats.length,
-      successful: referredCreatorStats.filter((item) => item.qualified).length,
+      successful: 0,
       referredCreators: referredCreatorStats,
     },
     progress: stats,
-    milestones: milestoneProgress,
-    upcomingRewards: milestoneProgress.filter((milestone) => !milestone.completed),
-    completedRewards: milestoneProgress.filter((milestone) => milestone.completed),
-    activeRewards,
-    rewardHistory: serializedRewards,
+    milestones: [],
+    upcomingRewards: [],
+    completedRewards: [],
+    activeRewards: [],
+    rewardHistory: [],
     platformFeeSync: {
-      results: Array.isArray(rewardEvaluation?.platformFeeSyncResults)
-        ? rewardEvaluation.platformFeeSyncResults
-        : [],
-      lastError:
-        creator.monnifySplitConfigLastError ||
-        rewardEvaluation?.platformFeeSyncResults?.find((item) => item?.error)?.error ||
-        "",
-      lastSyncedAt: creator.monnifySplitConfigLastSyncedAt || "",
+      results: [
+        {
+          skipped: true,
+          reason: "creator_fee_rewards_disabled",
+          platformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+        },
+      ],
+      lastError: "",
+      lastSyncedAt: "",
     },
-    config,
+    config: {
+      ...config,
+      defaultPlatformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+      minimumPlatformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+      referralReductionPercent: 0,
+      referralReductionCapPercent: 0,
+      milestones: [],
+    },
   }
 }
 
@@ -18345,8 +17925,17 @@ app.post("/admin/send-animation", requireAdminSession, async (req, res) => {
 
 app.get("/admin/rewards-config", requireAdminSession, async (_req, res) => {
   try {
-    const config = await getCreatorRewardsConfig()
-    return res.json({ config })
+    return res.json({
+      config: {
+        ...normalizeRewardConfigPayload({ milestones: [] }),
+        defaultPlatformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+        minimumPlatformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+        referralReductionPercent: 0,
+        referralReductionCapPercent: 0,
+        milestones: [],
+        disabled: true,
+      },
+    })
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: "Failed to load rewards configuration." })
@@ -18355,32 +17944,29 @@ app.get("/admin/rewards-config", requireAdminSession, async (_req, res) => {
 
 app.put("/admin/rewards-config", requireAdminSession, async (req, res) => {
   try {
-    const nextConfig = normalizeRewardConfigPayload(req.body || {})
-    const saved = await RewardConfig.findOneAndUpdate(
-      { key: "creator_rewards" },
-      {
-        $set: {
-          ...nextConfig,
-          updatedBy: req.adminSession._id.toString(),
-        },
-      },
-      { upsert: true, new: true },
-    )
-
     await createAuditLog({
       actorType: "admin",
       actorId: req.adminSession._id.toString(),
-      eventType: "admin.rewards_config.updated",
-      message: "Admin updated creator rewards configuration.",
+      eventType: "admin.rewards_config.disabled_update_attempt",
+      message: "Admin attempted to update disabled creator rewards configuration.",
       metadata: {
-        defaultPlatformFeePercent: nextConfig.defaultPlatformFeePercent,
-        minimumPlatformFeePercent: nextConfig.minimumPlatformFeePercent,
-        rewardExpirationDays: nextConfig.rewardExpirationDays,
-        milestoneCount: nextConfig.milestones.length,
+        platformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+        disabled: true,
       },
     })
 
-    return res.json({ config: normalizeRewardConfigPayload(saved.toObject()) })
+    return res.json({
+      config: {
+        ...normalizeRewardConfigPayload({ milestones: [] }),
+        defaultPlatformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+        minimumPlatformFeePercent: DEFAULT_PLATFORM_FEE_PERCENT,
+        referralReductionPercent: 0,
+        referralReductionCapPercent: 0,
+        milestones: [],
+        disabled: true,
+      },
+      message: "Creator fee rewards are disabled. Platform fee remains fixed at 20%.",
+    })
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: "Failed to save rewards configuration." })
