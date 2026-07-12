@@ -7093,7 +7093,7 @@ async function awardCreatorReward({ creatorId, source, sourceId, title, reductio
   )
 }
 
-async function evaluateCreatorRewards(creatorId) {
+async function evaluateCreatorRewards(creatorId, { throwOnSyncError = true } = {}) {
   if (!creatorId) return null
   const [config, creator] = await Promise.all([
     getCreatorRewardsConfig(),
@@ -7142,11 +7142,28 @@ async function evaluateCreatorRewards(creatorId) {
     affectedCreatorIds.add(creator.referredBy.toString())
   }
 
+  const platformFeeSyncResults = []
+
   for (const affectedCreatorId of affectedCreatorIds) {
-    await syncCreatorPlatformFeeWithRewards(affectedCreatorId, { config })
+    try {
+      platformFeeSyncResults.push(await syncCreatorPlatformFeeWithRewards(affectedCreatorId, { config }))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Creator rewards platform fee sync failed."
+      platformFeeSyncResults.push({
+        creatorId: affectedCreatorId,
+        error: message,
+      })
+
+      if (throwOnSyncError) {
+        throw error
+      }
+    }
   }
 
-  return stats
+  return {
+    ...stats,
+    platformFeeSyncResults,
+  }
 }
 
 async function getEffectivePlatformFeeForCreator(creatorId) {
@@ -7170,12 +7187,29 @@ async function getEffectivePlatformFeeForCreator(creatorId) {
     }
   }
 
+  const platformFeePercent = normalizePlatformFeePercent(creator.platformFee, config)
+  const totalReduction = Math.max(0, Number((defaultFee - platformFeePercent).toFixed(2)))
+
+  return {
+    config,
+    activeRewards: [],
+    platformFeePercent,
+    referralReduction: 0,
+    milestoneReduction: totalReduction,
+    totalReduction,
+  }
+}
+
+async function getRewardTargetPlatformFeeForCreator(creatorId, config) {
+  const resolvedConfig = config || (await getCreatorRewardsConfig())
+  const defaultFee = normalizePlatformFeePercent(resolvedConfig.defaultPlatformFeePercent, resolvedConfig)
+
   const now = new Date()
   const activeRewards = creatorId
     ? await CreatorReward.find({ creatorId, expiresAt: { $gt: now } }).sort({ awardedAt: -1 }).lean()
     : []
   const referralReduction = Math.min(
-    config.referralReductionCapPercent,
+    resolvedConfig.referralReductionCapPercent,
     activeRewards
       .filter((reward) => reward.source === "referral")
       .reduce((total, reward) => total + normalizeRewardPercent(reward.reductionPercent, 0), 0),
@@ -7183,17 +7217,17 @@ async function getEffectivePlatformFeeForCreator(creatorId) {
   const milestoneReduction = activeRewards
     .filter((reward) => reward.source !== "referral")
     .reduce((total, reward) => total + normalizeRewardPercent(reward.reductionPercent, 0), 0)
-  const maximumReduction = Math.max(0, config.defaultPlatformFeePercent - config.minimumPlatformFeePercent)
+  const maximumReduction = Math.max(0, resolvedConfig.defaultPlatformFeePercent - resolvedConfig.minimumPlatformFeePercent)
   const totalReduction = Math.min(maximumReduction, referralReduction + milestoneReduction)
   const platformFeePercent = Math.max(
-    config.minimumPlatformFeePercent,
-    Number((config.defaultPlatformFeePercent - totalReduction).toFixed(2)),
+    resolvedConfig.minimumPlatformFeePercent,
+    Number((resolvedConfig.defaultPlatformFeePercent - totalReduction).toFixed(2)),
   )
 
   return {
-    config,
+    config: resolvedConfig,
     activeRewards,
-    platformFeePercent: normalizePlatformFeePercent(platformFeePercent, config),
+    platformFeePercent: normalizePlatformFeePercent(platformFeePercent, resolvedConfig),
     referralReduction,
     milestoneReduction,
     totalReduction,
@@ -7250,7 +7284,7 @@ async function syncCreatorPlatformFeeWithRewards(creatorId, { config } = {}) {
     }
   }
 
-  const feeSummary = await getEffectivePlatformFeeForCreator(creator._id)
+  const feeSummary = await getRewardTargetPlatformFeeForCreator(creator._id, resolvedConfig)
   const oldFee = normalizePlatformFeePercent(creator.platformFee, resolvedConfig)
   const newFee = normalizePlatformFeePercent(feeSummary.platformFeePercent, resolvedConfig)
 
@@ -7426,7 +7460,7 @@ async function buildCreatorRewardsDashboard(user) {
   }
 
   const referralCode = await ensureCreatorReferralCode(creator)
-  await evaluateCreatorRewards(creator._id)
+  const rewardEvaluation = await evaluateCreatorRewards(creator._id, { throwOnSyncError: false })
 
   const [config, stats, feeSummary, rewards, referredCreators] = await Promise.all([
     getCreatorRewardsConfig(),
@@ -7506,6 +7540,16 @@ async function buildCreatorRewardsDashboard(user) {
     completedRewards: milestoneProgress.filter((milestone) => milestone.completed),
     activeRewards,
     rewardHistory: serializedRewards,
+    platformFeeSync: {
+      results: Array.isArray(rewardEvaluation?.platformFeeSyncResults)
+        ? rewardEvaluation.platformFeeSyncResults
+        : [],
+      lastError:
+        creator.monnifySplitConfigLastError ||
+        rewardEvaluation?.platformFeeSyncResults?.find((item) => item?.error)?.error ||
+        "",
+      lastSyncedAt: creator.monnifySplitConfigLastSyncedAt || "",
+    },
     config,
   }
 }
