@@ -88,7 +88,7 @@ const IDENTITY_ENCRYPTION_KEY = readEnv("IDENTITY_ENCRYPTION_KEY")
 const TELEGRAM_BOT_TOKEN = readEnv("TELEGRAM_BOT_TOKEN")
 const TELEGRAM_WITHDRAWAL_CHAT_ID =
   readEnv("TELEGRAM_WITHDRAWAL_CHAT_ID") || readEnv("TELEGRAM_CHAT_ID")
-const PORTAL_URL = readEnv("PORTAL_URL") || "https://portal.streamtips.live"
+const PORTAL_URL = readEnv("PORTAL_URL") || "https://streamtips.live"
 const API_PUBLIC_BASE_URL = readEnv("API_PUBLIC_BASE_URL") || "https://api.streamtips.live"
 const KYC_DOCUMENT_SIGNING_SECRET =
   readEnv("KYC_DOCUMENT_SIGNING_SECRET") || IDENTITY_ENCRYPTION_KEY || ADMIN_PASSWORD
@@ -5356,6 +5356,11 @@ function sanitizePortalUserListItem(user) {
     email: user.email || "",
     role: user.role || "creator",
     status: user.status || "active",
+    profileImage: user.profileImage || "",
+    socialProfile: sanitizeSocialProfile(user.socialProfile),
+    referralCode: user.referralCode || "",
+    referredBy: user.referredBy?.toString?.() || user.referredBy || "",
+    referredByCode: user.referredByCode || "",
     identity: {
       hasBvn: Boolean(bvn),
       hasNin: Boolean(nin),
@@ -5365,6 +5370,71 @@ function sanitizePortalUserListItem(user) {
       nin,
     },
     createdAt: user.createdAt || "",
+  }
+}
+
+async function buildPortalReferralSummary(userOrId, config) {
+  const creatorId = userOrId && typeof userOrId === "object" && userOrId._id ? userOrId._id : userOrId
+
+  if (!creatorId) {
+    return {
+      qualifyingDonationAmount: config?.referralQualifyingDonationAmount || DEFAULT_REFERRAL_QUALIFYING_DONATION_AMOUNT,
+      referredCreatorCount: 0,
+      qualifiedReferralCount: 0,
+      totalReferredGrossRevenue: 0,
+      totalReferredCreatorRevenue: 0,
+      totalReferredPendingRevenue: 0,
+      totalReferredPaidOut: 0,
+      referredCreators: [],
+    }
+  }
+
+  const qualifyingDonationAmount =
+    Number(config?.referralQualifyingDonationAmount) || DEFAULT_REFERRAL_QUALIFYING_DONATION_AMOUNT
+  const referredCreators = await User.find({ referredBy: creatorId })
+    .select({
+      _id: 1,
+      name: 1,
+      firstName: 1,
+      middleName: 1,
+      lastName: 1,
+      email: 1,
+      status: 1,
+      profileImage: 1,
+      socialProfile: 1,
+      referralCode: 1,
+      referredByCode: 1,
+      createdAt: 1,
+    })
+    .sort({ createdAt: -1 })
+    .lean()
+
+  const creatorRows = await Promise.all(
+    referredCreators.map(async (creator) => {
+      const totals = await getRevenueTotals({ creatorId: creator._id })
+      const grossRevenue = Number(totals.grossRevenue || 0)
+
+      return {
+        ...sanitizePortalUserListItem(creator),
+        grossRevenue,
+        creatorRevenue: Number(totals.creatorRevenue || 0) + Number(totals.directSplitCreatorRevenue || 0),
+        pendingCreatorRevenue: Number(totals.pendingCreatorRevenue || 0),
+        totalPaidOut: Number(totals.totalPaidOut || 0),
+        qualified: grossRevenue >= qualifyingDonationAmount,
+        progressPercent: Math.min(100, Math.round((grossRevenue / qualifyingDonationAmount) * 100)),
+      }
+    }),
+  )
+
+  return {
+    qualifyingDonationAmount,
+    referredCreatorCount: creatorRows.length,
+    qualifiedReferralCount: creatorRows.filter((creator) => creator.qualified).length,
+    totalReferredGrossRevenue: creatorRows.reduce((sum, creator) => sum + Number(creator.grossRevenue || 0), 0),
+    totalReferredCreatorRevenue: creatorRows.reduce((sum, creator) => sum + Number(creator.creatorRevenue || 0), 0),
+    totalReferredPendingRevenue: creatorRows.reduce((sum, creator) => sum + Number(creator.pendingCreatorRevenue || 0), 0),
+    totalReferredPaidOut: creatorRows.reduce((sum, creator) => sum + Number(creator.totalPaidOut || 0), 0),
+    referredCreators: creatorRows,
   }
 }
 
@@ -16746,6 +16816,9 @@ app.get("/portal/users", requireAdminSession, async (req, res) => {
           status: 1,
           profileImage: 1,
           socialProfile: 1,
+          referralCode: 1,
+          referredBy: 1,
+          referredByCode: 1,
           identity: 1,
           createdAt: 1,
         })
@@ -16755,9 +16828,16 @@ app.get("/portal/users", requireAdminSession, async (req, res) => {
         .lean(),
       User.countDocuments(filter),
     ])
+    const rewardsConfig = await getCreatorRewardsConfig()
+    const usersWithReferralSummaries = await Promise.all(
+      users.map(async (user) => ({
+        ...sanitizePortalUserListItem(user),
+        referralSummary: await buildPortalReferralSummary(user._id, rewardsConfig),
+      })),
+    )
 
     res.json({
-      users: users.map(sanitizePortalUserListItem),
+      users: usersWithReferralSummaries,
       pagination: getPaginationMeta({ page, limit, total }),
       search,
     })
@@ -16779,7 +16859,7 @@ app.get("/portal/users/:id", requireAdminSession, async (req, res) => {
       return res.status(404).json({ error: "User not found." })
     }
 
-    const [payouts, changeRequests, donations, balance] = await Promise.all([
+    const [payouts, changeRequests, donations, balance, rewardsConfig] = await Promise.all([
       Payout.find({ creatorId: user._id })
         .select({
           _id: 1,
@@ -16848,14 +16928,21 @@ app.get("/portal/users/:id", requireAdminSession, async (req, res) => {
         .limit(50)
         .lean(),
       getRevenueTotals({ creatorId: user._id }),
+      getCreatorRewardsConfig(),
     ])
+    const referralSummary = await buildPortalReferralSummary(user._id, rewardsConfig)
 
     res.json({
-      user: sanitizePrivilegedUser(user),
+      user: {
+        ...sanitizePrivilegedUser(user),
+        referredBy: user.referredBy?.toString?.() || user.referredBy || "",
+        referredByCode: user.referredByCode || "",
+      },
       payouts: payouts.map(sanitizePortalPayout),
       changeRequests: changeRequests.map(sanitizePayoutProfileChangeRequest),
       donations: donations.map(sanitizePortalDonation),
       balance,
+      referralSummary,
     })
   } catch (error) {
     console.error(error)
