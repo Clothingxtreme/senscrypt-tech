@@ -1832,7 +1832,15 @@ const userSchema = new mongoose.Schema(
     googleSub: { type: String, default: "", index: true },
     appleSub: { type: String, default: "", index: true },
     role: { type: String, enum: ["creator", "admin"], default: "creator" },
-    status: { type: String, enum: ["active", "suspended", "banned"], default: "active" },
+    status: { type: String, enum: ["active", "suspended", "banned", "deleted"], default: "active" },
+    // Deletion is deliberately retained for financial, KYC, and audit obligations.
+    // Never replace this with a MongoDB delete for customer records.
+    deletedAt: { type: Date, default: null, index: true },
+    deletedBy: {
+      actorType: { type: String, enum: ["user", "admin", "system"], default: "" },
+      actorId: { type: String, default: "" },
+    },
+    deletionReason: { type: String, default: "" },
     profileImage: { type: String, default: "" },
     phoneNumber: { type: String, default: "" },
     phoneVerified: { type: Boolean, default: false },
@@ -2064,6 +2072,8 @@ const userSchema = new mongoose.Schema(
           createdAt: Date,
           updatedAt: Date,
           deprecatedAt: Date,
+          archivedAt: Date,
+          archiveReason: String,
         },
       ],
       default: undefined,
@@ -2094,9 +2104,40 @@ const userSchema = new mongoose.Schema(
 )
 
 userSchema.index({ createdAt: -1 })
+userSchema.index({ deletedAt: 1, createdAt: -1 })
 userSchema.index({ referralCode: 1 }, { unique: true, sparse: true })
 
 const User = mongoose.model("User", userSchema)
+
+// MongoDB treats { field: null } as matching both legacy missing values and explicit nulls.
+const activeUserFilter = { deletedAt: null }
+
+function isSoftDeletedUser(user) {
+  return Boolean(user?.deletedAt) || String(user?.status || "").toLowerCase() === "deleted"
+}
+
+async function softDeleteUser({ user, actorType, actorId = "", reason = "" }) {
+  if (!user) {
+    throw createStatusCodeError("User not found.", 404)
+  }
+
+  if (isSoftDeletedUser(user)) {
+    return user
+  }
+
+  user.status = "deleted"
+  user.deletedAt = new Date()
+  user.deletedBy = { actorType, actorId: String(actorId || "") }
+  user.deletionReason = String(reason || "").trim().slice(0, 500)
+  user.sessionToken = null
+  user.passwordResetTokenHash = ""
+  user.passwordResetExpiresAt = undefined
+  user.passwordResetRequestedAt = undefined
+  await user.save()
+  invalidateOverlayPublicCache(user._id)
+
+  return user
+}
 
 function splitNamePartsFromFullName(name) {
   const parts = String(name || "").trim().split(/\s+/).filter(Boolean)
@@ -6369,6 +6410,7 @@ async function buildPublicOverlayCacheEntry(creatorId) {
   const creatorObjectId = new mongoose.Types.ObjectId(creatorId)
   const user = await User.findOne({
     _id: creatorObjectId,
+    ...activeUserFilter,
     $or: [{ status: { $exists: false } }, { status: "active" }],
   })
     .select({
@@ -9979,7 +10021,16 @@ async function removeVirtualAccountForUser(user) {
 
   const updatedUser = await User.findByIdAndUpdate(
     user._id,
-    { $unset: { virtualAccount: "" } },
+    {
+      $push: {
+        legacyVirtualAccounts: {
+          ...previousVirtualAccount,
+          archivedAt: new Date(),
+          archiveReason: "admin_deactivated",
+        },
+      },
+      $unset: { virtualAccount: "" },
+    },
     { new: true },
   )
 
@@ -11648,7 +11699,7 @@ async function getSessionUser(req) {
     return null
   }
 
-  return User.findOne({ sessionToken })
+  return User.findOne({ sessionToken, ...activeUserFilter })
 }
 
 async function getSessionUserByToken(sessionToken) {
@@ -11658,7 +11709,7 @@ async function getSessionUserByToken(sessionToken) {
     return null
   }
 
-  return User.findOne({ sessionToken: normalizedToken })
+  return User.findOne({ sessionToken: normalizedToken, ...activeUserFilter })
 }
 
 async function requireSessionUser(req, res, next) {
@@ -11692,6 +11743,7 @@ async function findCreatorForMonnifyEvent(eventData) {
 
   if (accountReference) {
     const matchedByReference = await User.findOne({
+      ...activeUserFilter,
       $or: [
         { "virtualAccount.accountReference": accountReference },
         { "virtualAccount.reservationReference": accountReference },
@@ -11705,6 +11757,7 @@ async function findCreatorForMonnifyEvent(eventData) {
 
   if (destinationAccountNumber) {
     const candidates = await User.find({
+      ...activeUserFilter,
       "virtualAccount.accountNumber": destinationAccountNumber,
       ...(destinationBankCode ? { "virtualAccount.bankCode": destinationBankCode } : {}),
     }).limit(2)
@@ -11889,6 +11942,7 @@ async function findCreatorForPaystackEvent(eventData = {}) {
 
   if (customerCode) {
     const creator = await User.findOne({
+      ...activeUserFilter,
       "virtualAccount.provider": "paystack",
       "virtualAccount.paystackCustomerCode": customerCode,
     })
@@ -11900,6 +11954,7 @@ async function findCreatorForPaystackEvent(eventData = {}) {
 
   if (dedicatedAccountId) {
     const creator = await User.findOne({
+      ...activeUserFilter,
       "virtualAccount.provider": "paystack",
       "virtualAccount.dedicatedAccountId": dedicatedAccountId,
     })
@@ -11911,6 +11966,7 @@ async function findCreatorForPaystackEvent(eventData = {}) {
 
   if (destinationAccountNumber) {
     const candidates = await User.find({
+      ...activeUserFilter,
       "virtualAccount.provider": "paystack",
       "virtualAccount.accountNumber": destinationAccountNumber,
     }).limit(2)
@@ -12544,6 +12600,10 @@ app.post("/auth/login", authLimiter, async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password." })
     }
 
+    if (isSoftDeletedUser(user)) {
+      return res.status(403).json({ error: "This account has been deleted. Contact support if you need assistance." })
+    }
+
     if (user.status === "banned") {
       return res.status(403).json({ error: "This account has been banned." })
     }
@@ -12586,7 +12646,7 @@ app.post("/auth/forgot-password", authLimiter, async (req, res) => {
 
     const user = await User.findOne({ email })
 
-    if (!user || user.status === "banned") {
+    if (!user || isSoftDeletedUser(user) || user.status === "banned") {
       await createAuditLog({
         actorType: "system",
         eventType: "auth.password_reset.requested_unknown",
@@ -12643,6 +12703,7 @@ app.get("/auth/reset-password/validate", authLimiter, async (req, res) => {
     const user = await User.findOne({
       passwordResetTokenHash: tokenHash,
       passwordResetExpiresAt: { $gt: new Date() },
+      ...activeUserFilter,
     }).select({ _id: 1 })
 
     if (!user) {
@@ -12676,6 +12737,7 @@ app.post("/auth/reset-password", authLimiter, async (req, res) => {
     const user = await User.findOne({
       passwordResetTokenHash: tokenHash,
       passwordResetExpiresAt: { $gt: new Date() },
+      ...activeUserFilter,
     })
 
     if (!user) {
@@ -15373,6 +15435,37 @@ app.put("/user", requireSessionUser, async (req, res) => {
   }
 })
 
+app.delete("/user", sensitiveActionLimiter, requireSessionUser, async (req, res) => {
+  try {
+    const currentPassword = String(req.body?.currentPassword || "")
+    const reason = String(req.body?.reason || "").trim()
+
+    if (!currentPassword || !verifyPassword(currentPassword, req.user.passwordHash)) {
+      return res.status(400).json({ error: "Enter your current password to delete your account." })
+    }
+
+    const user = await softDeleteUser({
+      user: req.user,
+      actorType: "user",
+      actorId: req.user._id.toString(),
+      reason: reason || "Deleted by the account holder.",
+    })
+
+    await createAuditLog({
+      actorType: "user",
+      actorId: user._id.toString(),
+      eventType: "user.soft_deleted",
+      message: `${user.email} deleted their account.`,
+      metadata: { userId: user._id.toString(), deletedAt: user.deletedAt, reason: user.deletionReason },
+    })
+
+    return res.json({ success: true })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to delete account." })
+  }
+})
+
 app.patch("/user/onboarding-tour", requireSessionUser, async (req, res) => {
   try {
     const completed = req.body?.completed !== false
@@ -16905,7 +16998,7 @@ app.get("/portal/users", requireAdminSession, async (req, res) => {
     const limit = Math.min(parsePositiveInteger(req.query.limit, 25), 100)
     const skip = (page - 1) * limit
     const search = String(req.query.search || "").trim()
-    const filter = {}
+    const filter = { ...activeUserFilter }
 
     if (search) {
       filter.$or = [
@@ -17398,12 +17491,72 @@ app.post("/portal/kyc-upgrade-submissions/:id/reject", requireAdminSession, asyn
   }
 })
 
+app.delete("/portal/users/:id", requireAdminSession, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id)
+    if (!user) return res.status(404).json({ error: "User not found." })
+
+    await softDeleteUser({
+      user,
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      reason: req.body?.reason || "Deleted from the admin portal.",
+    })
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.user.soft_deleted",
+      message: `Portal administrator soft-deleted ${user.email}.`,
+      metadata: {
+        userId: user._id.toString(),
+        email: user.email,
+        deletedAt: user.deletedAt,
+        reason: user.deletionReason,
+      },
+    })
+    res.json({ success: true, user: sanitizePrivilegedUser(user) })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to delete portal user." })
+  }
+})
+
+app.post("/portal/users/:id/restore", requireAdminSession, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id)
+    if (!user) return res.status(404).json({ error: "User not found." })
+    if (!isSoftDeletedUser(user)) return res.status(409).json({ error: "This user is not deleted." })
+
+    user.status = "suspended"
+    user.deletedAt = null
+    user.deletedBy = { actorType: "", actorId: "" }
+    user.deletionReason = ""
+    await user.save()
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "portal.user.restored",
+      message: `Portal administrator restored ${user.email} as suspended.`,
+      metadata: { userId: user._id.toString(), email: user.email },
+    })
+    res.json({ success: true, user: sanitizePrivilegedUser(user) })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to restore portal user." })
+  }
+})
+
 app.patch("/portal/users/:id", requireAdminSession, async (req, res) => {
   try {
     const user = await User.findById(req.params.id)
 
     if (!user) {
       return res.status(404).json({ error: "User not found." })
+    }
+
+    if (isSoftDeletedUser(user)) {
+      return res.status(409).json({ error: "Deleted users must be restored before they can be edited." })
     }
 
     const reason = String(req.body?.reason || "").trim()
@@ -17981,6 +18134,7 @@ app.get("/admin/users", requireAdminSession, async (req, res) => {
     const queryText = String(req.query.q || "").trim()
     const searchQuery = queryText
       ? {
+          ...activeUserFilter,
           $or: [
             { email: { $regex: escapeRegex(queryText), $options: "i" } },
             { name: { $regex: escapeRegex(queryText), $options: "i" } },
@@ -17989,7 +18143,7 @@ app.get("/admin/users", requireAdminSession, async (req, res) => {
             { lastName: { $regex: escapeRegex(queryText), $options: "i" } },
           ],
         }
-      : {}
+      : { ...activeUserFilter }
 
     const [total, users] = await Promise.all([
       User.countDocuments(searchQuery),
@@ -18027,7 +18181,7 @@ app.get("/admin/social-directory", requireAdminSession, async (req, res) => {
     const queryText = String(req.query.q || "").trim()
     const platform = String(req.query.platform || "").trim().toLowerCase()
     const liveOnly = String(req.query.liveOnly || "").toLowerCase() === "true"
-    const searchQuery = {}
+    const searchQuery = { ...activeUserFilter }
     const andConditions = []
 
     if (queryText) {
@@ -18156,28 +18310,56 @@ app.delete("/admin/users/:id", requireAdminSession, async (req, res) => {
       return res.status(404).json({ error: "User not found." })
     }
 
-    await Promise.all([
-      Donation.deleteMany({ creatorId: user._id }),
-      Payout.deleteMany({ creatorId: user._id }),
-      GiftSound.deleteMany({ ownerId: user._id }),
-      User.deleteOne({ _id: user._id }),
-    ])
+    await softDeleteUser({
+      user,
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      reason: req.body?.reason || "Deleted by an administrator.",
+    })
 
     await createAuditLog({
       actorType: "admin",
       actorId: req.adminSession._id.toString(),
-      eventType: "admin.user.deleted",
-      message: `Admin deleted ${user.email}.`,
+      eventType: "admin.user.soft_deleted",
+      message: `Admin soft-deleted ${user.email}.`,
       metadata: {
         userId: user._id.toString(),
         email: user.email,
+        deletedAt: user.deletedAt,
+        reason: user.deletionReason,
       },
     })
 
-    res.json({ success: true })
+    res.json({ success: true, user: sanitizePrivilegedUser(user) })
   } catch (error) {
     console.error(error)
-    res.status(500).json({ error: "Failed to delete user." })
+    res.status(500).json({ error: "Failed to delete user account." })
+  }
+})
+
+app.post("/admin/users/:id/restore", requireAdminSession, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id)
+    if (!user) return res.status(404).json({ error: "User not found." })
+    if (!isSoftDeletedUser(user)) return res.status(409).json({ error: "This user is not deleted." })
+
+    user.status = "suspended"
+    user.deletedAt = null
+    user.deletedBy = { actorType: "", actorId: "" }
+    user.deletionReason = ""
+    await user.save()
+
+    await createAuditLog({
+      actorType: "admin",
+      actorId: req.adminSession._id.toString(),
+      eventType: "admin.user.restored",
+      message: `Admin restored ${user.email} as suspended.`,
+      metadata: { userId: user._id.toString(), email: user.email },
+    })
+    res.json({ success: true, user: sanitizePrivilegedUser(user) })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: "Failed to restore user account." })
   }
 })
 
