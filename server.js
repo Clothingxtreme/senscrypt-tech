@@ -1928,6 +1928,12 @@ const userSchema = new mongoose.Schema(
     },
     dailyReceivingLimitOverride: { type: Number, default: 0 },
     platformFee: { type: Number, default: DEFAULT_PLATFORM_FEE_PERCENT },
+      monnifySplitPercentage: {
+      type: Number,
+      min: 0,
+      max: 100,
+      default: 20,
+    },
     monnifySplitConfigLastResponse: { type: mongoose.Schema.Types.Mixed, default: undefined },
     monnifySplitConfigLastSyncedAt: Date,
     monnifySplitConfigLastError: String,
@@ -5313,6 +5319,7 @@ function sanitizeUser(user) {
     email: user.email,
     overlaySlug: getOverlaySlug(user),
     role: user.role || "creator",
+    monnifySplitPercentage: Number(user.monnifySplitPercentage ?? 20),
     status: user.status || "active",
     platformFee:
       typeof user.platformFee === "number"
@@ -9167,8 +9174,11 @@ async function getMonnifyIncomeSplitConfigForUser({ user, accessToken }) {
   if (streamerSubAccountCode === platformSubAccountCode) {
     throw new Error("Streamer subaccount and platform subaccount must be different.")
   }
-
-  const { streamer, platform } = getMonnifySplitPercentages()
+  const streamer = normalizeMonnifySplitPercentage(
+    user?.monnifySplitPercentage,
+    20,
+  )
+  const platform = 100 - streamer
   return compactMonnifySplitConfig([
     { subAccountCode: streamerSubAccountCode, splitPercentage: streamer },
     { subAccountCode: platformSubAccountCode, splitPercentage: platform },
@@ -18594,6 +18604,18 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
       user.dailyReceivingLimitOverride = Number(req.body.dailyReceivingLimitOverride) || 0
     }
 
+    if (req.body?.monnifySplitPercentage !== undefined) {
+  const splitPercentage = Number(req.body.monnifySplitPercentage)
+
+  if (!Number.isFinite(splitPercentage) || splitPercentage < 0 || splitPercentage > 100) {
+    return res.status(400).json({
+      error: "Monnify split percentage must be a number between 0 and 100.",
+    })
+  }
+
+  user.monnifySplitPercentage = splitPercentage
+}
+
     if (typeof req.body?.password === "string" && req.body.password.trim().length >= 8) {
       user.passwordHash = hashPassword(req.body.password.trim())
       user.sessionToken = null
@@ -18610,6 +18632,48 @@ app.patch("/admin/users/:id", requireAdminSession, async (req, res) => {
     }
 
     await user.save()
+    const monnifySplitChanged =
+  req.body?.monnifySplitPercentage !== undefined
+
+if (
+  monnifySplitChanged &&
+  user.virtualAccount?.accountReference &&
+  user.virtualAccount?.status === "active" &&
+  useDirectSplitSettlementForIncomingCollections()
+) {
+  try {
+    const accessToken = await getMonnifyAccessToken()
+
+    const incomeSplitConfig = await getMonnifyIncomeSplitConfigForUser({
+      user,
+      accessToken,
+    })
+
+    await updateMonnifyReservedAccountSplitConfig({
+      accessToken,
+      accountReference: user.virtualAccount.accountReference,
+      incomeSplitConfig,
+    })
+
+    user.virtualAccount.incomeSplitConfigApplied = incomeSplitConfig
+    user.virtualAccount.updatedAt = new Date()
+    await user.save()
+  } catch (error) {
+    const message = getAxiosErrorMessage(
+      error,
+      "User was saved, but the Monnify split could not be updated.",
+    )
+
+    console.error("admin.monnify_split_update_failed", {
+      userId: user._id.toString(),
+      message,
+    })
+
+    return res.status(502).json({
+      error: `User was saved, but the Monnify split could not be updated: ${message}`,
+    })
+  }
+}
 
     await createAuditLog({
       actorType: "admin",
