@@ -1812,6 +1812,19 @@ const creatorRewardSchema = new mongoose.Schema(
 creatorRewardSchema.index({ creatorId: 1, source: 1, sourceId: 1 }, { unique: true })
 
 const AdminSession = mongoose.model("AdminSession", adminSessionSchema)
+
+// One document per nickname-derived referral code. The unique _id makes two creators claiming
+// the same new code at the same moment impossible (the users.referralCode index is not unique in
+// existing databases, so it cannot be relied on for this).
+const referralCodeClaimSchema = new mongoose.Schema(
+  {
+    _id: { type: String, required: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    claimedAt: { type: Date, default: Date.now },
+  },
+  { versionKey: false },
+)
+const ReferralCodeClaim = mongoose.model("ReferralCodeClaim", referralCodeClaimSchema)
 const AuditLog = mongoose.model("AuditLog", auditLogSchema)
 const GiftSound = mongoose.model("GiftSound", giftSoundSchema)
 const RewardConfig = mongoose.model("RewardConfig", rewardConfigSchema)
@@ -1820,6 +1833,10 @@ const CreatorReward = mongoose.model("CreatorReward", creatorRewardSchema)
 const userSchema = new mongoose.Schema(
   {
     name: { type: String, required: true },
+    // Public-facing creator nickname shown to supporters (overlay, battles, referrals).
+    // Never used for legal identity or payout name matching. When set, it seeds the public
+    // referral code; earlier codes are kept in referralCodeAliases so shared links keep working.
+    nickname: { type: String, default: "", trim: true },
     firstName: { type: String, default: "" },
     middleName: { type: String, default: "" },
     lastName: { type: String, default: "" },
@@ -1837,7 +1854,8 @@ const userSchema = new mongoose.Schema(
     // Never replace this with a MongoDB delete for customer records.
     deletedAt: { type: Date, default: null, index: true },
     deletedBy: {
-      actorType: { type: String, enum: ["user", "admin", "system"], default: "" },
+      // "" is the default for accounts that were never deleted; without it every User.create/save fails enum validation.
+      actorType: { type: String, enum: ["", "user", "admin", "system"], default: "" },
       actorId: { type: String, default: "" },
     },
     deletionReason: { type: String, default: "" },
@@ -1870,6 +1888,9 @@ const userSchema = new mongoose.Schema(
       updatedAt: Date,
     },
     referralCode: { type: String, default: "", index: true },
+    // Previous referral codes of this creator. Still accepted at registration so links already
+    // shared keep working after a nickname change. default: undefined keeps old documents untouched.
+    referralCodeAliases: { type: [String], default: undefined, index: true },
     referredBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
     referredByCode: { type: String, default: "" },
     personalRecords: {
@@ -2101,6 +2122,9 @@ const userSchema = new mongoose.Schema(
         default: [],
       },
       leaderboardResetAt: Date,
+      // Start of the running total shown by the "Donation Total" overlay.
+      // Only affects that overlay's display; donation records are never modified.
+      donationTotalResetAt: Date,
       updatedAt: Date,
     },
   },
@@ -2172,6 +2196,44 @@ function getUserNameParts(user) {
     middleName: String(user?.middleName || identity.middleName || fallbackParts.middleName || "").trim(),
     lastName: String(user?.lastName || identity.lastName || fallbackParts.lastName || "").trim(),
   }
+}
+
+const CREATOR_NICKNAME_MAX_LENGTH = 32
+
+// Mirrors lib/nickname.ts in the frontend. Follows the existing public display-name conventions
+// (sanitizeDonationText / sanitizeDonorDisplayName): collapse whitespace, no angle brackets, 32 chars.
+function normalizeCreatorNickname(value) {
+  return String(value ?? "")
+    .normalize("NFC")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function validateCreatorNickname(value) {
+  const nickname = normalizeCreatorNickname(value)
+
+  if (!nickname) {
+    throw createStatusCodeError("Enter a creator nickname.", 400)
+  }
+
+  if (Array.from(nickname).length > CREATOR_NICKNAME_MAX_LENGTH) {
+    throw createStatusCodeError(`Creator nickname must be ${CREATOR_NICKNAME_MAX_LENGTH} characters or fewer.`, 400)
+  }
+
+  if (/[<>]/.test(nickname) || /[\u0000-\u001F\u007F]/.test(nickname)) {
+    throw createStatusCodeError("Creator nickname cannot contain < or > or control characters.", 400)
+  }
+
+  if (!/[\p{L}\p{N}]/u.test(nickname)) {
+    throw createStatusCodeError("Creator nickname must include at least one letter or number.", 400)
+  }
+
+  return nickname
+}
+
+function getCreatorPublicName(user, fallback = "Creator") {
+  const nickname = normalizeCreatorNickname(user?.nickname)
+  return nickname || fallback
 }
 
 function applyUserNameParts(user, parts) {
@@ -2285,7 +2347,7 @@ async function getBattleSnapshot(battleOrId) {
   if (!battle) return null
 
   const [participants, donations] = await Promise.all([
-    BattleParticipant.find({ battleId: battle.battleId }).populate("userId", "name firstName middleName lastName email profileImage").lean(),
+    BattleParticipant.find({ battleId: battle.battleId }).populate("userId", "name nickname firstName middleName lastName email profileImage").lean(),
     BattleDonation.find({ battleId: battle.battleId }).sort({ countedAt: -1 }).limit(10).lean(),
   ])
   const participantBySide = new Map(participants.map((participant) => [participant.side, participant]))
@@ -2324,8 +2386,12 @@ async function getBattleSnapshot(battleOrId) {
       left: left
         ? {
             userId: left.userId?._id || left.userId || "",
-            name: buildFullNameFromParts(getUserNameParts(left.userId), left.displayName || left.userId?.name || "Creator"),
-            email: left.userId?.email || "",
+            name: getCreatorPublicName(
+              left.userId,
+              buildFullNameFromParts(getUserNameParts(left.userId), left.displayName || left.userId?.name || "Creator"),
+            ),
+            // Snapshots are public (battle page, overlay, socket room): never expose emails.
+            email: "",
             profileImage: left.profileImage || left.userId?.profileImage || "",
             ready: Boolean(left.ready),
             score: Number(left.score) || 0,
@@ -2335,8 +2401,11 @@ async function getBattleSnapshot(battleOrId) {
       right: right
         ? {
             userId: right.userId?._id || right.userId || "",
-            name: buildFullNameFromParts(getUserNameParts(right.userId), right.displayName || right.userId?.name || "Creator"),
-            email: right.userId?.email || "",
+            name: getCreatorPublicName(
+              right.userId,
+              buildFullNameFromParts(getUserNameParts(right.userId), right.displayName || right.userId?.name || "Creator"),
+            ),
+            email: "",
             profileImage: right.profileImage || right.userId?.profileImage || "",
             ready: Boolean(right.ready),
             score: Number(right.score) || 0,
@@ -4333,14 +4402,18 @@ function validatePayoutAccountNameMatch({
   return legal
 }
 
-function getOverlaySlug(user) {
-  const slug = String(user?.name || "creator")
+function slugifyOverlayName(value) {
+  return String(value || "")
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
+}
 
-  return slug || "creator"
+// Cosmetic first segment of overlay URLs. The overlay route only reads the creator id, so links
+// generated before this change (legal-name slugs) keep working. Prefer the public nickname.
+function getOverlaySlug(user) {
+  return slugifyOverlayName(user?.nickname) || slugifyOverlayName(user?.name) || "creator"
 }
 
 function sanitizePlainObject(value, fallback) {
@@ -4483,6 +4556,9 @@ function getOverlayStateForUser(user) {
     manualLeaderboardEntries: getManualLeaderboardEntriesForOverlay(overlayState),
     leaderboardResetAt: overlayState.leaderboardResetAt
       ? new Date(overlayState.leaderboardResetAt).toISOString()
+      : "",
+    donationTotalResetAt: overlayState.donationTotalResetAt
+      ? new Date(overlayState.donationTotalResetAt).toISOString()
       : "",
   }
 }
@@ -5313,6 +5389,7 @@ function sanitizeUser(user) {
   return {
     id: user._id,
     name: displayName,
+    nickname: normalizeCreatorNickname(user.nickname),
     firstName: nameParts.firstName,
     middleName: nameParts.middleName,
     lastName: nameParts.lastName,
@@ -6239,7 +6316,20 @@ function getInitialsFromAccountNameParts(parts = []) {
     .join("")
 }
 
+const PUBLIC_NICKNAME_INITIALS_MAX_LENGTH = 4
+
+// Public account-card label ("Senscrypttech/XY"). Initials come from the creator nickname; accounts
+// without a usable nickname keep the previous label built from their legal-name initials, so the
+// full legal name itself is never sent to public overlays. Mirrors lib/account-display.ts.
 function buildPublicStreamerAccountName(user) {
+  const nicknameInitials = getInitialsFromAccountNameParts([normalizeCreatorNickname(user?.nickname)]).slice(
+    0,
+    PUBLIC_NICKNAME_INITIALS_MAX_LENGTH,
+  )
+  if (nicknameInitials) {
+    return `Senscrypttech/${nicknameInitials}`
+  }
+
   const nameParts = getUserNameParts(user)
   const orderedNameParts = [nameParts.firstName, nameParts.middleName, nameParts.lastName].filter(Boolean)
   const initials =
@@ -6249,28 +6339,6 @@ function buildPublicStreamerAccountName(user) {
     "ST"
 
   return `Senscrypttech/${initials}`
-}
-
-function sanitizePublicOverlayUser(user) {
-  const sanitized = sanitizeUser(user)
-
-  if (!sanitized) {
-    return null
-  }
-
-  const virtualAccount = sanitized.virtualAccount?.toObject?.() || sanitized.virtualAccount
-
-  return {
-    ...sanitized,
-    email: "",
-    identity: undefined,
-    virtualAccount: virtualAccount
-      ? {
-          ...virtualAccount,
-          accountName: buildPublicStreamerAccountName(user),
-        }
-      : null,
-  }
 }
 
 function getOverlayCacheControlHeader() {
@@ -6389,21 +6457,24 @@ function buildPublicOverlayUserLean(user) {
     return null
   }
 
-  const nameParts = getUserNameParts(user)
-  const displayName = buildFullNameFromParts(nameParts, user.name || user.email || "Creator")
+  // Public (unauthenticated) payload: no legal names, emails or provider/split internals.
+  // Only the fields the overlays render are sent.
+  const nickname = normalizeCreatorNickname(user.nickname)
   const virtualAccount = user.virtualAccount && typeof user.virtualAccount === "object"
     ? {
-        ...user.virtualAccount,
+        accountNumber: user.virtualAccount.accountNumber || "",
+        bankName: user.virtualAccount.bankName || "",
+        provider: user.virtualAccount.provider || "",
+        status: user.virtualAccount.status || "",
         accountName: buildPublicStreamerAccountName(user),
       }
     : null
 
   return {
     id: user._id,
-    name: displayName,
-    firstName: nameParts.firstName,
-    middleName: nameParts.middleName,
-    lastName: nameParts.lastName,
+    // Kept for older overlay clients; it is the public nickname (or empty), never the legal name.
+    name: nickname,
+    nickname,
     email: "",
     overlaySlug: getOverlaySlug(user),
     role: user.role || "creator",
@@ -6423,6 +6494,7 @@ async function buildPublicOverlayCacheEntry(creatorId) {
     .select({
       _id: 1,
       name: 1,
+      nickname: 1,
       email: 1,
       firstName: 1,
       middleName: 1,
@@ -6862,12 +6934,107 @@ async function generateUniqueReferralCode(user) {
   return `ST${Date.now().toString(36).toUpperCase()}`
 }
 
+const NICKNAME_REFERRAL_CODE_MAX_LENGTH = 16
+const NICKNAME_REFERRAL_CODE_MIN_LENGTH = 3
+
+function normalizeReferralCodeInput(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 32)
+}
+
+// "Ada Plays!" -> "ADAPLAYS". Accents are folded; anything else non-alphanumeric is dropped.
+function getNicknameReferralCodeBase(nickname) {
+  const base = normalizeCreatorNickname(nickname)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "")
+    .slice(0, NICKNAME_REFERRAL_CODE_MAX_LENGTH)
+  return base.length >= NICKNAME_REFERRAL_CODE_MIN_LENGTH ? base : ""
+}
+
+function buildReferralCodeLookupFilter(code) {
+  return { $or: [{ referralCode: code }, { referralCodeAliases: code }] }
+}
+
+async function isReferralCodeTaken(code, excludeUserId) {
+  return Boolean(
+    await User.exists({
+      ...buildReferralCodeLookupFilter(code),
+      ...(excludeUserId ? { _id: { $ne: excludeUserId } } : {}),
+    }),
+  )
+}
+
+// Deterministic: BASE, then BASE2, BASE3, ... (trimmed to the max length). Codes the owner
+// already holds (current or alias) are reused, so re-saving the same nickname never rotates
+// the code. Any new code is claimed atomically before it is returned.
+async function generateNicknameReferralCode(nickname, owner = null) {
+  const base = getNicknameReferralCodeBase(nickname)
+  if (!base) return ""
+
+  const ownerId = owner?._id || null
+  const ownedCodes = new Set(
+    [owner?.referralCode, ...(owner?.referralCodeAliases || [])]
+      .map((code) => String(code || "").trim().toUpperCase())
+      .filter(Boolean),
+  )
+
+  for (let suffix = 1; suffix <= 200; suffix += 1) {
+    const tail = suffix === 1 ? "" : String(suffix)
+    const candidate = `${base.slice(0, NICKNAME_REFERRAL_CODE_MAX_LENGTH - tail.length)}${tail}`
+    if (ownedCodes.has(candidate)) {
+      return candidate
+    }
+    if (await isReferralCodeTaken(candidate, ownerId)) {
+      continue
+    }
+    try {
+      await ReferralCodeClaim.create({ _id: candidate, userId: ownerId })
+      return candidate
+    } catch (error) {
+      if (error?.code === 11000) {
+        const claim = await ReferralCodeClaim.findById(candidate).lean()
+        // A claim left by this same creator (e.g. an earlier save that failed) is still theirs.
+        if (ownerId && claim?.userId && String(claim.userId) === String(ownerId)) {
+          return candidate
+        }
+        continue
+      }
+      throw error
+    }
+  }
+  return ""
+}
+
+// Moves the creator's public referral code to the one derived from their nickname.
+// The previous code is kept as an alias. Mutates the document; the caller saves it.
+async function applyNicknameReferralCode(user) {
+  const nextCode = await generateNicknameReferralCode(user?.nickname, user)
+  const currentCode = String(user?.referralCode || "").trim().toUpperCase()
+  if (!nextCode || nextCode === currentCode) {
+    return { changed: false, code: currentCode }
+  }
+
+  const aliases = new Set((user.referralCodeAliases || []).map((code) => String(code).toUpperCase()))
+  if (currentCode) aliases.add(currentCode)
+  aliases.delete(nextCode)
+  user.referralCodeAliases = Array.from(aliases)
+  user.referralCode = nextCode
+  return { changed: true, code: nextCode, previousCode: currentCode }
+}
+
 async function ensureCreatorReferralCode(user) {
   if (!user) return ""
   const existingCode = String(user.referralCode || "").trim().toUpperCase()
   if (existingCode) return existingCode
 
-  const code = await generateUniqueReferralCode(user)
+  const code =
+    (await generateNicknameReferralCode(user.nickname, user)) ||
+    (await generateUniqueReferralCode(user))
   user.referralCode = code
   if (typeof user.save === "function") {
     await user.save()
@@ -7430,7 +7597,7 @@ async function buildCreatorRewardsDashboard(user) {
     getCreatorRewardsConfig(),
     getCreatorRewardStats(creator._id),
     User.find({ referredBy: creator._id })
-      .select({ _id: 1, name: 1, email: 1, createdAt: 1 })
+      .select({ _id: 1, name: 1, nickname: 1, email: 1, createdAt: 1 })
       .sort({ createdAt: -1 })
       .lean(),
   ])
@@ -7442,6 +7609,7 @@ async function buildCreatorRewardsDashboard(user) {
       return {
         id: referredCreator._id.toString(),
         name: referredCreator.name || referredCreator.email || "Creator",
+        nickname: normalizeCreatorNickname(referredCreator.nickname),
         email: referredCreator.email || "",
         joinedAt: referredCreator.createdAt || "",
         totalDonations: referredStats.totalAmount,
@@ -7461,6 +7629,8 @@ async function buildCreatorRewardsDashboard(user) {
     referral: {
       code: referralCode,
       link: getReferralLinkForCode(referralCode),
+      // Older codes that still work, so creators know previously shared links are safe.
+      previousCodes: (creator.referralCodeAliases || []).filter((code) => code && code !== referralCode),
       qualifyingDonationAmount: 0,
       reductionPercent: 0,
       reductionCapPercent: 0,
@@ -12389,11 +12559,15 @@ app.post("/auth/register", registerLimiter, async (req, res) => {
       bankCode = "",
       accountNumber = "",
       referralCode = "",
+      nickname = "",
     } = req.body
 
     if (!email || !password) {
       return res.status(400).json({ error: "Email and password are required." })
     }
+
+    // Optional for backward compatibility with older clients and social sign-up; validated when sent.
+    const creatorNickname = normalizeCreatorNickname(nickname) ? validateCreatorNickname(nickname) : ""
 
     const normalizedEmail = String(email).toLowerCase().trim()
     const rawPassword = String(password)
@@ -12441,9 +12615,14 @@ app.post("/auth/register", registerLimiter, async (req, res) => {
     let payoutProfile
     let registrationWarning = ""
     let registrationNextStep = "dashboard"
-    const cleanReferralCode = String(referralCode || "").trim().toUpperCase()
+    const cleanReferralCode = normalizeReferralCodeInput(referralCode)
+    // Matches the creator's current code or any earlier code (aliases kept after nickname changes).
     const referrer = cleanReferralCode
-      ? await User.findOne({ referralCode: cleanReferralCode, email: { $ne: normalizedEmail } }).select({ _id: 1, email: 1, referralCode: 1 })
+      ? await User.findOne({
+          ...buildReferralCodeLookupFilter(cleanReferralCode),
+          ...activeUserFilter,
+          email: { $ne: normalizedEmail },
+        }).select({ _id: 1, email: 1, referralCode: 1 })
       : null
 
     try {
@@ -12520,6 +12699,7 @@ app.post("/auth/register", registerLimiter, async (req, res) => {
 
     user = await User.create({
       name: trimmedName,
+      nickname: creatorNickname,
       firstName: legal.first,
       middleName: legal.middle,
       lastName: legal.last,
@@ -12528,7 +12708,9 @@ app.post("/auth/register", registerLimiter, async (req, res) => {
       sessionToken: generateSessionToken(),
       role: "creator",
       status: "active",
-      referralCode: await generateUniqueReferralCode({ name: trimmedName, email: normalizedEmail }),
+      referralCode:
+        (await generateNicknameReferralCode(creatorNickname)) ||
+        (await generateUniqueReferralCode({ name: trimmedName, email: normalizedEmail })),
       referredBy: referrer?._id || null,
       referredByCode: referrer?.referralCode || cleanReferralCode,
       phoneNumber: cleanPhoneNumber,
@@ -12576,6 +12758,11 @@ app.post("/auth/register", registerLimiter, async (req, res) => {
         referredByCode: referrer?.referralCode || cleanReferralCode,
       },
     })
+
+    // Link the claimed nickname code to the new account (best effort; the claim already blocks reuse).
+    void ReferralCodeClaim.updateOne({ _id: user.referralCode, userId: null }, { $set: { userId: user._id } }).catch(
+      () => undefined,
+    )
 
     let warning = registrationWarning
 
@@ -13057,7 +13244,7 @@ app.post("/battles", requireSessionUser, async (req, res) => {
       battleId,
       userId: req.user._id,
       side: "left",
-      displayName: req.user.name,
+      displayName: getCreatorPublicName(req.user, req.user.name),
       profileImage: req.user.profileImage || "",
     })
 
@@ -13098,7 +13285,7 @@ app.post("/battles/join", requireSessionUser, async (req, res) => {
       battleId: battle.battleId,
       userId: req.user._id,
       side: "right",
-      displayName: req.user.name,
+      displayName: getCreatorPublicName(req.user, req.user.name),
       profileImage: req.user.profileImage || "",
     })
 
@@ -13243,14 +13430,16 @@ app.get("/battles/rankings", requireSessionUser, async (req, res) => {
     const userIds = Array.from(
       new Set([...mostWins, ...highestRaised, ...longestStreak, ...largestDonation].map((item) => String(item._id))),
     )
-    const users = await User.find({ _id: { $in: userIds } }).select({ name: 1, firstName: 1, middleName: 1, lastName: 1, profileImage: 1 }).lean()
+    const users = await User.find({ _id: { $in: userIds } }).select({ name: 1, nickname: 1, firstName: 1, middleName: 1, lastName: 1, profileImage: 1 }).lean()
     const usersById = new Map(users.map((user) => [String(user._id), user]))
     const hydrate = (items) =>
       items.map((item) => {
         const user = usersById.get(String(item._id))
         return {
           creatorId: item._id,
-          name: user ? buildFullNameFromParts(getUserNameParts(user), user.name || "Creator") : "Creator",
+          name: user
+            ? getCreatorPublicName(user, buildFullNameFromParts(getUserNameParts(user), user.name || "Creator"))
+            : "Creator",
           profileImage: user?.profileImage || "",
           value: Number(item.value) || 0,
         }
@@ -14579,32 +14768,7 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
 
     await assertGiftWithinTierLimits(req.user, amount)
 
-    const giftLimitViolation = await getGiftLimitViolation(creator, amount)
-    if (giftLimitViolation) {
-      await upsertComplianceInflowFromMonnify({
-        eventType,
-        eventData,
-        data,
-        creator,
-        status: "held",
-        validationReason: giftLimitViolation,
-      })
-
-      await createAuditLog({
-        actorType: "system",
-        eventType: "donation.tier_limit_blocked",
-        message: `Monnify donation exceeded Tier ${getTierLevel(creator)} gift limits.`,
-        metadata: {
-          creatorId: creator._id.toString(),
-          amount,
-          reason: giftLimitViolation,
-          transactionReference,
-          paymentReference,
-        },
-      })
-
-      return res.sendStatus(200)
-    }
+    // Tier gift limits are enforced by assertGiftWithinTierLimits above.
 
     const split = await calculateCreatorRevenueSplit(req.user._id, amount)
     const donationFundsFlow = getIncomingDonationFundsFlow()
@@ -14661,6 +14825,10 @@ app.post("/monnify/test-donation", requireSessionUser, async (req, res) => {
       message: "Sandbox donation created successfully.",
     })
   } catch (error) {
+    const statusCode = Number(error?.statusCode || 0)
+    if (statusCode >= 400 && statusCode < 500) {
+      return res.status(statusCode).json({ error: error.message, code: error.errorCode || undefined })
+    }
     console.error(error)
     return res.status(500).json({ error: "Failed to create Monnify sandbox donation." })
   }
@@ -14792,15 +14960,178 @@ app.put("/overlay-state", requireSessionUser, async (req, res) => {
       updatedAt: new Date(),
     }
 
-    req.user.overlayState = nextState
-    req.user.markModified('overlayState')
-    await req.user.save()
+    // Write only these sub-paths. overlayState.donationTotalResetAt is deliberately not part of
+    // this update: it is owned by POST /overlay-state/donation-total/reset, so a settings save
+    // (even one racing a reset) can never undo or move a reset.
+    const $set = {}
+    Object.entries(nextState).forEach(([key, value]) => {
+      $set[`overlayState.${key}`] = value
+    })
+    // Sub-path $set needs an object to write into (older accounts may have no overlayState yet).
+    await User.updateOne({ _id: req.user._id, overlayState: null }, { $set: { overlayState: {} } })
+    await User.updateOne({ _id: req.user._id }, { $set })
     invalidateOverlayPublicCache(req.user._id)
 
-    return res.json(getOverlayStateForUser(req.user))
+    const savedUser = await User.findById(req.user._id).select({ overlayState: 1 }).lean()
+    return res.json(getOverlayStateForUser(savedUser))
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: "Failed to save overlay state." })
+  }
+})
+
+async function computeOverlayDonationTotal(creatorId, resetAtValue, overlayCustomization) {
+  const resetAt = normalizeLeaderboardResetAt(resetAtValue)
+  const query = {
+    creatorId: new mongoose.Types.ObjectId(String(creatorId)),
+    ...(resetAt ? { date: { $gte: resetAt } } : {}),
+  }
+  // Sums in MongoDB (uses the { creatorId, date } index) instead of loading the history into memory.
+  // The $expr below is the same rule as isOverlayDonationVisibleInPublicOverlay():
+  //   visible = (provider "monnify" AND paymentStatus "PAID" AND walletStatus != "rejected")
+  //             OR walletStatus is empty OR walletStatus == "available"   (case-insensitive, trimmed)
+  const walletStatusExpr = { $toLower: { $trim: { input: { $toString: { $ifNull: ["$walletStatus", ""] } } } } }
+  const [result] = await Donation.aggregate([
+    { $match: query },
+    {
+      $project: {
+        _id: 0,
+        walletStatus: walletStatusExpr,
+        provider: { $toLower: { $toString: { $ifNull: ["$provider", ""] } } },
+        paymentStatus: { $toUpper: { $toString: { $ifNull: ["$paymentStatus", ""] } } },
+        value: { $convert: { input: "$amount", to: "double", onError: 0, onNull: 0 } },
+      },
+    },
+    {
+      $match: {
+        value: { $gt: 0 },
+        $expr: {
+          $or: [
+            {
+              $and: [
+                { $eq: ["$provider", "monnify"] },
+                { $eq: ["$paymentStatus", "PAID"] },
+                { $ne: ["$walletStatus", "rejected"] },
+              ],
+            },
+            { $eq: ["$walletStatus", ""] },
+            { $eq: ["$walletStatus", "available"] },
+          ],
+        },
+      },
+    },
+    { $group: { _id: null, amount: { $sum: "$value" }, count: { $sum: 1 } } },
+  ])
+  const amount = Number(result?.amount) || 0
+  const count = Number(result?.count) || 0
+
+  return {
+    amount: Math.round(amount * 100) / 100,
+    count,
+    currency: "NGN",
+    showSubtitle: overlayCustomization?.showDonationTotalSubtitle !== false,
+    resetAt: resetAt ? resetAt.toISOString() : "",
+    computedAt: new Date().toISOString(),
+  }
+}
+
+app.post("/overlay-state/donation-total/reset", requireSessionUser, async (req, res) => {
+  try {
+    const resetAt = new Date()
+    // Only the overlay display marker changes; donations, earnings and payouts stay untouched.
+    await User.updateOne(
+      { _id: req.user._id },
+      {
+        $set: {
+          "overlayState.donationTotalResetAt": resetAt,
+          "overlayState.updatedAt": resetAt,
+        },
+      },
+    )
+    invalidateOverlayPublicCache(req.user._id)
+
+    const total = await computeOverlayDonationTotal(
+      req.user._id,
+      resetAt,
+      req.user.overlayState?.customization,
+    )
+    io.to(getCreatorRoom(req.user._id)).emit("donationTotalReset", total)
+
+    return res.json(total)
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to reset the donation total." })
+  }
+})
+
+// Lets the registration form confirm a referral code before sign-up. Only the public nickname is
+// returned; legal names, emails and account details are never exposed here.
+app.get("/public/referral/:code", async (req, res) => {
+  try {
+    const code = normalizeReferralCodeInput(req.params.code)
+    res.set("Cache-Control", "no-store")
+
+    if (!code) {
+      return res.status(404).json({ valid: false })
+    }
+
+    const referrer = await User.findOne({
+      ...buildReferralCodeLookupFilter(code),
+      ...activeUserFilter,
+    })
+      .select({ _id: 1, nickname: 1, referralCode: 1 })
+      .lean()
+
+    if (!referrer) {
+      return res.status(404).json({ valid: false })
+    }
+
+    return res.json({
+      valid: true,
+      code: referrer.referralCode || code,
+      creatorName: normalizeCreatorNickname(referrer.nickname),
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to check the referral code." })
+  }
+})
+
+app.get("/public/overlay/:creatorId/donation-total", async (req, res) => {
+  try {
+    const creatorId = String(req.params.creatorId || "").trim()
+
+    if (!mongoose.Types.ObjectId.isValid(creatorId)) {
+      return res.status(404).json({ error: "Overlay not found." })
+    }
+
+    const user = await User.findOne({
+      _id: new mongoose.Types.ObjectId(creatorId),
+      ...activeUserFilter,
+      $or: [{ status: { $exists: false } }, { status: "active" }],
+    })
+      .select({
+        _id: 1,
+        "overlayState.donationTotalResetAt": 1,
+        "overlayState.customization.showDonationTotalSubtitle": 1,
+      })
+      .lean()
+
+    if (!user) {
+      return res.status(404).json({ error: "Overlay not found." })
+    }
+
+    const total = await computeOverlayDonationTotal(
+      user._id,
+      user.overlayState?.donationTotalResetAt,
+      user.overlayState?.customization,
+    )
+
+    res.set("Cache-Control", "no-store")
+    return res.json(total)
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ error: "Failed to load the donation total." })
   }
 })
 
@@ -15473,6 +15804,55 @@ app.delete("/user", sensitiveActionLimiter, requireSessionUser, async (req, res)
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: "Failed to delete account." })
+  }
+})
+
+app.patch("/user/nickname", requireSessionUser, async (req, res) => {
+  try {
+    // Always acts on the authenticated session user; any client-supplied id is ignored.
+    const nickname = validateCreatorNickname(req.body?.nickname)
+    const previousNickname = normalizeCreatorNickname(req.user.nickname)
+
+    if (previousNickname !== nickname) {
+      req.user.nickname = nickname
+      let referralChange = { changed: false }
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        referralChange = await applyNicknameReferralCode(req.user)
+        try {
+          await req.user.save()
+          break
+        } catch (saveError) {
+          // Another creator claimed the same code between the check and the save; pick the next one.
+          if (saveError?.code === 11000 && attempt < 2) continue
+          throw saveError
+        }
+      }
+      invalidateOverlayPublicCache(req.user._id)
+
+      await createAuditLog({
+        actorType: "user",
+        actorId: req.user._id.toString(),
+        eventType: "user.nickname_updated",
+        message: `${req.user.email} updated their creator nickname.`,
+        metadata: {
+          previousNickname,
+          nickname,
+          ...(referralChange.changed
+            ? { previousReferralCode: referralChange.previousCode, referralCode: referralChange.code }
+            : {}),
+        },
+      })
+    }
+
+    return res.json(sanitizeUser(req.user))
+  } catch (error) {
+    const statusCode = Number(error?.statusCode || 0)
+    if (statusCode >= 400 && statusCode < 500) {
+      return res.status(statusCode).json({ error: error.message })
+    }
+    console.error(error)
+    return res.status(500).json({ error: "Failed to update creator nickname." })
   }
 })
 
